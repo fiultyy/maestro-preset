@@ -2,7 +2,7 @@
 
 跨 Orca、zap、DSH 三平面的多 agent 编排套件,以 DSH **agent preset** 形态分发。本目录自包含: 插件、技能、脚本全部随包走,零 npm 依赖(仅 `node:*` 内建 + 相对 import)。
 
-> 装好后怎么用 → **[使用说明 USAGE.md](./USAGE.md)**;开发调试(软链接即时生效)→ USAGE §10;打包规范(怎么装成插件/怎么发布)→ **[PACKAGING.md](./docs/PACKAGING.md)**。
+> 装好后怎么用 → **[使用说明 USAGE.md](./USAGE.md)**;开发调试(dev-sync 同步,禁用软链接)→ USAGE §10;打包规范(怎么装成插件/怎么发布)→ **[PACKAGING.md](./docs/PACKAGING.md)**。
 
 ## 前置要求
 

@@ -100,23 +100,17 @@ session-purge  <code|sessionId>                   # 删会话(确认闸门)
 - **只改 `plugins/*.js`**: 运行中会话已把旧模块导入内存,不受影响;确定性让新代码生效 = **重启 DSH 进程**。
 - 因此发布新版本 = 改代码 + 改 `agent.cordis.yml`(哪怕加个注释),让新会话拿到新代际。
 
-## 10. 开发模式(软链接,repo 改动即时生效)
+## 10. 开发模式(dev-sync 同步,禁用软链接)
 
-不想每次改完拷贝到 `~/.dsh/.agent-presets/maestro`? 让安装点直接指向本仓库:
+开发循环 = 在本仓库编辑 → `bin/dev-sync.sh` 同步到安装点 → 新会话验证:
 
 ```bash
-# 1) 备份已安装副本(如有)
-mkdir -p ~/.dsh/maestro/dev
-[ -e ~/.dsh/.agent-presets/maestro ] && mv ~/.dsh/.agent-presets/maestro ~/.dsh/maestro/dev/maestro.installed.bak
-
-# 2) 软链接指向本仓库
-ln -s "$(pwd)" ~/.dsh/.agent-presets/maestro
-
-# 3) 验证
-readlink -f ~/.dsh/.agent-presets/maestro   # → /home/<you>/tools/maestro-preset
+bin/dev-sync.sh    # rsync(或 cp)仓库 → ~/.dsh/.agent-presets/maestro,排除 .git
 ```
 
-之后在本仓库改文件,安装点即所见(软链接直通)。**生效边界仍受 §9 约束**: 改 `agent.cordis.yml` → 新会话即得新代际;改插件 `.js` → 重启 DSH 才确定性生效。开发循环建议: 改代码 → 重启宿主(或接受"新会话才生效")→ 开新会话验证。
+**⚠️ 禁止把安装点做成软链接**(`ln -s` 指向仓库)。DSH 的 preset discovery 用 `readdir(withFileTypes)` 的 `isDirectory()` 过滤(harness `packages/preset/agent-presets/src/discovery.ts` scanRoot),符号链接 `isDirectory()==false` → **整个 preset 从 roster 消失**,默认/选用该 preset 的新会话全部创建失败(症状: 新建对话无响应)。已实测踩坑并回滚。
+
+**生效边界仍受 §9 约束**: 改 `agent.cordis.yml` → 新会话即得新代际;改插件 `.js` → 重启 DSH 才确定性生效。开发循环: 改代码 → `bin/dev-sync.sh` → 重启宿主(或接受"新会话才生效")→ 开新会话验证 → `git commit` + `git push`。
 
 ## 11. 信任与安全
 

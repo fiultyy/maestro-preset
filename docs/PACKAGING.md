@@ -53,7 +53,7 @@ export default { version, inject, apply }
 - preset 代际以 `agent.cordis.yml` 的 **stamp(mtime+size)** 为键。
 - 改 `agent.cordis.yml` → **新会话**挂新代际;运行中会话永远保持加入时代际。
 - 只改 `plugins/*.js` → 运行中会话已 import 旧模块不受影响;**确定性生效 = 重启 DSH 进程**。
-- 开发模式: 软链接安装点指向仓库(见 USAGE §10),编辑即所见;但上述边界不变。
+- 开发模式: `bin/dev-sync.sh` 同步仓库→安装点(见 USAGE §10)。**禁止软链接安装点**: discovery 的 `isDirectory()` 过滤会把 symlink 的 preset 从 roster 整个踢掉,新会话创建失败。
 
 ## 6. preset.yml 官方 schema(metadata.ts)
 

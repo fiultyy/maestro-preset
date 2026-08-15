@@ -1,0 +1,7 @@
+{
+  "name": "@maestro/callback-bridge",
+  "version": "4.0.0",
+  "type": "module",
+  "description": "Generalized callback bridge for the maestro preset: shared kernel (envelope/addressing/registry/dedup/store) + transport sources (file-inbox from orca-callback v3.5, http from message-bridge v1.0) + agent-turn sink. P1: kernel ported, not yet registered in agent.cordis.yml. Design: docs/callback-bridge-design.md.",
+  "main": "index.js"
+}
