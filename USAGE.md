@@ -16,6 +16,8 @@ git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/ma
 
 装完**新建一个会话**,在 preset 选择器里选「高级编排模式」。preset 一经选用不可热切换,切换要开新会话。
 
+> **fork 不等于新会话**: `session.fork` 没有 preset 参数,子会话继承源会话的组合;且 fork 自带历史前缀(一出生就"已产出"),而换 preset 的唯一通道 `recompose` 只接受白纸会话。想要"带旧上下文的编排会话": 从一个已是编排模式的会话 fork,或新建编排会话后把旧上下文摘要/检索过去。
+
 ## 3. 首次会话三步走
 
 **① arm 回调泵**(会话开场调一次工具):
