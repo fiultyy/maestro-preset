@@ -1,0 +1,7 @@
+{
+  "name": "@maestro/message-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Loopback HTTP direct-send callback endpoint for the maestro bridge: POST /callback on 127.0.0.1 (port published to bridge/http.port) driving agent turns via followup/inject, with (from,body) 60s idempotency (208) and 400 validation",
+  "main": "index.js"
+}

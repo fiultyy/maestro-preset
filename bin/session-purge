@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""session-purge — 删除 main 会话(按需,agent 显式执行)
+
+用法: session-purge <code|sessionId>
+
+守卫: 拒绝 orch1(编排者自身); 服务端另有 confirm 闸 + 忙闸(5 分钟内有写入拒绝)。
+成功后同步清理 fleet.json 登记项。
+
+环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json) / MAESTRO_HOME(默认 ~/.dsh)
+"""
+import json
+import os
+import sys
+import tempfile
+import urllib.request
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+FLEET = os.environ.get('MAESTRO_FLEET', f'{HOME}/maestro/fleet.json')
+PORT_FILE = f'{HOME}/maestro/purge.port'
+
+
+def resolve(key: str, fleet: dict) -> str:
+    if key.startswith('session-'):
+        return key
+    entry = fleet.get('fleet', {}).get(key)
+    if entry:
+        return entry['sessionId']
+    sys.exit(f'session-purge: unknown code {key!r}')
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    key = sys.argv[1]
+    with open(FLEET) as fh:
+        fleet = json.load(fh)
+    if key == 'orch1' or (key != 'session-' and fleet.get('fleet', {}).get(key, {}).get('role') == 'orchestrator'):
+        sys.exit('session-purge: refused — orchestrator self-purge guard')
+    sid = resolve(key, fleet)
+    try:
+        port = open(PORT_FILE).read().strip()
+    except OSError:
+        sys.exit('session-purge: no purge.port — no maestro session with the session-purge plugin is alive; spawn one first')
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{port}/purge',
+        data=json.dumps({'sessionId': sid, 'confirm': 'PURGE'}).encode(),
+        headers={'content-type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            verdict = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f'session-purge: HTTP {e.code}:', e.read().decode()[:300])
+        sys.exit(1)
+    print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    code = next((c for c, v in fleet.get('fleet', {}).items() if v.get('sessionId') == sid), None)
+    if code and 'error' not in verdict.get('steps', {}).get('registry', ''):
+        fleet['fleet'].pop(code, None)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(FLEET), prefix='.fleet-', suffix='.json')
+        with os.fdopen(fd, 'w') as fh:
+            json.dump(fleet, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, FLEET)
+        print(f'fleet: removed {code}')
+
+
+if __name__ == '__main__':
+    main()

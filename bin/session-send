@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""session-send — 跨 main 会话消息直发(loopback /api 包装)
+
+用法: session-send <from> <to> <type> <ref> <body>
+  from/to: fleet.json 里的 4 位码(如 orch1/2437),sessionId 前 4 位,或完整 sessionId
+  type:    ping|pong|done|ask|steer|nack|ack
+  ref:     关联的 ledger node_id(无则填 -)
+  body:    单行正文
+
+信封: 收方回合首行 = DSHMSG]{"from","to","type","ref","body"}
+      方向语义显式可解析,与文件桥 v3.5 的 {"type","from","to","body"} 同一心智模型。
+
+环境: DSH_PORT(默认 3080)/ MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)
+"""
+import json
+import os
+import sys
+import urllib.request
+import uuid
+
+
+def resolve(key: str, fleet: dict) -> str:
+    if key.startswith('session-'):
+        return key
+    entry = fleet.get('fleet', {}).get(key)
+    if entry:
+        return entry['sessionId']
+    for code, ent in fleet.get('fleet', {}).items():
+        if ent['sessionId'].startswith('session-' + key):
+            return ent['sessionId']
+    sys.exit(f'session-send: unknown code {key!r} (not in fleet.json, not a sessionId prefix)')
+
+
+def main() -> None:
+    if len(sys.argv) != 6:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    frm, to, typ, ref, body = sys.argv[1:6]
+    port = os.environ.get('DSH_PORT', '3080')
+    fleet_path = os.environ.get('MAESTRO_FLEET', os.path.expanduser('~/.dsh/maestro/fleet.json'))
+    with open(fleet_path) as fh:
+        fleet = json.load(fh)
+    port = str(fleet.get('port', port))
+    to_sid = resolve(to, fleet)
+    envelope = {'from': frm, 'to': to, 'type': typ, 'ref': ref, 'body': body}
+    line = 'DSHMSG]' + json.dumps(envelope, ensure_ascii=False)
+    payload = {
+        'sessionId': to_sid,
+        'mode': 'queue',
+        'content': [{'type': 'text', 'text': line}],
+    }
+    wire = {
+        'type': 'client-request',
+        'rpcId': str(uuid.uuid4()),
+        'method': 'session.prompt',
+        'payload': payload,
+    }
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{port}/api/session.prompt',
+        data=json.dumps(wire, ensure_ascii=False).encode(),
+        headers={'content-type': 'application/json'},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())['result']
+    if not result.get('ok'):
+        print('session-send: RPC error:', json.dumps(result.get('error'), ensure_ascii=False))
+        sys.exit(1)
+    print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}: accepted={result['value']['accepted']}")
+
+
+if __name__ == '__main__':
+    main()

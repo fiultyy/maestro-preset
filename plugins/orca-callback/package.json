@@ -1,0 +1,7 @@
+{
+  "name": "@maestro/orca-callback",
+  "version": "3.5.0",
+  "type": "module",
+  "description": "Native Orca->DSH callback pump (v3.5): multi-consumer exact routing via to=<alias>@<sessionId>|<sessionId>|* with bridge/registry.json, per-consumer cursors (.cursor.<sessionId>), unknown-addressee dead-lettering, on top of v3.4 at-least-once semantics (dedup window, echo separation, rotation, atomic state writes), driving agent turns via followup/inject",
+  "main": "pump.js"
+}
