@@ -56,7 +56,7 @@
       - Prefer --json for every agent-driven CLI call.
       - Copy worktree ids whole (`<repoId>::<worktreePath>`); a bare repo id is not a worktree id.
       - Terminal handles are runtime-scoped. On stale or missing handles, re-list and continue with the replacement only; never dual-send to old and new.
-      - Read a terminal before sending to it; wait on agent CLIs with `terminal wait --for tui-idle --timeout-ms ...`.
+      - Read a terminal before sending to it; confirm supervised dispatches with the dispatch handshake (below) instead of output-polling; wait on agent CLIs with `terminal wait --for tui-idle --timeout-ms ...` only as the mechanical fallback.
       - worker_done is reported exactly once with --task-id, --dispatch-id, and --outcome; a valid worker_done completes the task automatically — never follow it with task-update --status completed.
       - Heartbeat, status, or visible activity means alive, not done. A check --wait timeout is a checkpoint, not a failure: keep rolling waits (15-60 minute tasks are normal) unless worker_done/escalation arrives, the terminal exits or disappears, or the user stops you. Never kill or restart a worker for being slow.
       - After an accepted worker_done: reuse the terminal via worker-start --terminal for an immediate follow-up Task, else worker-release; retain a terminal only on an explicit user request (worker-retain).
@@ -92,6 +92,16 @@
       2. Deliver A's opening to B with A's reply address embedded in the text, and symmetrically for B.
       3. Relay loop: poll both mailboxes on a cadence (zap check-messages CONSUMES mail — sweep it only as that mailbox's owner; Orca check --peek does not), forward new messages verbatim, until the alignment goal is met or both sides idle out.
       4. Relay verbatim — never paraphrase or fabricate content between peers. If a peer stalls past the agreed cadence, report the stall with its last signal time; do not invent progress.
+
+      ## Dispatch handshake (terminal-send dispatches)
+
+      Plain `terminal send` carries no delivery semantics — do not confirm receipt by polling terminal output. Embed a two-phase callback contract instead:
+
+      1. Session start: arm both callback channels (`bridge_arm { alias }`, then `bridge_http_status`) — the receipt signature `<alias>@<sessionId>` is your replyable address for every dispatch you send.
+      2. Every supervised dispatch embeds the ACK/DONE contract (template in `skills/orca-bridge/SKILL.md`): the peer runs `bin/cb-send ack <self> <your-signature> <ref> "turn started"` as the FIRST action of its turn, and `bin/cb-send done <self> <your-signature> <ref> "<summary>"` (≤300 chars) when finished. Both arrive as native callback turns (MSGBR]/ORCA-CB] prefixed) and wake you.
+      3. Fold them into the ledger: ACK → node `running` + `progress` event ("ack: turn started"); DONE → node `done|failed` + outcome summary. A done closes the node — never re-wait or re-dispatch on top of it without a new ref.
+      4. No ACK by your first sweep or ~10 min → verify mechanically (`terminal read --cursor`, `terminal wait --for tui-idle`) and proceed. The handshake is cooperative (peers without the contract cannot ack); the mechanical check stays the arbiter, never the reverse.
+      5. Scope: full handoffs demand no callbacks (you renounced monitoring). Orchestration-plane dispatches already emit worker_done exactly once — never stack a second callback protocol on them.
 
       ## Progress collection
 

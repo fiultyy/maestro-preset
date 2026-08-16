@@ -21,7 +21,9 @@
  *   ctx.connection 并在 bridge_http_status 中报告（仅信息性，不用于路由）。
  *
  * 行为契约：
- *   POST /callback  {"type":"done|ping|status","from":"<agent@loc>","to":"<可选,默认编排1>","body":"<文本>"}
+ *   POST /callback  {"type":"ack|done|ping|status","from":"<agent@loc>","to":"<可选,默认编排1>","body":"<文本>"}
+ *     - type=ack 用于派发握手: 对端回合开始时回 "[ref:…] turn started"(见 bin/cb-send
+ *       与 skills/orca-bridge 的 ACK/DONE 契约);done 携带 ≤300 字符结果摘要
  *     - 200 校验通过且已投递（followup/inject 与 pump 同策略：idle→followup，忙→inject）
  *     - 400 校验失败（附错误详情），不投递
  *     - 208 同一 (from, body) 60s 内重复 → 已投递标记，不重复 wake
@@ -43,7 +45,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 
 /** 版本指纹：bridge_http_status 回执携带，供会话与磁盘对账。 */
-export const version = '1.0.0'
+export const version = '1.1.0'
 
 export const inject = ['agents', 'tools']
 
@@ -51,8 +53,8 @@ export const inject = ['agents', 'tools']
 export const DEDUP_WINDOW_MS = 60_000
 /** 请求体上限（字节）。 */
 export const MAX_BODY_BYTES = 256 * 1024
-/** 允许的消息 type 枚举。 */
-export const TYPES = ['done', 'ping', 'status']
+/** 允许的消息 type 枚举（ack = 派发握手: 回合已开始）。 */
+export const TYPES = ['ack', 'done', 'ping', 'status']
 /** to 缺省（仅记录，不路由）。 */
 export const DEFAULT_TO = '编排1'
 /** 回环监听地址。 */
@@ -403,7 +405,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'bridge_http_status',
     description:
-      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. The to field is recorded but never routed. HostConnectionRpc availability is reported for the record only.',
+      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. Types: ack (dispatch handshake - peer turn started), done (completion summary), ping, status. The to field is recorded but never routed. HostConnectionRpc availability is reported for the record only.',
     parameters: {},
     output: {
       schema: { type: 'string' },

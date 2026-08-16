@@ -23,10 +23,12 @@ git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/ma
 **① arm 回调泵**(会话开场调一次工具):
 
 ```
-bridge_arm { alias: "orch" }
+bridge_arm { alias: "orch" }        # 文件桥: 绑定 + 签名 orch@session-xxxx
+bridge_http_status                  # HTTP 桥: 绑定 + 起监听(回执给 curl 端点)
 ```
 
-回执给出规范签名 `orch@session-xxxx`。记住它——这是别人把回调精准投给你的地址。
+回执给出规范签名 `orch@session-xxxx`。记住它——这是别人把回调精准投给你的地址,
+也是派发握手契约里嵌给对端的回信地址(见 §5)。
 
 **② 建 Orca 桥**(一次性,Orca 重启后 handle 失效需重建): 让 agent 读 `skills/orca-bridge/SKILL.md` 执行建桥脚本,把桥 pane 的 handle 写进 `~/.dsh/maestro/bridge/handle`。桥 pane 就是一个 `cat >> inbox.log` 的终端,是外部回调进 DSH 的入口。
 
@@ -54,6 +56,18 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 编排者收到回调 → 桥把它注入成一个新回合 → 编排者更新账本、继续下一个 gate。
 
+**Orca 派发同理走握手**（`terminal send` 没有投递语义，不读终端输出确认）:
+
+```bash
+# 派发时消息末尾嵌入 ACK/DONE 契约（模板见 skills/orca-bridge/SKILL.md）:
+#   [ref:t1] 在仓库 X 跑 cargo test 并回报
+#   —— 回调契约 ——
+#   1) 回合开始: bin/cb-send ack dev1 <orch签名> t1 "turn started"
+#   2) 完成时:   bin/cb-send done dev1 <orch签名> t1 "<摘要≤300字符>"
+# 对端 ACK → 账本节点 running;DONE → 落 outcome 收口
+# 一轮 sweep 无 ACK → 退回 terminal read / wait --for tui-idle 机械校验
+```
+
 ## 6. 组件逐项
 
 ### 6.1 插件
@@ -76,6 +90,8 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 session-send   <from> <to> <type> <ref> <body>   # 发 DSHMSG;type: ping|pong|done|ask|steer|nack|ack
 session-spawn  <preset> <node> <purpose> [ws]    # 起会话+入组+命名+登记,回显 4 位码
 session-purge  <code|sessionId>                   # 删会话(确认闸门)
+cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回调;type: ack|done|ping|status
+                                                  # 派发握手投递端: HTTP 优先,文件桥兜底
 ```
 
 ## 7. 运行时状态

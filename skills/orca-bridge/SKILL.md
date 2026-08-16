@@ -46,6 +46,32 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 "$B/reply.sh" "<回复>"
 ```
 
+## 派发握手（ACK/DONE 契约，terminal send 派发必嵌）
+
+`terminal send` 没有投递语义——不要靠读终端输出确认对方收到并开始回合。监督式派发
+（supervised dispatch）在消息末尾嵌入下面的契约，把确认变成对方的两次回调：
+
+```
+[ref:<node_id>] <任务正文>
+
+—— 回调契约（收到本消息后必须执行）——
+1) 回合一开始（第一条动作前）:
+   ~/.dsh/.agent-presets/maestro/bin/cb-send ack <你的ID> <orch签名> <ref> "turn started"
+2) 完成时:
+   ~/.dsh/.agent-presets/maestro/bin/cb-send done <你的ID> <orch签名> <ref> "<结果摘要≤300字符>"
+   （cb-send 不在/失败时兜底: printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<orch签名>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log）
+```
+
+- `<orch签名>` = 编排者 `bridge_arm` 回执的 `<alias>@<sessionId>`（HTTP 通道仅记录、
+  文件桥按它路由——务必带上，别用 `*` 广播吵醒所有在册会话）。
+- 对端视角：`cb-send` 一条命令（HTTP 优先、文件桥兜底），语义见共享 skill
+  `~/.agents/skills/maestro-bridge/SKILL.md`。
+- 编排者视角：ACK 到达 → 账本节点 `running`；DONE 到达 → 落 outcome 收口。超过一轮
+  sweep（~10 分钟）无 ACK → 退回机械校验（`terminal read --cursor` /
+  `terminal wait --for tui-idle`）。握手是协作语义，机械校验兜底，方向不可倒置。
+- 边界：FULL HANDOFF 不嵌契约（已放弃监督）；orchestration 面 dispatch 已有
+  worker_done 单次回报，不叠第二套协议。
+
 ## 约定
 
 - **回声过滤**：桥 pane 是 `cat >> inbox.log`，DSH 侧 `reply.sh` 的回复会回流进

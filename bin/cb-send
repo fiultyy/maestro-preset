@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# cb-send — 任意本机进程/agent 向 maestro 编排会话发回调(派发握手 ACK/DONE 的投递端)。
+# 编排者派发 terminal send 时在消息里嵌入回调契约(见 skills/orca-bridge/SKILL.md),
+# 对端照抄本命令即可: ACK=回合已开始握手, DONE=完成+结果摘要。
+#
+# 用法: cb-send <type> <from> <to> <ref> <body>
+#   type: ack|done|ping|status
+#         ack  = 收到派发、回合已开始(握手,编排者据此把节点置 running)
+#         done = 完成,body 为 ≤300 字符结果摘要(编排者据此落账收口)
+#   from: 自己的身份,如 dev1@terminal_xx
+#   to:   编排者桥签名 <alias>@<sessionId>(bridge_arm 回执给出);广播填 *
+#   ref:  派发消息里的任务 ref(无则 -)
+#   body: 单行正文
+#
+# 信封: 单行 JSON {"type","from","to","body"};ref 折进 body 前缀 "[ref:<ref>] "
+#       (HTTP 通道丢弃未知字段,两通道统一此格式;编排者从 body 前缀解析 ref)
+# 传输: HTTP 直发(bridge/http.port,200/208 皆成功)优先;
+#       不可用(无端口文件/未 arm/连接失败)则降级文件桥(append inbox.log,游标消费不丢)。
+# 依赖: curl + python3(与 session-send 同);二者皆无时按 SKILL.md 手拼 JSON。
+set -euo pipefail
+if [ "$#" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
+typ="$1" frm="$2" to="$3" ref="$4" body="$5"
+B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
+payload=$(python3 -c '
+import json, sys
+print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
+                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}"}, ensure_ascii=False))
+' "$typ" "$frm" "$to" "$ref" "$body")
+
+# 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)
+if [ -f "$B/http.port" ] && command -v curl >/dev/null 2>&1; then
+  port=$(tr -d '[:space:]' < "$B/http.port")
+  tmp=$(mktemp)
+  code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/callback" \
+    -H 'content-type: application/json' -d "$payload" 2>/dev/null || echo 000)
+  case "$code" in
+    200|208) echo "cb-send: http ${code} $(cat "$tmp")"; rm -f "$tmp"; exit 0 ;;
+    *) echo "cb-send: http ${code} $(cat "$tmp" 2>/dev/null), falling back to file bridge" >&2 ;;
+  esac
+  rm -f "$tmp"
+fi
+
+# 2) 文件桥兜底: append inbox.log,armed 泵按游标顺序消费(at-least-once)
+mkdir -p "$B"; touch "$B/inbox.log"
+printf '%s\n' "$payload" >> "$B/inbox.log"
+echo "cb-send: file-bridge appended -> ${B}/inbox.log"

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createBridgeService, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS } from './index.js'
+import { createBridgeService, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS, TYPES } from './index.js'
 
 const bridgeDirs = []
 async function makeBridge() {
@@ -54,9 +54,23 @@ async function withService(fn, config = {}) {
 }
 
 test('exports version fingerprint', () => {
-  assert.equal(version, '1.0.0')
+  assert.equal(version, '1.1.0')
   assert.equal(DEDUP_WINDOW_MS, 60_000)
   assert.equal(MAX_BODY_BYTES, 256 * 1024)
+  assert.deepEqual(TYPES, ['ack', 'done', 'ping', 'status'])
+})
+
+test('ack (dispatch handshake) → 200 delivered, same canonical line shape', async () => {
+  await withService(async ({ delivered, post }) => {
+    const response = await post('/callback', { type: 'ack', from: 'dev1@t1', to: 'orch@session-x', body: '[ref:n1] turn started' })
+    assert.equal(response.status, 200)
+    assert.equal(response.json.status, 'delivered')
+    const parsed = JSON.parse(delivered[0])
+    assert.equal(parsed.type, 'ack')
+    assert.equal(parsed.from, 'dev1@t1')
+    assert.equal(parsed.to, 'orch@session-x')
+    assert.equal(parsed.body, '[ref:n1] turn started')
+  })
 })
 
 test('valid callback → 200 delivered; wake receives MSGBR-shaped canonical line; port file written', async () => {
@@ -182,7 +196,7 @@ test('routing guard: wrong path → 404, non-POST → 405, oversized body → 41
 test('listener binds loopback only; status reports port/bind/counters', async () => {
   await withService(async ({ service, port }) => {
     const s = service.status()
-    assert.equal(s.version, '1.0.0')
+    assert.equal(s.version, '1.1.0')
     assert.equal(s.bind.host, '127.0.0.1')
     assert.equal(s.bind.port, port)
     assert.equal(s.endpoint, `http://127.0.0.1:${port}/callback`)
