@@ -18,13 +18,18 @@ DST="${DSH_HOME:-$HOME/.dsh}/.agent-presets/maestro"
 # 排除集: .git / 运行时产物 / 镜像副本互不相干
 EXCLUDES=(--exclude .git --exclude __pycache__)
 
+# 镜像兜底(maestro-bridge 技能的 [ -x 装点 ] || 镜像 回退路径, 0006 收编)
+MIRROR="${DSH_HOME:-$HOME/.dsh}/maestro/bin"
+
 case "${1:-}" in
 --verify)
   echo "== repo -> install (装点落后项):"
   diff -rq "${EXCLUDES[@]}" "$SRC" "$DST" | sed "s|$DST|<install>|g; s|$SRC|<repo>|g" || true
   echo "== install -> repo (仓落后项, 应逐个回流):"
   diff -rq "${EXCLUDES[@]}" "$DST" "$SRC" | sed "s|$DST|<install>|g; s|$SRC|<repo>|g" || true
-  echo "== 双向清零 = 完全同步"
+  echo "== mirror drift (镜像漂移项, 下次正向同步自动齐平):"
+  diff -rq --exclude __pycache__ "$SRC/bin" "$MIRROR" 2>/dev/null | sed "s|$MIRROR|<mirror>|g; s|$SRC|<repo>|g" || true
+  echo "== 三段清零 = 完全同步"
   exit 0
   ;;
 --reverse)
@@ -54,6 +59,16 @@ else
   rm -rf "$DST/.git"
 fi
 echo "synced: $SRC -> $DST"
+
+# 镜像兜底(0006): 仓/bin → ~/.dsh/maestro/bin, 冷执行对端的稳定回退路径。
+# 只镜像 bin/(镜像角色=脚本兜底, skills/docs 有各自发现面); 排 __pycache__。
+mkdir -p "$MIRROR"
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete --exclude __pycache__ "$SRC/bin"/ "$MIRROR"/
+else
+  rm -rf "$MIRROR"; cp -a "$SRC/bin" "$MIRROR"; rm -rf "$MIRROR/__pycache__"
+fi
+echo "mirror synced: $SRC/bin -> $MIRROR"
 
 # shared/ → ~/.agents/skills: 对端 harness(Orca/zap 里的 agent)的 skill 发现面。
 # 仓库是唯一源头;~/.agents/skills 与 ~/.claude/skills 的副本/软链均由这里派生。
