@@ -58,6 +58,45 @@ cb-send 兜底"最近 armer",多编排会话同场时**误投别人**(现场实�
 协议层讨论(most-recent-armer 兜底的安全边界与 alias 稳定性)见
 `docs/callback-bridge-design.md` §8。
 
+### 3.2 编排者换代(compact 失效与继任接管)
+
+**fork 会话的 manual compact 失效**: 长对话经 fork(长 seed 重放)后, compact 无法
+收拢上下文——重放的 seed 会把体积带回来。编排者上下文过载时, 出路不是 compact,
+是**换代**。换代操作律(现场: orch1 一代→二代, 2026-08-16):
+
+1. **继任者 preset 必须 `maestro`**: 编排能力(桥工具/账本/技能面)只在 maestro preset
+   里。错用 code preset 的继任者能力受限, 只能废弃重spawn(现场 a741 教训);
+2. **会话是 host 槽, kill = retire**: 会话没有独立进程可杀, 下 kill 单即退役; 废弃
+   一个继任者 = 一条 retire 指令, 不留僵尸;
+3. **简报过继**: 卸任者把交接简报落盘(`maestro/handoff-*.md`: 专用壳/分支状态/
+   在飞票/用户偏好/机制坑速查/自迭代回路), 继任者读文即接管, 不依赖原始对话;
+4. **签名广播**: 继任者开场双通道武装拿新签名, 自检回报通过后卸任者退役; 在飞
+   worker 按新签名寻址(换代消息本身即广播)。
+
+### 3.3 回调送达假阳性与通道选择(七/八坑)
+
+**第七坑 — 回调端口代际漂移(HTTP 200 假阳性)**: `bridge/http.port` 是单文件共享,
+每个会话 `bridge_http_status` 都会**覆写**它——文件永远指向**最新武装代际**的桥。
+cb-send HTTP 优先读当前端口 POST: 目标若是旧代际签名, 显式 `to` 在新一代桥上无
+匹配槽 → v1.2 兜底 most-recent-armer → **新会话自己吸收** → HTTP 200 delivered
+**假阳性**(实投自己/别人, 真目标永等不到; 现场: 换代 done 两连投全假阳性)。
+
+**第八坑 — HTTP delivered 不回写 inbox, 会话驱动唯一可靠通道是 session-send**:
+message-bridge v1.2 的 HTTP 路径**不落 `bridge/inbox.log`**——文件泵(v3.6)的游标/
+死信/轮转/at-least-once 整个消费面看不到 HTTP 消息; "delivered" 只证明某桥的 HTTP
+面收了, 不构成持久证据, 更不证明目标会话被驱动。跨 main 会话**驱动回合**的可靠
+通道只有 `bin/session-send`(回环 `/api/session.prompt`, `accepted=True` 实证)。
+
+**判定纪律**:
+
+- cb-send 的 HTTP 200 delivered **≠ 送达目标**; 定向回调跨代际(目标早于当前
+  http.port 持有者武装)时, 必须以**目标侧回合响应**为送达证据;
+- 无响应 → 改走 `session-send` 直驱目标会话回合(现场终验通道); 桥是回调面,
+  不是会话驱动面;
+- 插件级修复落 `docs/tickets/0005`(v1.3 显式 to 失配→404 不吸收 + 降级文件桥;
+  delivered 回写 inbox 统一消费面待评), 按 §10.2 plugins 强制 git 分支路径实施;
+  设计侧见 `docs/callback-bridge-design.md` §9。
+
 ## 4. 核心概念(30 秒版
 
 - **三平面**: Orca(worktree/terminal/repo/浏览器)、zap(GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
@@ -132,6 +171,7 @@ session-spawn  <preset> <node> <purpose> [ws]    # 起会话+入组+命名+登�
 session-purge  <code|sessionId>                   # 删会话(确认闸门)
 cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回调;type: ack|done|ping|status
                                                   # 派发握手投递端: HTTP 优先,文件桥兜底
+                                                   # ⚠ HTTP 200 delivered≠送达目标(§3.3 七/八坑)
 fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004): termid 回报匹配才
                [--reverify] [--status T]         # verified 入册;编排回调回合验证 from==termid
 ```
