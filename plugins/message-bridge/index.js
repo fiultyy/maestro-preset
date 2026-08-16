@@ -45,7 +45,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 
 /** 版本指纹：bridge_http_status 回执携带，供会话与磁盘对账。 */
-export const version = '1.1.0'
+export const version = '1.2.0'
 
 export const inject = ['agents', 'tools']
 
@@ -373,10 +373,29 @@ export function createBridgeService(config) {
   return { start, stop, status, get port() { return rt.boundPort } }
 }
 
+/**
+ * 按投递目标挑选唤醒槽（v1.2,incident 0003）:
+ * to 形如 <alias>@<sessionId> / 裸 sessionId / 裸 alias 时精确路由;
+ * 匹配不到或 to 缺省 → 最近 arm 的会话(向后兼容单会话行为)。
+ * 纯函数,导出供单测。
+ */
+export function pickRecipient(to, knownSessionIds, lastArmedId) {
+  if (typeof to === 'string' && to.length > 0) {
+    for (const sid of knownSessionIds) {
+      if (to === sid || to.endsWith(`@${sid}`) || to.includes(sid)) return sid
+    }
+  }
+  return lastArmedId ?? null
+}
+
 export function apply(ctx) {
   const agents = ctx.agents
   const bridgeDir = process.env.MAESTRO_BRIDGE ?? `${process.env.HOME}/.dsh/maestro/bridge`
-  const state = { agent: null, service: null, hostRpcAvailable: undefined }
+  // v1.2: HTTP 服务进程级单例(端口/去重全局),但 agent 绑定按 sessionId 分槽——
+  // 单槽会被后 arm 的会话抢占(incident 0003 冷测回调全数劫持)。
+  const slots = new Map() // sessionId -> agent
+  let lastArmedId = null
+  const state = { service: null, hostRpcAvailable: undefined }
 
   try {
     state.hostRpcAvailable = typeof ctx.get === 'function' ? ctx.get('connection') !== undefined : false
@@ -385,7 +404,14 @@ export function apply(ctx) {
   }
 
   const wake = (line) => {
-    const agent = state.agent
+    let targetId = null
+    try {
+      const envelope = JSON.parse(line)
+      targetId = pickRecipient(envelope?.to, [...slots.keys()], lastArmedId)
+    } catch {
+      targetId = lastArmedId
+    }
+    const agent = targetId === null ? null : slots.get(targetId) ?? null
     if (agent === null) {
       throw Object.assign(
         new Error('message-bridge not armed: call bridge_http_status in the target session first'),
@@ -396,7 +422,7 @@ export function apply(ctx) {
       id: randomUUID(),
       role: 'user',
       content: [{ type: 'text', text: `MSGBR] ${line}` }],
-      source: { kind: 'plugin', plugin: '@maestro/message-bridge', form: 'notice', summary: 'Message bridge callback' },
+      source: { kind: 'plugin', plugin: '@maestro/message-bridge', form: 'notice', summary: `Message bridge callback routed to ${targetId}` },
     })
     if (agent.status === 'idle') agent.followup(message)
     else agent.inject(message)
@@ -405,18 +431,22 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'bridge_http_status',
     description:
-      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. Types: ack (dispatch handshake - peer turn started), done (completion summary), ping, status. The to field is recorded but never routed. HostConnectionRpc availability is reported for the record only.',
+      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. Types: ack (dispatch handshake - peer turn started), done (completion summary), ping, status. Since v1.2 the to field routes: <alias>@<sessionId> or bare sessionId wakes exactly that armed session; unmatched or missing to wakes the most recent armer. HostConnectionRpc availability is reported for the record only.',
     parameters: {},
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: String(value) }],
     },
     async execute() {
+      let agent
       try {
-        state.agent = agents.requireInitiator()
+        agent = agents.requireInitiator()
       } catch (error) {
         return `cannot resolve initiating agent: ${error?.message}`
       }
+      const sessionId = String(agent.id)
+      slots.set(sessionId, agent)
+      lastArmedId = sessionId
       if (state.service === null) {
         state.service = createBridgeService({ bridgeDir, wake })
       }
@@ -431,6 +461,7 @@ export function apply(ctx) {
         return `message-bridge failed to start listener: ${startedError}; counters: ${JSON.stringify(s.counters)}`
       }
       return `message-bridge v${version} armed: ${s.endpoint} (pid ${s.pid}); `
+        + `this session ${sessionId} (${slots.size} armed slot(s), routing: to=<alias>@<sessionId> exact, else most-recent armer); `
         + `port file ${s.portFile}; `
         + `curl -X POST ${s.endpoint} -H 'content-type: application/json' `
         + `-d '{"type":"done","from":"<agent@loc>","body":"…"}'; `

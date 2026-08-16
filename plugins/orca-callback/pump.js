@@ -1,5 +1,10 @@
 /**
- * @maestro/orca-callback — 原生 Orca→DSH 回调泵插件 (v3.5)
+ * @maestro/orca-callback — 原生 Orca→DSH 回调泵插件 (v3.6)
+ *
+ * v3.6 相对 v3.5 的变更（incident 0003：多编排会话单例互杀）：
+ *   apply() 的 state 按 sessionId 分槽——pump/watcher/agent 绑定每会话独立,
+ *   绝不跨会话复用（v3.5 单例下,首 arm 会话创建 pump,后续会话 arm 只是其
+ *   幻注册+身份劫持）。bridge_arm 回执对账盘上 registry:条目不在即 INCONSISTENT。
  *
  * 机制（v3.5，v3.4 之上的多消费者路由迭代）：
  *   Orca 侧任意 agent:
@@ -61,7 +66,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 
 /** 版本指纹：会话 arm 回执与磁盘插件对账用。 */
-export const version = '3.5.0'
+export const version = '3.6.0'
 
 export const inject = ['agents', 'tools']
 
@@ -188,6 +193,15 @@ export function resolveRouting(address, self, registry) {
 
 // ---- 注册表（bridge/registry.json，原子写） ----
 
+// v3.6: 同进程多 pump 并发读改写会撞同一 tmp 路径(ENOENT/丢更新)——
+// 模块级链串行化全部 registry 写操作(registerSelf/unregisterSelf)。
+let registryOpChain = Promise.resolve()
+function serializeRegistryOp(operation) {
+  const next = registryOpChain.then(operation, operation)
+  registryOpChain = next.catch(() => {})
+  return next
+}
+
 function sanitizeConsumers(raw) {
   const out = {}
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
@@ -203,7 +217,7 @@ function sanitizeConsumers(raw) {
   return out
 }
 
-async function readRegistry(registryPath) {
+export async function readRegistry(registryPath) {
   try {
     const txt = await fsp.readFile(registryPath, 'utf8')
     const parsed = JSON.parse(txt)
@@ -215,8 +229,7 @@ async function readRegistry(registryPath) {
     }
   } catch {
     // 缺失或损坏：视为空表；本轮 registerSelf 的读改写会自愈自身条目。
-  }
-  return { version: null, consumers: {} }
+  }  return { version: null, consumers: {} }
 }
 
 async function writeRegistryAtomic(registryPath, registry) {
@@ -364,26 +377,31 @@ export function createPump(config) {
     if (rt.armedAt === null) rt.armedAt = isoOf(now)
     own.armedAt = rt.armedAt
     own.pid = process.pid
-    const registry = await readRegistry(paths.registry)
-    registry.version = version
-    registry.consumers[consumer.sessionId] = { alias: own.alias, pid: own.pid, armedAt: rt.armedAt }
-    try {
-      await writeRegistryAtomic(paths.registry, registry)
-      rt.registered = true
-    } catch (error) {
-      console.error('orca-callback registry.json write failed:', errorMessage(error))
-    }
+    const registry = await serializeRegistryOp(async () => {
+      const current = await readRegistry(paths.registry)
+      current.version = version
+      current.consumers[consumer.sessionId] = { alias: own.alias, pid: own.pid, armedAt: rt.armedAt }
+      try {
+        await writeRegistryAtomic(paths.registry, current)
+        rt.registered = true
+      } catch (error) {
+        console.error('orca-callback registry.json write failed:', errorMessage(error))
+      }
+      return current
+    })
     // 即使落盘失败也把自身并入内存视图：路由/undertaker 判定不因 IO 抖动丢自己。
     return registry
   }
 
   async function unregisterSelf() {
     try {
-      const registry = await readRegistry(paths.registry)
-      if (registry.consumers[consumer.sessionId] === undefined) return
-      delete registry.consumers[consumer.sessionId]
-      registry.version = version
-      await writeRegistryAtomic(paths.registry, registry)
+      await serializeRegistryOp(async () => {
+        const registry = await readRegistry(paths.registry)
+        if (registry.consumers[consumer.sessionId] === undefined) return
+        delete registry.consumers[consumer.sessionId]
+        registry.version = version
+        await writeRegistryAtomic(paths.registry, registry)
+      })
     } catch (error) {
       console.error('orca-callback registry.json unregister failed:', errorMessage(error))
     } finally {
@@ -661,44 +679,35 @@ export function createPump(config) {
 export function apply(ctx) {
   const agents = ctx.agents
   const bridgeDir = process.env.MAESTRO_BRIDGE ?? `${process.env.HOME}/.dsh/maestro/bridge`
-  const state = { agent: null, watcher: null, pump: null, canonical: null }
 
-  const wake = (line, info) => {
-    const agent = state.agent
-    if (agent === null) {
-      throw new Error('bridge not armed: no agent bound (call bridge_arm in this session first)')
+  // v3.6（incident 0003）：preset 按 standing scope 只挂载一次，apply() 全程仅跑
+  // 一遍——state 绝不能是闭包单例，否则首个 arm 的会话创建 pump 后，后续会话的
+  // arm 只是"替别人的 pump 干活 + 回执按自己现算的签名撒谎"（幻注册 + 身份劫持）。
+  // 故 state 按 sessionId 分槽：每会话独立的 pump/watcher/agent 绑定，互不复用。
+  const slots = new Map() // sessionId -> { agent, alias, canonical, pump, watcher }
+
+  function makeWake(slot) {
+    return (line, info) => {
+      const message = Object.freeze({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: `ORCA-CB] ${line}` }],
+        source: {
+          kind: 'plugin',
+          plugin: '@maestro/orca-callback',
+          form: 'notice',
+          summary: `Orca bridge callback routed to ${info?.consumer ?? slot.canonical}`,
+        },
+      })
+      if (slot.agent.status === 'idle') slot.agent.followup(message)
+      else slot.agent.inject(message)
     }
-    const message = Object.freeze({
-      id: randomUUID(),
-      role: 'user',
-      content: [{ type: 'text', text: `ORCA-CB] ${line}` }],
-      source: {
-        kind: 'plugin',
-        plugin: '@maestro/orca-callback',
-        form: 'notice',
-        summary: `Orca bridge callback routed to ${info?.consumer ?? state.canonical ?? '(unrouted)'}`,
-      },
-    })
-    if (agent.status === 'idle') agent.followup(message)
-    else agent.inject(message)
-  }
-
-  const arm = () => {
-    if (state.watcher !== null) return 'already armed'
-    state.watcher = watch(bridgeDir, (_event, filename) => {
-      if (filename === 'inbox.log') {
-        state.pump.flush().catch((error) => {
-          console.error('orca-callback flush failed:', error?.message)
-        })
-      }
-    })
-    return 'armed'
   }
 
   ctx.tools.register({
     name: 'bridge_arm',
     description:
-      'Arm the Orca callback pump (v3.5, multi-consumer routing) for this session: bind the calling agent to the bridge inbox watcher and register it in bridge/registry.json (sid/pid/armedAt/alias). Each incoming Orca callback is routed by its "to" field: <alias>@<sessionId>, bare <sessionId>, or "*" (broadcast wakes every registered consumer once); legacy bare aliases resolve via the registry and ambiguous ones dead-letter. This consumer keeps its own cursor file .cursor.<sessionId>, scans past all rows, and wakes only on rows addressed to itself. Delivery is at-least-once with a 60s (from,body) dedup window and 2s-backoff retries (3 strikes -> dead.log); unaddressable and malformed rows go to bridge/dead.log; DSH-RE] echoes are skipped and archived to bridge/echo.log; inbox rotates to inbox.log.1 past 1MB/1000 lines only after every registered consumer reached the tail; counters live in bridge/state.json per consumer. Acks must be signed <alias>@<sessionId>. Call once at session start when Orca-driven callbacks are wanted.',
+      'Arm the Orca callback pump (v3.6, multi-consumer routing) for this session: bind the calling agent to the bridge inbox watcher and register it in bridge/registry.json (sid/pid/armedAt/alias). Each incoming Orca callback is routed by its "to" field: <alias>@<sessionId>, bare <sessionId>, or "*" (broadcast wakes every registered consumer once); legacy bare aliases resolve via the registry and ambiguous ones dead-letter. This consumer keeps its own cursor file .cursor.<sessionId>, scans past all rows, and wakes only on rows addressed to itself. Delivery is at-least-once with a 60s (from,body) dedup window and 2s-backoff retries (3 strikes -> dead.log); unaddressable and malformed rows go to bridge/dead.log; DSH-RE] echoes are skipped and archived to bridge/echo.log; inbox rotates to inbox.log.1 past 1MB/1000 lines only after every registered consumer reached the tail; counters live in bridge/state.json per consumer. Acks must be signed <alias>@<sessionId>. Call once at session start when Orca-driven callbacks are wanted. The receipt verifies the registry entry on disk (fail-loud on phantom registration).',
     parameters: {
       type: 'object',
       properties: {
@@ -720,39 +729,74 @@ export function apply(ctx) {
         : (typeof process.env.MAESTRO_BRIDGE_ALIAS === 'string' && process.env.MAESTRO_BRIDGE_ALIAS.length > 0
           ? process.env.MAESTRO_BRIDGE_ALIAS
           : null)
+      let agent
       try {
-        state.agent = agents.requireInitiator()
+        agent = agents.requireInitiator()
       } catch (error) {
         return `cannot resolve initiating agent: ${error?.message}`
       }
-      const sessionId = String(state.agent.id)
-      state.canonical = alias === null ? sessionId : `${alias}@${sessionId}`
-      if (state.pump === null) {
-        state.pump = createPump({ bridgeDir, wake, consumer: { sessionId, alias } })
+      const sessionId = String(agent.id)
+      const canonical = alias === null ? sessionId : `${alias}@${sessionId}`
+      let slot = slots.get(sessionId)
+      if (slot === undefined) {
+        slot = { agent, alias, canonical, pump: null, watcher: null }
+        slots.set(sessionId, slot)
+      } else {
+        // 重复 arm：刷新绑定与签名（别名可变），但绝不复用他人的 pump。
+        slot.agent = agent
+        slot.alias = alias
+        slot.canonical = canonical
       }
-      arm()
+      if (slot.pump === null) {
+        slot.pump = createPump({ bridgeDir, wake: makeWake(slot), consumer: { sessionId, alias } })
+      }
+      if (slot.watcher === null) {
+        slot.watcher = watch(bridgeDir, (_event, filename) => {
+          if (filename === 'inbox.log') {
+            slot.pump.flush().catch((error) => {
+              console.error('orca-callback flush failed:', error?.message)
+            })
+          }
+        })
+      }
       try {
-        await state.pump.flush()
+        await slot.pump.flush()
       } catch (error) {
-        return `bridge armed (pump v${version}) as ${state.canonical} but initial flush failed: ${error?.message}`
+        return `bridge armed (pump v${version}) as ${canonical} but initial flush failed: ${error?.message}`
       }
-      return `bridge armed (orca-callback pump v${version}): consumer ${state.canonical} bound + registered in `
-        + `bridge/registry.json (pid ${process.pid}); addressing: to=<alias>@<sessionId> | <sessionId> | "*" broadcast `
+      // 回执对账（0003 幻注册防线）：flush 声称注册完成，但必须盘上确有其事。
+      let onDisk = false
+      try {
+        const registry = await readRegistry(`${bridgeDir}/registry.json`)
+        onDisk = registry.consumers[sessionId] !== undefined
+      } catch {
+        onDisk = false
+      }
+      if (!onDisk) {
+        return `bridge arm INCONSISTENT as ${canonical}: flush 完成但 registry.json 无本会话条目 — `
+          + `检查桥目录(${bridgeDir})写权限;回调无法路由到本会话,本 arm 不可信`
+      }
+      return `bridge armed (orca-callback pump v${version}): consumer ${canonical} bound + registered in `
+        + `bridge/registry.json (pid ${process.pid}, verified on disk); addressing: to=<alias>@<sessionId> | <sessionId> | "*" broadcast `
         + `(legacy bare aliases resolve via registry, ambiguous ones dead-letter); per-consumer cursor .cursor.${sessionId}; `
         + `at-least-once wake with ${Math.round(DEDUP_WINDOW_MS / 1000)}s dedup window; `
         + `unknown-addressee/malformed/retry-exhausted lines -> bridge/dead.log; `
         + `DSH-RE] echoes skipped+archived (replies belong in bridge/echo.log); `
         + `rotation @ ${ROTATE_MAX_LINES} lines / ${Math.round(ROTATE_MAX_BYTES / 1024 / 1024)}MB gated on all registered consumers; `
-        + `counters in bridge/state.json (per consumer); sign acks as ${state.canonical}`
+        + `counters in bridge/state.json (per consumer); sign acks as ${canonical}`
     },
   })
 
   ctx.effect(() => () => {
-    if (state.watcher !== null) {
-      state.watcher.close()
-      state.watcher = null
+    // scope teardown（宿主停机）：逐槽关闭 watcher + 卸册,只动自己的条目。
+    for (const slot of slots.values()) {
+      if (slot.watcher !== null) {
+        slot.watcher.close()
+        slot.watcher = null
+      }
+      void slot.pump?.dispose()
     }
-    void state.pump?.dispose()
+    slots.clear()
   })
 }
 

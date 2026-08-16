@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createBridgeService, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS, TYPES } from './index.js'
+import { createBridgeService, apply, pickRecipient, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS, TYPES } from './index.js'
 
 const bridgeDirs = []
 async function makeBridge() {
@@ -54,7 +54,7 @@ async function withService(fn, config = {}) {
 }
 
 test('exports version fingerprint', () => {
-  assert.equal(version, '1.1.0')
+  assert.equal(version, '1.2.0')
   assert.equal(DEDUP_WINDOW_MS, 60_000)
   assert.equal(MAX_BODY_BYTES, 256 * 1024)
   assert.deepEqual(TYPES, ['ack', 'done', 'ping', 'status'])
@@ -196,7 +196,7 @@ test('routing guard: wrong path → 404, non-POST → 405, oversized body → 41
 test('listener binds loopback only; status reports port/bind/counters', async () => {
   await withService(async ({ service, port }) => {
     const s = service.status()
-    assert.equal(s.version, '1.1.0')
+    assert.equal(s.version, '1.2.0')
     assert.equal(s.bind.host, '127.0.0.1')
     assert.equal(s.bind.port, port)
     assert.equal(s.endpoint, `http://127.0.0.1:${port}/callback`)
@@ -206,4 +206,73 @@ test('listener binds loopback only; status reports port/bind/counters', async ()
     assert.equal(typeof address, 'number')
     assert.ok(address > 0)
   })
+})
+
+// ------------------------------------------------ apply 层多会话（incident 0003）
+
+function fakeAgent(id) {
+  return {
+    id,
+    status: 'idle',
+    received: [],
+    followup(message) { this.received.push(message) },
+    inject(message) { this.received.push(message) },
+  }
+}
+
+function fakeCtx() {
+  const tools = new Map()
+  const harness = {
+    current: null,
+    teardown: null,
+    agents: { requireInitiator: () => { if (!harness.current) throw new Error('no initiator'); return harness.current } },
+    tools: { register: (t) => tools.set(t.name, t) },
+    effect: (fn) => { harness.teardown = fn() },
+  }
+  return { ctx: harness, tools, harness }
+}
+
+test('pickRecipient: exact sid / alias@sid / bare sid route; unmatched or missing to → last armer', () => {
+  const known = ['session-ka', 'session-kb']
+  assert.equal(pickRecipient('session-ka', known, 'session-kb'), 'session-ka')
+  assert.equal(pickRecipient('orchB@session-kb', known, 'session-ka'), 'session-kb')
+  assert.equal(pickRecipient('nobody@session-zz', known, 'session-ka'), 'session-ka')
+  assert.equal(pickRecipient(undefined, known, 'session-kb'), 'session-kb')
+  assert.equal(pickRecipient('', known, null), null)
+})
+
+test('apply slots per session: to=<alias>@<sid> wakes exactly that session; missing to wakes last armer', async () => {
+  const dir = await makeBridge()
+  const prev = process.env.MAESTRO_BRIDGE
+  process.env.MAESTRO_BRIDGE = dir
+  const A = fakeAgent('session-ma')
+  const B = fakeAgent('session-mb')
+  const { ctx, tools, harness } = fakeCtx()
+  apply(ctx)
+  try {
+    harness.current = A
+    await tools.get('bridge_http_status').execute()
+    harness.current = B
+    const receipt = await tools.get('bridge_http_status').execute()
+    assert.match(receipt, /2 armed slot/)
+
+    const port = Number((await readFile(join(dir, 'http.port'), 'utf8')).trim())
+    const post = (payload) => fetch(`http://127.0.0.1:${port}/callback`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    // 定向 A(后 arm 的是 B: to 路由必须压过 last-armer 兜底——0003 劫持形态)
+    assert.equal((await post({ type: 'ping', from: 'x@t', to: 'orch@session-ma', body: 'to A' })).status, 200)
+    assert.equal((await post({ type: 'ping', from: 'x@t', to: 'session-mb', body: 'to B' })).status, 200)
+    assert.equal((await post({ type: 'ping', from: 'x@t', body: 'no to' })).status, 200)
+    assert.equal(A.received.length, 1)
+    assert.equal(B.received.length, 2)
+    assert.match(A.received[0].content[0].text, /MSGBR\].*"to":"orch@session-ma"/)
+  } finally {
+    harness.teardown?.() // 停 HTTP listener:放 finally,断言失败也不拖住进程
+    if (prev === undefined) delete process.env.MAESTRO_BRIDGE
+    else process.env.MAESTRO_BRIDGE = prev
+  }
 })
