@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""fleet-probe — Orca 终端准入探测: termid 回报验证后才入编排列表(ticket 0004)
+
+用法:
+  fleet-probe <termid> [--wait <secs>]    探测一个终端;--wait 轮询 fleet.json 等验证
+  fleet-probe --reverify [--timeout <s>]  批量重探所有 verified/orca-terminal 条目
+  fleet-probe --status <termid>           查看探测状态
+
+机制:
+  $ORCA_TERMINAL_HANDLE 是 OMP 注入的进程私有 env,只有终端里的 agent 自己读得到
+  ——「回报 termid 正确」一探三验: 终端活(handle 有效) + agent 活(会读 env/跑命令)
+  + 回调链路通(回报走 cb-send 正式通道)。
+
+  本脚本只负责: 快检 handle → 发探测消息 → fleet 条目置 probing。
+  验证在编排者回调回合完成(回报 from == termid → verified;见 persona/USAGE),
+  --wait 轮询 fleet.json 等编排者落笔。
+
+fleet 条目(orca-terminal 类):
+  { "kind": "orca-terminal", "handle": <termid>, "status": "probing|verified|mismatch",
+    "probedAt": iso, "verifiedAt": iso|null, "lastSeenAt": iso|null, "alias": str|null }
+
+环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json) / ORCA_CLI_COMMAND(默认 orca-ide)
+      MAESTRO_PRESET_BIN(cb-send 位置,默认 ~/.dsh/.agent-presets/maestro/bin)
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+FLEET = os.environ.get('MAESTRO_FLEET', f'{HOME}/maestro/fleet.json')
+ORCA = os.environ.get('ORCA_CLI_COMMAND', 'orca-ide')
+PRESET_BIN = os.environ.get(
+    'MAESTRO_PRESET_BIN', f'{HOME}/.agent-presets/maestro/bin')
+PROBE_TIMEOUT_DEFAULT = 600  # probing 超 10 分钟由 sweep 判 unresponsive
+
+
+def die(msg: str, code: int = 1):
+    print(f'fleet-probe: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def load_fleet() -> dict:
+    try:
+        with open(FLEET) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {'port': 3080, 'fleet': {}}
+
+
+def save_fleet(fleet: dict):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(FLEET), prefix='.fleet-', suffix='.json')
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(fleet, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, FLEET)
+
+
+def run_orca(*args, timeout=30) -> subprocess.CompletedProcess:
+    return subprocess.run([ORCA, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def handle_alive(termid: str) -> bool:
+    """快检: handle 是否还有效(terminal read 能应答即活,不消费输出)。"""
+    try:
+        proc = run_orca('terminal', 'read', '--terminal', termid, '--limit', '1', '--json')
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        die(f'orca CLI unavailable: {exc}', 3)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout)
+        return bool(payload.get('ok'))
+    except json.JSONDecodeError:
+        return False
+
+
+def probe_message(termid: str, orch_signature: str) -> str:
+    cb = f'{PRESET_BIN}/cb-send'
+    return (
+        f'[ref:probe:{termid}] 编排准入探测(一次性,完成后无后续动作):\n'
+        f'1) 读你的终端身份: echo $ORCA_TERMINAL_HANDLE\n'
+        f'   (或 bash ~/.agents/skills/orcard/scripts/self-id.sh 出完整表卡)\n'
+        f'2) 立即回调(把 <handle> 换成上面读到的值):\n'
+        f'   {cb} ack <handle> {orch_signature} probe:{termid} "probe ok, handle=<handle>"\n'
+        f'3) 除此之外不要做任何事。'
+    )
+
+
+def send_probe(termid: str, orch_signature: str) -> bool:
+    msg = probe_message(termid, orch_signature)
+    try:
+        proc = run_orca('terminal', 'send', '--terminal', termid,
+                        '--text', msg, '--enter', '--json')
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        die(f'orca CLI unavailable: {exc}', 3)
+    if proc.returncode != 0:
+        return False
+    try:
+        return bool(json.loads(proc.stdout).get('ok'))
+    except json.JSONDecodeError:
+        return False
+
+
+def upsert_probing(fleet: dict, termid: str) -> dict:
+    entry = fleet['fleet'].get(termid, {})
+    entry.update({
+        'kind': 'orca-terminal',
+        'handle': termid,
+        'status': 'probing',
+        'probedAt': now_iso(),
+    })
+    entry.setdefault('verifiedAt', None)
+    entry.setdefault('lastSeenAt', None)
+    entry.setdefault('alias', None)
+    fleet['fleet'][termid] = entry
+    return entry
+
+
+def probe(termid: str, wait: float):
+    if not handle_alive(termid):
+        die(f'handle dead or unreachable: {termid} (terminal read failed) — not probing', 4)
+    fleet = load_fleet()
+    orch_sig = os.environ.get('MAESTRO_ORCH_SIGNATURE')
+    if not orch_sig:
+        die('MAESTRO_ORCH_SIGNATURE unset — pass <alias>@<sessionId> of this orchestrator', 2)
+    if not send_probe(termid, orch_sig):
+        die(f'terminal send failed for {termid}', 5)
+    entry = upsert_probing(fleet, termid)
+    save_fleet(fleet)
+    print(f'probing: {termid} (probe sent, waiting orchestrator verification)')
+
+    if wait <= 0:
+        print('note: verification lands in the orchestrator callback turn; rerun with --status')
+        return
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        fleet = load_fleet()
+        status = fleet['fleet'].get(termid, {}).get('status')
+        if status != 'probing':
+            print(json.dumps(fleet['fleet'][termid], ensure_ascii=False, indent=2))
+            return
+        time.sleep(2)
+    print(f'timeout: {termid} still probing after {wait:.0f}s '
+          f'(sweep marks unresponsive past {PROBE_TIMEOUT_DEFAULT}s)')
+    sys.exit(6)
+
+
+def reverify(timeout: float):
+    fleet = load_fleet()
+    terms = {k: v for k, v in fleet['fleet'].items()
+             if v.get('kind') == 'orca-terminal' and v.get('status') == 'verified'}
+    if not terms:
+        print('no verified orca-terminal entries to reverify')
+        return
+    orch_sig = os.environ.get('MAESTRO_ORCH_SIGNATURE')
+    if not orch_sig:
+        die('MAESTRO_ORCH_SIGNATURE unset — pass <alias>@<sessionId> of this orchestrator', 2)
+    stale, reprobed = [], []
+    for termid in terms:
+        if handle_alive(termid):
+            if send_probe(termid, orch_sig):
+                fleet = load_fleet()  # 重读: 回调可能已并发落笔
+                fleet['fleet'][termid]['status'] = 'probing'
+                fleet['fleet'][termid]['probedAt'] = now_iso()
+                save_fleet(fleet)
+                reprobed.append(termid)
+                continue
+        fleet = load_fleet()
+        fleet['fleet'][termid]['status'] = 'stale'
+        save_fleet(fleet)
+        stale.append(termid)
+    print(json.dumps({'reprobed': re-probed, 'stale': stale}, ensure_ascii=False, indent=2))
+
+
+def status(termid: str):
+    entry = load_fleet()['fleet'].get(termid)
+    if entry is None:
+        die(f'no fleet entry for {termid}', 7)
+    print(json.dumps(entry, ensure_ascii=False, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description='fleet admission probe (ticket 0004)')
+    ap.add_argument('termid', nargs='?', help='terminal handle to probe (term_…)')
+    ap.add_argument('--wait', type=float, default=0, help='poll fleet.json up to N seconds')
+    ap.add_argument('--reverify', action='store_true', help='re-probe all verified orca-terminals')
+    ap.add_argument('--timeout', type=float, default=60, help='reverify per-terminal quick-check timeout')
+    ap.add_argument('--status', metavar='TERMID', help='show probe status for a terminal')
+    args = ap.parse_args()
+
+    if args.status:
+        status(args.status)
+        return
+    if args.reverify:
+        reverify(args.timeout)
+        return
+    if not args.termid:
+        ap.print_help()
+        sys.exit(2)
+    probe(args.termid, args.wait)
+
+
+if __name__ == '__main__':
+    main()

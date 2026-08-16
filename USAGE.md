@@ -105,6 +105,8 @@ session-spawn  <preset> <node> <purpose> [ws]    # 起会话+入组+命名+登�
 session-purge  <code|sessionId>                   # 删会话(确认闸门)
 cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回调;type: ack|done|ping|status
                                                   # 派发握手投递端: HTTP 优先,文件桥兜底
+fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004): termid 回报匹配才
+               [--reverify] [--status T]         # verified 入册;编排回调回合验证 from==termid
 ```
 
 ## 7. 运行时状态

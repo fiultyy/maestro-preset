@@ -51,7 +51,8 @@ maestro/
 │   ├── session-send      #   跨会话消息直发(DSHMSG 信封 → /api/session.prompt)
 │   ├── session-spawn     #   起新会话并入 fleet
 │   ├── session-purge     #   调 session-purge 插件的 purge 端口
-│   └── cb-send           #   对端回调投递(派发握手 ACK/DONE;HTTP 优先,文件桥兜底)
+│   ├── cb-send           #   对端回调投递(派发握手 ACK/DONE;HTTP 优先,文件桥兜底)
+│   └── fleet-probe       #   Orca 终端准入探测(termid 回报验证后才入编排列表)
 ├── shared/               # 对端共享 skill(镜像到 ~/.agents/skills,供其他 harness 的 agent 发现)
 │   └── maestro-bridge/   #   冷执行回调手册(身份自查/cb-send/消息语义/红线/排查)
 └── docs/                 # 设计文档(含 callback-bridge 抽象设计与 DSH 插件打包面事实)

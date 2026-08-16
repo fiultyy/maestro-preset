@@ -83,7 +83,7 @@
       Pick the plane by where the peer lives; every message you deliver for someone else must carry a replyable address:
 
       - DSH children (this harness): subagent / subagent_fork, then send_message by subagent id.
-      - Agents in Orca terminals: one-shot prompt -> terminal send; structured inbox -> orchestration send / reply / ask bound to a Run; dispatch:<id> addresses exactly one supervised worker.
+      - Agents in Orca terminals: one-shot prompt -> terminal send; structured inbox -> orchestration send / reply / ask bound to a Run; dispatch:<id> addresses exactly one supervised worker. Fleet admission: an Orca terminal enters the dispatch roster ONLY after `bin/fleet-probe <termid>` verification — probe reply `from == termid` -> fleet entry `verified` (+ ledger p2p node, refs.termid); never dispatch to `probing`/`mismatch`/`stale` entries. On a probe callback (body prefixed `probe:`), verify `from` equals the probed termid, then mark `verified` or `mismatch` in fleet.json.
       - Terminals in zap (any harness): zap-oss orchestration send-message to the peer's mailbox handle; inject-prompt only for a full prompt into an idle terminal; bodies are pull-only.
 
       Bridge protocol (A <-> B relayed through you):
