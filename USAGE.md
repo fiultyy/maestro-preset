@@ -187,6 +187,20 @@ bin/dev-sync.sh    # rsync(或 cp)仓库 → ~/.dsh/.agent-presets/maestro,排�
 + **哈希比对**（`git rev-parse HEAD` 与 ls-remote 返回值逐字一致才算推上）。不一致 →
 查 lfs/网络后重推，直到哈希对上为止。
 
+### 10.2 自迭代路径分治
+
+preset 三类构件的爆炸半径不同,自迭代**按构件选路径**,不一刀切:
+
+| 构件 | 路径 | 理由 |
+|---|---|---|
+| 文档(USAGE/README/docs) | **路径1: git 直改** | 不进会话运行面,改错无爆炸半径;仓库即真源 |
+| `bin/` + `skills/` | **路径2: 先 .dsh 后 sync** | 产物是脚本/手册,按需从磁盘读;先在安装点改+新会话验证,再 sync-back 落仓库 |
+| `plugins/` | **路径1: 强制 git 分支迭代** | 爆炸半径 = **全体会话回调面**(pump/bridge 一挂,所有编排会话断流);branch/fix-forward/revert/bisect 是刚需,**禁止在安装点直改** |
+
+**护栏一: sync-back 必须脚本化**。`dev-sync.sh` 增 `--reverse`(从安装点**生成 patch**,不直接覆盖仓库)与 `--verify`(输出双向 diff 报告);**禁止手工 cp 安装点文件覆盖回仓库**。且**每次 sync-back 当场一条 commit,禁攒包**——攒包会把多轮实验混进一笔提交,破坏 revert/bisect 的最小单元。
+
+**护栏二: 验证必须新 spawn 会话跑**。运行中会话(含编排者自身)在加入时钉死旧代际(§9),体内验证永远跑在旧代码上,结论无效;任何"改完了、验证过"必须开新会话执行后才算数。
+
 ## 11. headless 借壳纪律
 
 headless 进程/agent（无 `ORCA_TERMINAL_HANDLE`，如 cron、脚本、无 Orca 终端的会话）
