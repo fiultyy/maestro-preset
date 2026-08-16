@@ -231,3 +231,107 @@ interface ConsumerRef { sessionId:string; alias?:string }
 - **HTTP-R2**: `http.state.json` 是否并入主 `state.json` consumers 分节(建议并,减少一个观测文件;保留 port 文件)。
 - **前缀统一**: `MSGBR] ` 退役统一为 `ORCA-CB] ` 会改变会话内可见行前缀——若下游有按前缀 grep 的脚本需先扫一遍(已知: 无)。
 - **多 host 实例**: v3.5 事故后 registry 已按 sessionId 精确路由;HTTP 端口文件单实例假设仍在(第二实例随机端口会覆写 http.port)——P2 双跑期顺带验证,必要时 port 文件带 pid 后缀。
+
+---
+
+## 7. 现场坑补充(一): headless 借壳纪律(field-pitfalls 沉淀)
+
+回调桥的投递端(cb-send / terminal send)有两类执行环境: 持有 `ORCA_TERMINAL_HANDLE`
+的活终端 agent,与 headless 进程(cron/脚本/无 Orca 终端的会话)。headless 要驱动
+终端时**必须有活跃终端的 sender**——`terminal send` 只认活 handle。由此立三条纪律
+(与 USAGE §11 同源,此处记设计侧依据):
+
+1. **借壳必须注明"票不投壳"**: headless 借某终端壳发消息/回调时,票据归属(from/ref
+   收口记账)一律写 headless 自己的 agent ID,**不落在被借的壳上**。桥按 `from` 路由
+   与去重(§3.1 envelope),票投到壳会把账记到壳名下——账本错账、fleet 码表误登记、
+   (from,body) 去重窗口也被壳的旧消息占位。
+2. **最佳实践: 专用壳**: 常驻 headless 编排单开一个专用终端做 sender(定位同桥
+   pane: 只是投递通道),不借在役 worker/交互终端——不污染对方输入流、不抢对方
+   回合,sender 生命周期也归自己管,不会被回收后回调断流。
+3. **借壳是应急通道**: 用完即还,壳内不留长任务;壳 handle 失效(Orca 重启)按
+   orca-bridge SKILL 建桥步骤重建专用壳。
+
+设计含义(记入未来 @maestro/callback-bridge 的文档面): Sink 的 `source` 元数据与
+envelope `from` 是**两回事**——借壳投递时 source 指向壳通道,from 必须仍是真实
+headless agent;两字段不得合并简化。
+
+---
+
+## 8. 现场坑补充(二): most-recent-armer 兜底的误投风险与 alias 稳定性(field-pitfalls 沉淀)
+
+**现场**: DSH host 重启后,编排者 sessionId 漂移(9a173a3d→1737c79e)。重启前派发的
+回调契约里嵌的是旧签名 `orch1@9a173a3d…`——重启后 registry 中没有任何消费者占这个
+地址,它成了**幽灵地址**。对端 cb-send 带显式 `to` 投递,桥找不到匹配槽,走了
+**most-recent-armer 兜底**(投给最近一次 arm 的消费者);当时同机另有一个编排会话在
+册,消息实投 session-313e6f7f——**跨编排串话**,真正的编排者永远等不到 ACK/DONE。
+
+### 8.1 显式 to 失配时兜底策略的安全边界
+
+most-recent-armer 兜底在单编排常态下是善意设计(冷 agent 拿旧地址也能投到人),但
+它的安全边界止于"**缺省 to** 的善意补全"——**显式 `to` 找不到槽时,兜底必须反转**:
+
+- **显式 to + 无匹配槽** → 拒收进死信(dead.log / 400 附 details "ghost address"),
+  让发送端拿到明确失败去刷新签名,而不是桥替发送端**猜一个收件人**。误投比丢票更
+  危险: 丢票可重试,误投会造成跨编排串话+账本错账,且双方都难察觉;
+- **缺省 to**(调用方没写)才允许"唯一在册消费者即投递,多在册则拒"——与 §6 HTTP-R1
+  的显式化方向同源;
+- 由此立决策点 **ADDR-R1**: 收紧兜底,显式 to 失配改判死信/400,仅缺省 to 保留
+  唯一消费者规则。
+
+### 8.2 alias 稳定性: 会话内稳定,跨重启不保证
+
+`<alias>@<sessionId>` 把会话生命周期钉进了回调契约,而 host 重启恰恰换 sessionId。
+alias 的正确模型是:**会话内稳定,跨重启不保证**——
+
+- alias(如 orch1)在一个会话生命周期内不变,可作会话内简写寻址;
+- host 重启后新会话可复用同名 alias,且新旧两个编排会话可能**并存**(旧会话残留
+  registry、新会话已 re-arm)——此时同 alias 双槽,alias 单独无法寻址,必须带
+  sessionId;
+- 决策点 **alias 代际(epoch)**: registry 为 alias 维护换代计数,同 alias 重 arm 视为
+  换代,旧 `<alias>@<旧sid>` 立即标 stale(undertaker 清理),bridge_arm 回执与 probe
+  应答带 epoch——对端可检测"我拿的地址是上一代"并主动请求刷新。
+
+**运行纪律(已落 USAGE §3.1)**: host 重启后编排者必须重新 `bridge_arm` +
+`bridge_http_status`,并向所有在飞 worker 广播新签名——协议层修复(ADDR-R1/epoch)
+落地前,这是唯一可靠防线。与 §6 HTTP-R1/多 host 实例条目同源(地址寻址在多消费者
+场景下的退化),P2 双跑期一并验证。
+
+---
+
+## 9. 现场坑补充(三): 回调端口代际漂移与 HTTP/文件桥消费面分裂(七/八坑, field-pitfalls 沉淀)
+
+**现场(2026-08-16 编排者换代)**: 继任会话双通道武装后, `bridge/http.port` 被覆写
+为新代际端口。卸任者(旧代际, 会话仍活)等待继任者的 done 回调——cb-send 按当前
+http.port POST, 显式 `to=<旧代际签名>` 在新桥上无匹配槽 → v1.2 兜底
+most-recent-armer → **继任者自己的会话吸收了这条发给卸任者的消息** → HTTP 200
+delivered **假阳性**(两连投皆然); 改走 `bin/session-send`(回环 `/api/session.prompt`)
+`accepted=True` 才真正驱动卸任者回合。
+
+### 9.1 根因一: http.port 单文件 + 武装即覆写(端口代际漂移)
+
+端口发现文件没有代际概念: 每个会话 arm 都覆写, 文件永远指向**最新武装代际**。
+cb-send 不校验"端口持有者==目标签名", 跨代际定向回调必然撞错桥。与 §8 幽灵地址
+同族但独立: 即使 §8 的 ADDR-R1 落地(显式 to 失配→404), 端口漂移仍会让 cb-send
+**先走错桥再吃 404**——降级文件桥后才能被 registry 正确路由。
+
+- **决策点 PORT-R1**: `http.port` 同时记录持有者签名(或按会话分文件
+  `http.port.<sid>`); cb-send 读端口后**校验目标签名==持有者**, 不匹配直落文件桥,
+  不 POST。一行防御, 消除"撞错桥"整类现场。
+
+### 9.2 根因二: HTTP 面与文件泵消费面分裂(不回写 inbox)
+
+v1.2 的 HTTP 路径 delivered **不写 `bridge/inbox.log`**: 文件泵(v3.6)的游标推进、
+at-least-once 重试、死信、轮转、60s 去重(两窗口各算各的)对 HTTP 消息**全部不可
+见**。"delivered" 只是进程内一次应答, 无持久证据、无重试、不可审计; 同一逻辑消息
+经两通道各投一次会双双送达(去重不互通)。HTTP 槽持有会话确实能被驱动(现场
+MSGBR] 回合), 但**被兜底吸收的错投同样"成功"驱动了错误的会话**——假阳性的伤害
+正在于此。
+
+- **决策点 HTTP-R2(delivered 回写 inbox)**: HTTP 面受理后**同步追加写 inbox.log**
+  (带通道标记), 让文件泵消费面统一: 游标/死信/轮转/去重单窗口; 或明确 HTTP 面仅
+  作"低延迟通知", 驱动语义与持久证据归文件泵+session-send——两取一, 不许现状
+  的"中间态"(看似双通道, 实则语义各一半)。
+- **运行纪律(已落 USAGE §3.3)**: cb-send HTTP 200 ≠ 送达目标; 跨 main 会话驱动
+  回合唯一实证可靠通道 = session-send。修复载体 = `docs/tickets/0005`(ADDR-R1 +
+  cb-send 降级链), 本坑新增 PORT-R1/HTTP-R2 并入该票实施; 按 §10.2 plugins 强制
+  git 分支路径, 禁安装点直改。
