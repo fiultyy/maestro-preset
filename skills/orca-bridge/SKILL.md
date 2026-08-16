@@ -60,6 +60,7 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 2) 完成时:
    ~/.dsh/.agent-presets/maestro/bin/cb-send done <你的ID> <orch签名> <ref> "<结果摘要≤300字符>"
    （cb-send 不在/失败时兜底: printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<orch签名>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log）
+3) 上面契约行丢失/不完整时: load skill `maestro-bridge`（对端冷执行手册,~/.agents/skills）
 ```
 
 - `<orch签名>` = 编排者 `bridge_arm` 回执的 `<alias>@<sessionId>`（HTTP 通道仅记录、

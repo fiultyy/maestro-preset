@@ -12,6 +12,16 @@
 git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/maestro
 ```
 
+可选但推荐——安装**对端共享 skill**(Orca/zap 等其他 harness 的 agent 冷发现回调协议用;不装则冷 agent 只能靠派发消息内嵌的契约行):
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r ~/.dsh/.agent-presets/maestro/shared/maestro-bridge ~/.agents/skills/
+ln -sfn ~/.agents/skills/maestro-bridge ~/.claude/skills/maestro-bridge   # claude 发现面(存在 ~/.claude/skills 时)
+```
+
+开发流(`bin/dev-sync.sh`)自动镜像 shared/ → `~/.agents/skills` 并接好 claude 软链,无需手工。
+
 前置: DSH(宿主)、Orca CLI(编排面必需)、sqlite3 CLI(账本)。zap 可选。
 
 装完**新建一个会话**,在 preset 选择器里选「高级编排模式」。preset 一经选用不可热切换,切换要开新会话。
@@ -81,8 +91,11 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 ### 6.2 技能
 
-- **orca-bridge**: 建桥 pane、布防 watcher、回复署名约定。含 `scripts/watch.sh`(阻塞等一条回调)、`scripts/reply.sh`(回执)。
+- **orca-bridge**: 建桥 pane、布防 watcher、回复署名约定、派发握手契约模板。含 `scripts/watch.sh`(阻塞等一条回调)、`scripts/reply.sh`(回执)。
 - **maestro-ledger**: 账本读写(分发/回收全落账)。含 `scripts/sync.py`/`log.sh`。
+- **maestro-bridge**(shared/,不在本会话技能目录): **对端**冷执行手册——Orca/zap 侧
+  agent 凭它发现回调协议(cb-send 用法/ack·done 语义/红线/排查)。源头在仓库
+  `shared/maestro-bridge/`,镜像到 `~/.agents/skills` + claude 软链(见 §2)。
 
 ### 6.3 bin 脚本
 
