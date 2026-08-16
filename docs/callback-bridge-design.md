@@ -234,7 +234,7 @@ interface ConsumerRef { sessionId:string; alias?:string }
 
 ---
 
-## 7. 现场坑补充: headless 借壳纪律(0005 现场沉淀)
+## 7. 现场坑补充(一): headless 借壳纪律(field-pitfalls 沉淀)
 
 回调桥的投递端(cb-send / terminal send)有两类执行环境: 持有 `ORCA_TERMINAL_HANDLE`
 的活终端 agent,与 headless 进程(cron/脚本/无 Orca 终端的会话)。headless 要驱动
@@ -254,3 +254,44 @@ interface ConsumerRef { sessionId:string; alias?:string }
 设计含义(记入未来 @maestro/callback-bridge 的文档面): Sink 的 `source` 元数据与
 envelope `from` 是**两回事**——借壳投递时 source 指向壳通道,from 必须仍是真实
 headless agent;两字段不得合并简化。
+
+---
+
+## 8. 现场坑补充(二): most-recent-armer 兜底的误投风险与 alias 稳定性(field-pitfalls 沉淀)
+
+**现场**: DSH host 重启后,编排者 sessionId 漂移(9a173a3d→1737c79e)。重启前派发的
+回调契约里嵌的是旧签名 `orch1@9a173a3d…`——重启后 registry 中没有任何消费者占这个
+地址,它成了**幽灵地址**。对端 cb-send 带显式 `to` 投递,桥找不到匹配槽,走了
+**most-recent-armer 兜底**(投给最近一次 arm 的消费者);当时同机另有一个编排会话在
+册,消息实投 session-313e6f7f——**跨编排串话**,真正的编排者永远等不到 ACK/DONE。
+
+### 8.1 显式 to 失配时兜底策略的安全边界
+
+most-recent-armer 兜底在单编排常态下是善意设计(冷 agent 拿旧地址也能投到人),但
+它的安全边界止于"**缺省 to** 的善意补全"——**显式 `to` 找不到槽时,兜底必须反转**:
+
+- **显式 to + 无匹配槽** → 拒收进死信(dead.log / 400 附 details "ghost address"),
+  让发送端拿到明确失败去刷新签名,而不是桥替发送端**猜一个收件人**。误投比丢票更
+  危险: 丢票可重试,误投会造成跨编排串话+账本错账,且双方都难察觉;
+- **缺省 to**(调用方没写)才允许"唯一在册消费者即投递,多在册则拒"——与 §6 HTTP-R1
+  的显式化方向同源;
+- 由此立决策点 **ADDR-R1**: 收紧兜底,显式 to 失配改判死信/400,仅缺省 to 保留
+  唯一消费者规则。
+
+### 8.2 alias 稳定性: 会话内稳定,跨重启不保证
+
+`<alias>@<sessionId>` 把会话生命周期钉进了回调契约,而 host 重启恰恰换 sessionId。
+alias 的正确模型是:**会话内稳定,跨重启不保证**——
+
+- alias(如 orch1)在一个会话生命周期内不变,可作会话内简写寻址;
+- host 重启后新会话可复用同名 alias,且新旧两个编排会话可能**并存**(旧会话残留
+  registry、新会话已 re-arm)——此时同 alias 双槽,alias 单独无法寻址,必须带
+  sessionId;
+- 决策点 **alias 代际(epoch)**: registry 为 alias 维护换代计数,同 alias 重 arm 视为
+  换代,旧 `<alias>@<旧sid>` 立即标 stale(undertaker 清理),bridge_arm 回执与 probe
+  应答带 epoch——对端可检测"我拿的地址是上一代"并主动请求刷新。
+
+**运行纪律(已落 USAGE §3.1)**: host 重启后编排者必须重新 `bridge_arm` +
+`bridge_http_status`,并向所有在飞 worker 广播新签名——协议层修复(ADDR-R1/epoch)
+落地前,这是唯一可靠防线。与 §6 HTTP-R1/多 host 实例条目同源(地址寻址在多消费者
+场景下的退化),P2 双跑期一并验证。

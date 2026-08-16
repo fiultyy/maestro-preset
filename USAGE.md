@@ -44,7 +44,21 @@ bridge_http_status                  # HTTP 桥: 绑定 + 起监听(回执给 cur
 
 **③ 对外发消息**: 用 `bin/session-send`(见 §7)。
 
-## 4. 核心概念(30 秒版)
+### 3.1 host 重启后回调重定向
+
+DSH host 重启后,编排者的 sessionId 会变(现场: 9a173a3d→1737c79e)。重启前派出的
+在飞 worker,其回调契约里嵌的 `to=orch1@旧id` 随即成**幽灵地址**——桥内无匹配槽,
+cb-send 兜底"最近 armer",多编排会话同场时**误投别人**(现场实投 session-313e6f7f,
+真正的编排者永远等不到 ACK/DONE)。重启后必做:
+
+1. **重新 `bridge_arm` + `bridge_http_status`**: 拿到新规范签名 `<alias>@<新sessionId>`;
+2. **向所有在飞 worker 广播新签名**: 让它们后续回调(ack/done/ask)改投新地址——旧
+   地址不会自动转发,不广播就持续丢票。
+
+协议层讨论(most-recent-armer 兜底的安全边界与 alias 稳定性)见
+`docs/callback-bridge-design.md` §8。
+
+## 4. 核心概念(30 秒版
 
 - **三平面**: Orca(worktree/terminal/repo/浏览器)、zap(GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
 - **DSHMSG 信封**: 每条跨会话消息首行是 `DSHMSG]{"from","to","type","ref","body"}`。`session-send` 帮你拼,回调桥帮你收。
