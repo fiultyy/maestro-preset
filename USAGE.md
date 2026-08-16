@@ -48,7 +48,7 @@ bridge_http_status                  # HTTP 桥: 绑定 + 起监听(回执给 cur
 
 - **三平面**: Orca(worktree/terminal/repo/浏览器)、zap(GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
 - **DSHMSG 信封**: 每条跨会话消息首行是 `DSHMSG]{"from","to","type","ref","body"}`。`session-send` 帮你拼,回调桥帮你收。
-- **fleet 码表**: `~/.dsh/maestro/fleet.json` 把 `orch1`/`aa0a` 这种 4 位码映射到 sessionId。`session-spawn` 起会话自动登记。
+- **fleet 码表**: `~/.dsh/maestro/fleet.json` 把 `orch1`/`aa0a` 这种 4 位码映射到 sessionId(`session-spawn` 起会话自动登记)。0004 起 Orca 终端条目以 **termid** 为键(`kind: orca-terminal`,状态机 `probing→verified|mismatch|stale`),准入探测见 §5。
 - **回调桥**: 两条入向通道——文件桥(Orca pane 写 inbox.log)与 HTTP 直发(本机 curl POST /callback)。出向统一 `session-send`。
 
 ## 5. 一条端到端链路
@@ -69,6 +69,10 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 **Orca 派发同理走握手**（`terminal send` 没有投递语义，不读终端输出确认）:
 
 ```bash
+# 0) 准入(0004): 先探测,回报匹配 verified 才可派发(需 MAESTRO_ORCH_SIGNATURE):
+#   MAESTRO_ORCH_SIGNATURE=<orch签名> bin/fleet-probe <termid> --wait 120
+#   → 探测回调 from==termid → fleet 条目 verified(编排回调回合验证+落账)
+
 # 派发时消息末尾嵌入 ACK/DONE 契约（模板见 skills/orca-bridge/SKILL.md）:
 #   [ref:t1] 在仓库 X 跑 cargo test 并回报
 #   —— 回调契约 ——
@@ -119,12 +123,12 @@ fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004)
 | `bridge/registry.json` | 在册消费者 | 随会话 teardown 自注销;崩溃残留需手清 |
 | `bridge/.cursor.*` / `state.json` / `dead.log` / `echo.log` | 游标/计数/死信/回声 | 可整体删(重置) |
 | `bridge/http.port` / `http.state.json` | HTTP 通道端口与计数 | 随实例 |
-| `fleet.json` | 码表 | 手工编辑 |
+| `fleet.json` | 码表(4位码↔sessionId)+ Orca 终端准入条目(kind/status) | 手工编辑 / fleet-probe 维护 |
 | `ledger.db` | 账本 | sqlite 操作 |
 
 ## 8. 环境变量
 
-见 [README.md](./README.md) 环境变量表。核心五个: `MAESTRO_BRIDGE`、`MAESTRO_BRIDGE_ALIAS`、`MAESTRO_LEDGER`、`MAESTRO_HOME`、`DSH_PORT`。
+见 [README.md](./README.md) 环境变量表。核心六个: `MAESTRO_BRIDGE`、`MAESTRO_BRIDGE_ALIAS`、`MAESTRO_LEDGER`、`MAESTRO_HOME`、`MAESTRO_ORCH_SIGNATURE`(fleet-probe)、`DSH_PORT`。
 
 ## 9. 升级与代际语义
 

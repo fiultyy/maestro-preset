@@ -11,6 +11,7 @@
 | DeepSeek Harness (DSH) | 宿主 | 不可用 |
 | Orca (`orca-ide`/`orca-dev`) | 桥 pane、terminal send、worktree 管理 | 仅剩普通编码能力,编排面不可用 |
 | sqlite3 CLI | 项目状态账本 | 账本技能不可用 |
+| python3 + curl | bin 脚本(session-send/cb-send/fleet-probe) | 对应脚本不可用 |
 | zap (可选) | zap 平面投递 | 该平面跳过 |
 
 ## 安装
@@ -77,13 +78,17 @@ maestro/
 | `MAESTRO_LEDGER` | `~/.dsh/maestro/ledger.db` | 账本路径 |
 | `MAESTRO_HOME` | `~/.dsh` | DSH home(插件内运行数据定位) |
 | `MAESTRO_FLEET` | `~/.dsh/maestro/fleet.json` | fleet 码表路径 |
+| `MAESTRO_ORCH_SIGNATURE` | (无) | fleet-probe 必需: 编排者 `<alias>@<sessionId>` 签名,嵌进探测消息回信地址 |
+| `MAESTRO_PRESET_BIN` | `~/.dsh/.agent-presets/maestro/bin` | fleet-probe 探测消息里 cb-send 的路径 |
+| `MAESTRO_SHARED_SKILLS` | `~/.agents/skills` | dev-sync 镜像 shared/ 的目标目录 |
 | `DSH_PORT` | 3080 | session-send 目标端口 |
 
 ## 快速开始(装完后第一个会话)
 
-1. 会话开场调一次 `bridge_arm {alias: "你的别名"}` —— 绑定回调泵,回执给出规范签名 `<alias>@<sessionId>`
+1. 会话开场调一次 `bridge_arm {alias: "你的别名"}` **和** `bridge_http_status` —— 双回调通道绑定,回执给出规范签名 `<alias>@<sessionId>`
 2. 按 `skills/orca-bridge/SKILL.md` 建 Orca 桥 pane(一次性)
-3. 之后外部 agent 的回调经桥自动驱动本会话回合;对外发消息用 `bin/session-send`
+3. Orca 终端入编: `MAESTRO_ORCH_SIGNATURE=<签名> bin/fleet-probe <termid>`,回报匹配入 `verified` 后才可派发(见 USAGE §5)
+4. 之后外部 agent 的回调经桥自动驱动本会话回合;对外发消息用 `bin/session-send`
 
 ## 信任边界(必读)
 
