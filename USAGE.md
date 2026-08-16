@@ -82,6 +82,15 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 # 一轮 sweep 无 ACK → 退回 terminal read / wait --for tui-idle 机械校验
 ```
 
+**paste-Enter 时序坑（派发大文本必读）**: `terminal send`/inject 大文本（粘贴）后，
+目标 TUI 可能把粘贴**折叠停在输入框**而不提交回合。判据与处置:
+
+- 派发后盯 `terminal read` / `tui-idle`: **45s 仍未消费**（输入框还挂着折叠文本、对端
+  未动笔）→ **补发一个空 `--enter`** 单独提交;
+- **绝不连发两次 Enter**: 第二次 Enter 会**撤销 bracketed paste**（粘贴正文被撤回），
+  前功尽弃——先确认折叠未消费，再补空 Enter，只补一次;
+- 大文本优先拆段投递或落文件传路径（PTY 单行 ~4KB 上限），别一次灌满输入框。
+
 ## 6. 组件逐项
 
 ### 6.1 插件
@@ -149,6 +158,38 @@ bin/dev-sync.sh    # rsync(或 cp)仓库 → ~/.dsh/.agent-presets/maestro,排�
 
 **生效边界仍受 §9 约束**: 改 `agent.cordis.yml` → 新会话即得新代际;改插件 `.js` → 重启 DSH 才确定性生效。开发循环: 改代码 → `bin/dev-sync.sh` → 重启宿主(或接受"新会话才生效")→ 开新会话验证 → `git commit` + `git push`。
 
-## 11. 信任与安全
+### 10.1 推送验证（git 假象防线）
+
+开发循环末尾的 `git push` 有三个现场坑，**别信单次命令的表面成功**:
+
+- **git-lfs locks verify 超时静默吞 push**: `git lfs push`/带 lfs 对象的 push 卡在
+  locks verify 超时，进程"成功"返回但对象实际没推上去——退出码是假绿;
+- **ls-remote 过期缓存**: 推完立刻 `git ls-remote` 可能读到旧引用（缓存/竞态），
+  拿到"已在远端"的假象;
+- **worktree 检不出主检出分支**: 主检出（主仓库目录）已占住的分支，在 worktree 里
+  `checkout` 会被拒——这是 worktree 保护，不是推送/远端出了问题，别误诊。
+
+**终验纪律**: `git ls-remote origin <branch>` **重试**（隔几秒再查一次，避开过期缓存）
++ **哈希比对**（`git rev-parse HEAD` 与 ls-remote 返回值逐字一致才算推上）。不一致 →
+查 lfs/网络后重推，直到哈希对上为止。
+
+## 11. headless 借壳纪律
+
+headless 进程/agent（无 `ORCA_TERMINAL_HANDLE`，如 cron、脚本、无 Orca 终端的会话）
+要驱动终端时，必须有**活跃终端的 sender**——`terminal send` 只认活 handle。借壳
+（借用别的终端发消息/跑命令）的纪律:
+
+- **借壳必须注明"票不投壳"**: 回调/账本/收口票据的归属一律写真正的 from（headless
+  自己的 agent ID），不能记到被借的壳终端名下——否则账本错账、fleet 码表误登记、
+  追责追到壳;
+- **最佳实践是专用壳**: 常驻 headless 任务单开一个**专用终端**做 sender（定位同 §3
+  桥 pane），不借在役 worker/交互终端——既不污染对方输入流、抢对方回合，也不会
+  sender 被回收后回调断流;
+- 借壳只是应急通道: 用完即还，壳内不留长任务;壳 handle 失效（Orca 重启）按 §3 桥
+  pane 同款步骤重建。
+
+设计侧背景见 `docs/callback-bridge-design.md` §7。
+
+## 12. 信任与安全
 
 本 preset 的插件会写文件、开回环监听端口、驱动会话回合;技能会指使 agent 操作 Orca 终端。user preset 等同 shell 权限——只从信任来源安装,审阅 `agent.cordis.yml` 列的每一行后再挂载。

@@ -70,8 +70,29 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 - 编排者视角：ACK 到达 → 账本节点 `running`；DONE 到达 → 落 outcome 收口。超过一轮
   sweep（~10 分钟）无 ACK → 退回机械校验（`terminal read --cursor` /
   `terminal wait --for tui-idle`）。握手是协作语义，机械校验兜底，方向不可倒置。
+- **paste-Enter 时序（派发大文本必读）**: 正文很大时，目标 TUI 会把粘贴**折叠停在
+  输入框**不提交回合。判据与处置: 派发后 45s 仍未消费（`terminal read --cursor` 仍见
+  折叠文本、对端未 tui-idle）→ **补发一个空 `--enter`** 单独提交；**绝不连发两次
+  Enter**——第二次 Enter 会撤销 bracketed paste，粘贴正文被撤回，前功尽弃。大文本
+  拆段投递或落文件传路径（PTY 单行 ~4KB 上限）。
 - 边界：FULL HANDOFF 不嵌契约（已放弃监督）；orchestration 面 dispatch 已有
   worker_done 单次回报，不叠第二套协议。
+
+## watcher 判定纪律（防旧 recap 误触）
+
+编排者用 `terminal read` + grep 判定对端是否已产出（recap/总结类信号）时，**残留旧文
+会误触**: 上一轮的 recap 还留在终端回滚区，grep 一命中就把后续节点提前/重复触发
+（现场: T2b/T3 被旧句式命中，各误触两次）。判定必须过三重闸:
+
+1. **排除旧句式**: 判定前先读一遍全量输出，记下已存在的命中行（cursor/上下文），
+   上一轮已消费的旧 recap 句式明确排除，不当作新信号;
+2. **新关键词**: 判定关键词选**本轮任务独有**的词（ref 号、新产物名），不用每轮都
+   出现的泛词（"recap"/"done" 这类）；宁可多一个限定词，不贪宽匹配;
+3. **二次 idle 确认**: 关键词命中后，再等一次 `terminal wait --for tui-idle`（对端
+   真的停笔），**两次 idle** 才落账收口——防止命中半截输出就收口。
+
+一次性 `watch.sh` 同纪律: 每消费一条回调重新布防；对新节点对账时只用**布防之后**
+新写入的行，不拿旧输出对账。
 
 ## 约定
 

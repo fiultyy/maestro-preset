@@ -231,3 +231,26 @@ interface ConsumerRef { sessionId:string; alias?:string }
 - **HTTP-R2**: `http.state.json` 是否并入主 `state.json` consumers 分节(建议并,减少一个观测文件;保留 port 文件)。
 - **前缀统一**: `MSGBR] ` 退役统一为 `ORCA-CB] ` 会改变会话内可见行前缀——若下游有按前缀 grep 的脚本需先扫一遍(已知: 无)。
 - **多 host 实例**: v3.5 事故后 registry 已按 sessionId 精确路由;HTTP 端口文件单实例假设仍在(第二实例随机端口会覆写 http.port)——P2 双跑期顺带验证,必要时 port 文件带 pid 后缀。
+
+---
+
+## 7. 现场坑补充: headless 借壳纪律(0005 现场沉淀)
+
+回调桥的投递端(cb-send / terminal send)有两类执行环境: 持有 `ORCA_TERMINAL_HANDLE`
+的活终端 agent,与 headless 进程(cron/脚本/无 Orca 终端的会话)。headless 要驱动
+终端时**必须有活跃终端的 sender**——`terminal send` 只认活 handle。由此立三条纪律
+(与 USAGE §11 同源,此处记设计侧依据):
+
+1. **借壳必须注明"票不投壳"**: headless 借某终端壳发消息/回调时,票据归属(from/ref
+   收口记账)一律写 headless 自己的 agent ID,**不落在被借的壳上**。桥按 `from` 路由
+   与去重(§3.1 envelope),票投到壳会把账记到壳名下——账本错账、fleet 码表误登记、
+   (from,body) 去重窗口也被壳的旧消息占位。
+2. **最佳实践: 专用壳**: 常驻 headless 编排单开一个专用终端做 sender(定位同桥
+   pane: 只是投递通道),不借在役 worker/交互终端——不污染对方输入流、不抢对方
+   回合,sender 生命周期也归自己管,不会被回收后回调断流。
+3. **借壳是应急通道**: 用完即还,壳内不留长任务;壳 handle 失效(Orca 重启)按
+   orca-bridge SKILL 建桥步骤重建专用壳。
+
+设计含义(记入未来 @maestro/callback-bridge 的文档面): Sink 的 `source` 元数据与
+envelope `from` 是**两回事**——借壳投递时 source 指向壳通道,from 必须仍是真实
+headless agent;两字段不得合并简化。
