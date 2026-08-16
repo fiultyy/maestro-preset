@@ -205,8 +205,12 @@ fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004)
 开发循环 = 在本仓库编辑 → `bin/dev-sync.sh` 同步到安装点 → 新会话验证:
 
 ```bash
-bin/dev-sync.sh    # rsync(或 cp)仓库 → ~/.dsh/.agent-presets/maestro,排除 .git
+bin/dev-sync.sh                 # 正向: 仓库→装点(rsync --delete) + bin/→镜像 ~/.dsh/maestro/bin + shared/→~/.agents/skills
+bin/dev-sync.sh --reverse <f>   # 回流: 装点→仓库逐文件 patch → git apply -p1 + 当场 commit(护栏一见 §10.2)
+bin/dev-sync.sh --verify        # 三段漂移报告: 装点落后项 / 仓落后项 / 镜像漂移项
 ```
+
+⚠️ 正向带 `--delete` 会覆盖装点——装点上的实验改动必须**先 `--reverse` 回流入仓**,再跑正向,否则被冲掉。
 
 **⚠️ 禁止把安装点做成软链接**(`ln -s` 指向仓库)。DSH 的 preset discovery 用 `readdir(withFileTypes)` 的 `isDirectory()` 过滤(harness `packages/preset/agent-presets/src/discovery.ts` scanRoot),符号链接 `isDirectory()==false` → **整个 preset 从 roster 消失**,默认/选用该 preset 的新会话全部创建失败(症状: 新建对话无响应)。已实测踩坑并回滚。
 
