@@ -26,8 +26,9 @@ def resolve(key: str, fleet: dict) -> str:
     if entry:
         return entry['sessionId']
     for code, ent in fleet.get('fleet', {}).items():
-        if ent['sessionId'].startswith('session-' + key):
-            return ent['sessionId']
+        sid = ent.get('sessionId')
+        if sid and sid.startswith('session-' + key):
+            return sid
     sys.exit(f'session-send: unknown code {key!r} (not in fleet.json, not a sessionId prefix)')
 
 
