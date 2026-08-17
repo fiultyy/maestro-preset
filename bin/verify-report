@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""verify-report — 审查助手: 重跑验证门 + 解析回报 A/B/C 表 + 证据抽查 → 判定草稿(ticket SI-001)
+
+用法:
+  verify-report <repo> <REF> [--done-body <str>] [--json]
+                [--g1-cmd CMD] [--g2-cmd CMD] [--gate-timeout <秒>]
+  verify-report --selftest                     # 内置自测(fixture: testdata/SI-001/)
+
+机制:
+  - 报告: <repo>/docs/reports/<REF>-report.md 或 <repo>/reports/<REF>-report.md
+  - 票:   <repo>/docs/tickets.md 或 <repo>/tickets.md 中 "### <REF>" 块
+          (取「回报物 … B 表预填:①…」计数,对照报告 B 表行数,查漏项/增项)
+  - 硬伤 → FAIL:
+      报告缺失 / 未填模板拷贝; B 行 [x] 证据空; B 行数 ≠ 票内预填;
+      C 用例名在 spec 文件 grep 不到; A 门未勾; G1/G2 重跑失败或与勾选矛盾;
+      报告判定 FAIL; F 节被 worker 填写; done body 格式错 / 判定不一致 / 路径不指向本报告 / 备注超 40 字
+  - 无硬伤 + (E 节有实质备注 或 报告判定 PASS-NOTES) → PASS-NOTES;其余 → PASS
+  - 门默认 pnpm typecheck / pnpm test(项目侧 G1/G2,真实执行非假输出);
+    maestro 侧用 --g1-cmd / --g2-cmd 覆盖(如 py_compile / --selftest);空串 '' 显式跳过
+  - 输出: 判定草稿 + F 节可直贴文本(审查人/结论槽位);--json 出结构化结果
+
+环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_TESTDATA(selftest fixture 根)
+退出码: 0 = PASS/PASS-NOTES · 1 = FAIL · 2 = 用法错 · 3 = fixture 缺失
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+TESTDATA = os.environ.get('MAESTRO_TESTDATA') or os.path.join(HOME, 'maestro', 'testdata', 'SI-001')
+
+G1_DEFAULT = 'pnpm typecheck'
+G2_DEFAULT = 'pnpm test'
+GATE_TIMEOUT_DEFAULT = 900
+CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+
+A_ITEM_RE = re.compile(r'^- \[([ xX])\] \*\*(G\d+)\*\*')
+JUDGE_RE = re.compile(r'^- \*\*判定\*\*:\s*(PASS|PASS-NOTES|FAIL)\s*$')
+B_ROW_RE = re.compile(r'^\|\s*(\d+)\s*\|([^|]*)\|([^|]*)\|([^|]*)\|\s*$')
+C_ROW_RE = re.compile(r'^\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*$')
+DONE_BODY_RE = re.compile(
+    r'^(PASS|PASS-NOTES|FAIL);报告:(\S+);测试:(\+\d+/\d+全绿|selftest \d+项全绿);备注:(.+)$')
+
+
+def die(msg, code=1):
+    print(f'verify-report: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def norm_paren(s):
+    return s.replace('（', '(').replace('）', ')')
+
+
+# ---------- 报告/票定位与解析 ----------
+
+def report_candidates(repo, ref):
+    return [os.path.join(repo, 'docs', 'reports', f'{ref}-report.md'),
+            os.path.join(repo, 'reports', f'{ref}-report.md')]
+
+
+def first_existing(paths):
+    for p in paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def load_ticket_block(repo, ref):
+    """返回 (票板路径, 票块文本);票板缺失 → (None, None);票号未找到 → (path, None)。"""
+    path = first_existing([os.path.join(repo, 'docs', 'tickets.md'),
+                           os.path.join(repo, 'tickets.md')])
+    if not path:
+        return None, None
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    m = re.search(rf'^(### {re.escape(ref)}\b[^\n]*)$(.*?)(?=^### |^## |\Z)', text, re.M | re.S)
+    if not m:
+        return path, None
+    return path, (m.group(1) + m.group(2)).rstrip()
+
+
+def expected_b_count(block):
+    """票内「回报物 … B 表预填:①… ②…」的 ①–⑳ 计数;解析不到返回 None。"""
+    for line in block.splitlines():
+        if '**回报物**' in line and 'B 表预填' in line:
+            tail = line.split('B 表预填', 1)[1]
+            return sum(tail.count(c) for c in CIRCLED)
+    return None
+
+
+def section(text, letter):
+    """截取 "## <letter>. …" 起至下一 "## " 前;返回 (正文, 起始行号) 或 (None, None)。"""
+    m = re.search(rf'^## {letter}\..*$', text, re.M)
+    if not m:
+        return None, None
+    nxt = re.search(r'^## ', text[m.end():], re.M)
+    end = m.end() + nxt.start() if nxt else len(text)
+    start_line = text.count('\n', 0, m.start()) + 1
+    return text[m.start():end], start_line
+
+
+def strip_notes(sec):
+    """E 节正文: 去标题行/占位行;'无' → 空。"""
+    if not sec:
+        return ''
+    body = '\n'.join(sec.splitlines()[1:]).strip()
+    body = re.sub(r'^<[^>]*>\s*$', '', body, flags=re.M).strip()
+    return '' if body in ('', '无') else body
+
+
+def parse_report(text):
+    info = {'judgment': None, 'a': [], 'b': [], 'c': [], 'e_text': '', 'f_text': ''}
+    for idx, line in enumerate(text.splitlines(), 1):
+        m = JUDGE_RE.match(line)
+        if m:
+            info['judgment'] = m.group(1)
+        m = A_ITEM_RE.match(line)
+        if m:
+            info['a'].append({'gate': m.group(2), 'checked': m.group(1).lower() == 'x', 'line': idx})
+    bsec, bline = section(text, 'B')
+    if bsec:
+        for off, line in enumerate(bsec.splitlines(), bline):
+            m = B_ROW_RE.match(line)
+            if m:
+                info['b'].append({'num': int(m.group(1)), 'goal': m.group(2).strip(),
+                                  'checked': m.group(3).strip().lower() == '[x]',
+                                  'evidence': m.group(4).strip(), 'line': off})
+    csec, cline = section(text, 'C')
+    if csec:
+        for off, line in enumerate(csec.splitlines(), cline):
+            m = C_ROW_RE.match(line)
+            if not m or m.group(1).strip() == '用例名':
+                continue
+            if all(re.fullmatch(r'-+', c.strip()) for c in m.groups()):  # 分隔行 |---|---|
+                continue
+            info['c'].append({'case': m.group(1).strip(), 'spec': m.group(2).strip(),
+                              'b': m.group(3).strip(), 'result': m.group(4).strip(), 'line': off})
+    esec, _ = section(text, 'E')
+    info['e_text'] = strip_notes(esec)
+    fsec, _ = section(text, 'F')
+    info['f_text'] = fsec or ''
+    return info
+
+
+def looks_like_scaffold(raw):
+    """未替换占位符的模板拷贝: 标题仍是 LK-00X/脚手架,或正文含模板占位标记。"""
+    title = next((l for l in raw.splitlines() if l.startswith('# ')), '')
+    if 'LK-00X' in title or '脚手架' in title:
+        return True
+    return any(mk in raw for mk in ('<ISO 8601>', '<从票内复制>', '<具体证据', '汇总行原文'))
+
+
+def f_section_violations(f_text):
+    """F 节应保持模板原样(worker 留空);值被填 → 违规描述列表。"""
+    if not f_text:
+        return ['F 节整体缺失(模板要求保留)']
+    filled = []
+    for line in f_text.splitlines():
+        s = norm_paren(line.strip())
+        if s.startswith('- 审查人/时间:') and s != '- 审查人/时间:':
+            filled.append('审查人/时间 被填写')
+        elif s.startswith('- 结论:') and s != norm_paren('- 结论: 通过 / 打回(打回原因)'):
+            filled.append('结论 被填写')
+        elif s.startswith('- 备注:') and s != '- 备注:':
+            filled.append('备注 被填写')
+    return filled
+
+
+# ---------- done body 校验 ----------
+
+def validate_done_body(body, ref, report_judgment):
+    """格式 <判定>;报告:路径;测试:+N/M全绿|selftest N项全绿;备注:≤40字 + 一致性。"""
+    out = {'body': body, 'ok': False, 'errors': [], 'judgment': None, 'report': None, 'tests': None}
+    m = DONE_BODY_RE.match(body)
+    if not m:
+        out['errors'].append('格式不符: 应为 <判定>;报告:路径;测试:+N/M全绿 或 selftest N项全绿;备注:≤40字')
+        return out
+    out['judgment'], out['report'], out['tests'] = m.group(1), m.group(2), m.group(3)
+    note = m.group(4)
+    if len(note) > 40:
+        out['errors'].append(f'备注 {len(note)} 字,超 40 字上限')
+    if os.path.basename(out['report']) != f'{ref}-report.md':
+        out['errors'].append(f'报告路径未指向 {ref}-report.md(实际为 {out["report"]})')
+    if report_judgment and out['judgment'] != report_judgment:
+        out['errors'].append(f'判定 {out["judgment"]} ≠ 报告判定 {report_judgment}')
+    out['ok'] = not out['errors']
+    return out
+
+
+# ---------- 门重跑 ----------
+
+def run_gate(cmd, cwd, timeout):
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {'cmd': cmd, 'ok': False, 'rc': None,
+                'dur': round(time.monotonic() - started, 1), 'tail': f'TIMEOUT after {timeout}s'}
+    out = (proc.stdout or '') + (proc.stderr or '')
+    tail = out.strip().splitlines()[-1] if out.strip() else ''
+    return {'cmd': cmd, 'ok': proc.returncode == 0, 'rc': proc.returncode,
+            'dur': round(time.monotonic() - started, 1), 'tail': tail[:200]}
+
+
+# ---------- 主流程 ----------
+
+def render_f(judgment, summary):
+    lean = '通过' if judgment != 'FAIL' else '打回'
+    return ('## F. 审查记录(verify-report 草稿,编排者确认/修订后粘贴)\n'
+            '- 审查人/时间: <待填: orch1 / ISO 8601>\n'
+            f'- 结论: {lean}(判定草稿 {judgment};如打回请写明原因)\n'
+            f'- 备注: {summary}')
+
+
+def summarize(res, info):
+    bits = []
+    for name in ('G1', 'G2'):
+        g = res['gates'].get(name)
+        if not g:
+            continue
+        bits.append(f"{name}重跑{'跳过' if g.get('skipped') else ('✓' if g['ok'] else '✗')}")
+    exp = res.get('ticket_b_expected')
+    bits.append(f"B行{len(info['b'])}/{exp}" if exp else f"B行{len(info['b'])}")
+    bits.append(f"C用例{len(info['c'])}项grep")
+    fails = sum(1 for f in res['findings'] if f['level'] == 'fail')
+    bits.append(f'硬伤{fails}')
+    return ';'.join(bits)
+
+
+def verify(repo, ref, done_body=None, g1=None, g2=None, timeout=GATE_TIMEOUT_DEFAULT):
+    res = {'ref': ref, 'repo': repo, 'report': None, 'ticket': None,
+           'ticket_b_expected': None, 'gates': {}, 'findings': [],
+           'judgment': None, 'f_section': '', 'done_body': None}
+
+    def fail(msg, line=None):
+        res['findings'].append({'level': 'fail', 'line': line, 'msg': msg})
+
+    def warn(msg):
+        res['findings'].append({'level': 'warn', 'msg': msg})
+
+    # 1) 报告存在性(fail-fast,不跑门)
+    path = first_existing(report_candidates(repo, ref))
+    res['report'] = path
+    if not path:
+        tried = ', '.join(report_candidates(repo, ref))
+        fail(f'report missing: {ref}-report.md 不存在(尝试 {tried})')
+        res['judgment'] = 'FAIL'
+        res['f_section'] = render_f('FAIL', '报告文件缺失,无法审查')
+        return res
+    with open(path, encoding='utf-8') as fh:
+        raw = fh.read()
+    if looks_like_scaffold(raw):
+        fail('report is unfilled scaffold: 仍是未替换占位符的模板拷贝(标题/占位标记未填)')
+        res['judgment'] = 'FAIL'
+        res['f_section'] = render_f('FAIL', '报告为未填写的模板拷贝')
+        return res
+
+    # 2) 解析
+    info = parse_report(raw)
+    res['report_parsed'] = {'judgment': info['judgment'], 'a': info['a'],
+                            'b': info['b'], 'c': info['c'], 'e_notes': bool(info['e_text'])}
+
+    # 3) 票对照(B 表行数 vs 票内预填)
+    tpath, block = load_ticket_block(repo, ref)
+    res['ticket'] = tpath
+    if block is None:
+        if tpath is None:
+            warn('tickets.md 未找到,B 行数对照跳过(仅结构审查)')
+        else:
+            warn(f'票 {ref} 未在 {tpath} 找到,B 行数对照跳过')
+    else:
+        exp = expected_b_count(block)
+        if exp:
+            res['ticket_b_expected'] = exp
+            if len(info['b']) != exp:
+                first_line = info['b'][0]['line'] if info['b'] else None
+                fail(f'B 表 {len(info["b"])} 行 ≠ 票内 B 表预填 {exp} 项(漏项或增项)', line=first_line)
+
+    # 4) B 行: [x] 必须有非空证据;[ ] 与非 FAIL 判定矛盾
+    for row in info['b']:
+        ev = row['evidence']
+        if row['checked'] and (not ev or ev.startswith('<')):
+            fail(f'B#{row["num"]} 勾选 [x] 但证据为空(禁止"已通过"式空话)', line=row['line'])
+        if not row['checked'] and info['judgment'] != 'FAIL':
+            fail(f'B#{row["num"]} 达成列为 [ ] 未达成,与判定 {info["judgment"]} 矛盾', line=row['line'])
+    if not info['b']:
+        fail('B 节未解析到验证目标行(表格缺失或格式不符模板)')
+
+    # 5) C 表 grep 抽查: 用例名必须真实存在于 spec 文件
+    #    spec 列容忍 "file:line(-line)" 行号后缀(LK-001 真实报告形态)
+    for row in info['c']:
+        rel = re.sub(r':\d+(-\d+)?$', '', row['spec'])
+        spec = os.path.join(repo, rel)
+        if not os.path.isfile(spec):
+            fail(f'C 用例 "{row["case"]}": spec 文件不存在 {row["spec"]}', line=row['line'])
+            continue
+        with open(spec, encoding='utf-8', errors='replace') as fh:
+            if row['case'] not in fh.read():
+                fail(f'C 用例 "{row["case"]}" 在 {row["spec"]} 中 grep 不到(用例名不真实)',
+                     line=row['line'])
+
+    # 6) A 门勾选
+    for it in info['a']:
+        if not it['checked']:
+            fail(f'A 验证门 {it["gate"]} 未勾选 [x]', line=it['line'])
+    if not info['a']:
+        fail('A 节未解析到 G1/G2/G3 条目(格式不符模板)')
+
+    # 7) G1/G2 重跑(真实执行)
+    for name, default, requested in (('G1', G1_DEFAULT, g1), ('G2', G2_DEFAULT, g2)):
+        cmd = requested if requested is not None else default
+        if not cmd:
+            res['gates'][name] = {'cmd': None, 'skipped': True}
+            warn(f'{name} 重跑被显式跳过(--{name.lower()}-cmd "")')
+            continue
+        if cmd == default and shutil.which('pnpm') is None:
+            res['gates'][name] = {'cmd': cmd, 'ok': False, 'skipped': True, 'rc': None,
+                                  'dur': 0, 'tail': 'pnpm not in PATH'}
+            fail(f'{name} 无法重跑: pnpm 不在 PATH')
+            continue
+        ran = run_gate(cmd, repo, timeout)
+        res['gates'][name] = ran
+        claimed = next((a['checked'] for a in info['a'] if a['gate'] == name), None)
+        if ran['ok'] and claimed is False:
+            fail(f'{name} 重跑通过但报告 A 节未勾选(报告低估)')
+        if not ran['ok']:
+            extra = '且报告勾选 [x](矛盾)' if claimed else ''
+            tail = ran['tail']
+            fail(f'{name} 重跑失败{extra}: `{cmd}` rc={ran["rc"]} tail={tail!r}')
+
+    # 8) F 节必须留空(编排者填写)
+    for v in f_section_violations(info['f_text']):
+        fail(f'F 节应由编排者填写(agent 留空): {v}')
+
+    # 9) done body(可选)
+    if done_body is not None:
+        db = validate_done_body(done_body, ref, info['judgment'])
+        res['done_body'] = db
+        for msg in db['errors']:
+            fail(f'done body: {msg}')
+
+    # 10) 判定草稿
+    has_fail = any(f['level'] == 'fail' for f in res['findings'])
+    if info['judgment'] == 'FAIL' or has_fail:
+        res['judgment'] = 'FAIL'
+    elif info['judgment'] == 'PASS-NOTES' or info['e_text']:
+        res['judgment'] = 'PASS-NOTES'
+    else:
+        res['judgment'] = 'PASS'
+    res['f_section'] = render_f(res['judgment'], summarize(res, info))
+    return res
+
+
+def print_human(res):
+    print(f"verify-report: ref={res['ref']} repo={res['repo']}")
+    print(f"report: {res['report'] or '(missing)'} | ticket: {res['ticket'] or '(missing)'}")
+    for name in ('G1', 'G2'):
+        g = res['gates'].get(name)
+        if g is None:
+            continue
+        if g.get('skipped') and g.get('cmd') is None:
+            print(f'{name} rerun: skipped (explicit)')
+        elif g.get('skipped'):
+            print(f"{name} rerun: unavailable ({g.get('tail')})")
+        else:
+            ok = 'OK' if g['ok'] else 'FAIL'
+            print(f"{name} rerun: {ok} rc={g['rc']} {g['dur']}s `{g['cmd']}` tail={g['tail']!r}")
+    rp = res.get('report_parsed')
+    if rp:
+        print(f"report claims: judgment={rp['judgment']} A={len(rp['a'])} "
+              f"B={len(rp['b'])} C={len(rp['c'])} e_notes={rp['e_notes']}")
+    if res.get('done_body'):
+        db = res['done_body']
+        state = 'OK' if db['ok'] else 'REJECT'
+        print(f'done-body: {state} {db["body"]!r}')
+        for e in db['errors']:
+            print(f'  - {e}')
+    if res['findings']:
+        print('findings:')
+        for f in res['findings']:
+            loc = f' L{f["line"]}' if f.get('line') else ''
+            print(f'  [{f["level"].upper()}]{loc} {f["msg"]}')
+    else:
+        print('findings: none')
+    print(f'judgment draft: {res["judgment"]}')
+    print('--- F 节(可直接粘贴) ---')
+    print(res['f_section'])
+
+
+# ---------- selftest ----------
+
+FAKE_PNPM = (
+    '#!/bin/sh\n'
+    'printf \'%s cwd=%s\\n\' "$*" "$(pwd)" >> "$FAKE_PNPM_LOG"\n'
+    'if [ "$FAKE_PNPM_MODE" = "fail-typecheck" ] && [ "$1" = "typecheck" ]; then\n'
+    '  echo "error TS2304: Cannot find name (fake)" >&2\n'
+    '  exit 1\n'
+    'fi\n'
+    'exit 0\n'
+)
+
+
+def selftest():
+    if not os.path.isdir(TESTDATA):
+        die(f'testdata missing: {TESTDATA}(期望 testdata/SI-001/fixture-repo)', 3)
+    tmp = tempfile.mkdtemp(prefix='vr-selftest-')
+    repo = os.path.join(tmp, 'repo')
+    shutil.copytree(os.path.join(TESTDATA, 'fixture-repo'), repo)
+    fbin = os.path.join(tmp, 'bin')
+    os.makedirs(fbin)
+    log = os.path.join(tmp, 'pnpm.log')
+    fake = os.path.join(fbin, 'pnpm')
+    with open(fake, 'w') as fh:
+        fh.write(FAKE_PNPM)
+    os.chmod(fake, 0o755)
+
+    def run_cli(args, mode='ok'):
+        env = dict(os.environ)
+        env['PATH'] = fbin + os.pathsep + env.get('PATH', '')
+        env['FAKE_PNPM_LOG'] = log
+        env['FAKE_PNPM_MODE'] = mode
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                              capture_output=True, text=True, env=env, timeout=180)
+
+    def run_json(args, mode='ok'):
+        proc = run_cli(list(args) + ['--json'], mode)
+        try:
+            return proc.returncode, json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f'--json 不可解析 rc={proc.returncode} out={proc.stdout[:300]!r} err={proc.stderr[:300]!r}')
+
+    def report_lines(fname):
+        with open(os.path.join(repo, 'docs', 'reports', fname), encoding='utf-8') as fh:
+            return fh.read().splitlines()
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('vr:compliant-fixture-pass')
+    def _():
+        rc, data = run_json([repo, 'TST-001'])
+        assert rc == 0, f'rc={rc} findings={data["findings"]}'
+        assert data['judgment'] == 'PASS', data['judgment']
+
+    @check('vr:compliant-f-slots')
+    def _():
+        rc, data = run_json([repo, 'TST-001'])
+        f = data['f_section']
+        assert rc == 0 and data['judgment'] == 'PASS'
+        assert '审查人' in f and '结论' in f, f
+        assert '通过' in f or '打回' in f, f
+
+    @check('vr:spec-line-suffix-tolerated')
+    def _():
+        rc, data = run_json([repo, 'TST-001'])
+        assert rc == 0 and data['judgment'] == 'PASS', (rc, data['judgment'])
+        assert not [x for x in data['findings'] if 'spec 文件不存在' in x['msg']], data['findings']
+        assert len(data['report_parsed']['c']) == 3, data['report_parsed']['c']
+
+    @check('vr:fake-empty-evidence-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-002'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        hits = [x for x in data['findings'] if '证据为空' in x['msg']]
+        assert hits, data['findings']
+        ln = hits[0]['line']
+        lines = report_lines('TST-002-report.md')
+        assert ln and ln <= len(lines) and '| 2 |' in lines[ln - 1], f'问题行定位错: L{ln}'
+
+    @check('vr:fake-ghost-case-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-003'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        hits = [x for x in data['findings'] if 'ghost case missing' in x['msg']]
+        assert hits and 'tests/demo.spec.ts' in hits[0]['msg'], data['findings']
+
+    @check('vr:fake-b-missing-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-004'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        hits = [x for x in data['findings'] if '预填' in x['msg'] and '≠' in x['msg']]
+        assert hits, data['findings']
+        assert '2' in hits[0]['msg'] and '3' in hits[0]['msg'], hits[0]['msg']
+
+    @check('vr:report-missing-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-999'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert any('report missing' in x['msg'] for x in data['findings']), data['findings']
+        assert data['gates'] == {}, '报告缺失应 fail-fast 不跑门'
+
+    @check('vr:scaffold-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-008'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert any('scaffold' in x['msg'] for x in data['findings']), data['findings']
+
+    @check('vr:gates-actually-invoked')
+    def _():
+        if os.path.exists(log):
+            os.remove(log)
+        rc, data = run_json([repo, 'TST-001'])
+        assert rc == 0, data['findings']
+        logged = open(log, encoding='utf-8').read() if os.path.exists(log) else ''
+        assert 'typecheck' in logged, f'G1 未真实调用: {logged!r}'
+        assert 'test' in logged, f'G2 未真实调用: {logged!r}'
+        assert f'cwd={repo}' in logged, f'门命令未在 repo 内执行: {logged!r}'
+
+    @check('vr:gate-rerun-fail-detected')
+    def _():
+        rc, data = run_json([repo, 'TST-001'], mode='fail-typecheck')
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert data['gates']['G1']['ok'] is False, data['gates']
+        assert any('G1 重跑失败' in x['msg'] for x in data['findings']), data['findings']
+
+    @check('vr:gate-claim-mismatch-flagged')
+    def _():
+        rc, data = run_json([repo, 'TST-001'], mode='fail-typecheck')
+        hits = [x for x in data['findings'] if 'G1' in x['msg'] and '矛盾' in x['msg']]
+        assert hits, data['findings']
+
+    @check('vr:done-body-valid-pass')
+    def _():
+        body = 'PASS;报告:docs/reports/TST-001-report.md;测试:+2/6全绿;备注:无偏差'
+        rc, data = run_json([repo, 'TST-001', '--done-body', body])
+        assert rc == 0, data['findings']
+        assert data['done_body']['ok'] is True, data['done_body']
+
+    @check('vr:done-body-format-reject')
+    def _():
+        body = '通过;报告:docs/reports/TST-001-report.md;测试:全绿;备注:好'
+        rc, data = run_json([repo, 'TST-001', '--done-body', body])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert any('格式不符' in x['msg'] for x in data['findings']), data['findings']
+
+    @check('vr:done-body-selftest-format-ok')
+    def _():
+        db = validate_done_body(
+            'PASS-NOTES;报告:maestro/reports/SI-001-report.md;测试:selftest 26项全绿;备注:两脚本内置自测',
+            'SI-001', 'PASS-NOTES')
+        assert db['ok'], db['errors']
+
+    @check('vr:done-body-judgment-mismatch')
+    def _():
+        body = 'FAIL;报告:docs/reports/TST-001-report.md;测试:+2/6全绿;备注:自判失败'
+        rc, data = run_json([repo, 'TST-001', '--done-body', body])
+        hits = [x for x in data['findings'] if 'done body' in x['msg'] and '≠' in x['msg']]
+        assert hits, data['findings']
+
+    @check('vr:pass-notes-draft')
+    def _():
+        rc, data = run_json([repo, 'TST-005'])
+        assert rc == 0 and data['judgment'] == 'PASS-NOTES', (rc, data['judgment'])
+
+    @check('vr:declared-fail-propagates')
+    def _():
+        rc, data = run_json([repo, 'TST-006'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert data['report_parsed']['judgment'] == 'FAIL'
+
+    @check('vr:unchecked-b-row-fail')
+    def _():
+        rc, data = run_json([repo, 'TST-007'])
+        assert rc != 0 and data['judgment'] == 'FAIL', (rc, data['judgment'])
+        assert any('[ ]' in x['msg'] and '矛盾' in x['msg'] for x in data['findings']), data['findings']
+
+    @check('vr:json-mode-shape')
+    def _():
+        rc, data = run_json([repo, 'TST-002'])
+        for key in ('ref', 'repo', 'report', 'ticket', 'gates', 'findings', 'judgment', 'f_section'):
+            assert key in data, f'缺 {key}'
+        assert data['gates']['G1']['cmd'] == 'pnpm typecheck', data['gates']
+        assert data['gates']['G2']['cmd'] == 'pnpm test', data['gates']
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    print(f'verify-report selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description='semi-auto report reviewer (ticket SI-001)')
+    ap.add_argument('repo', nargs='?', help='仓库根路径(含 docs/tickets.md 或 tickets.md)')
+    ap.add_argument('ref', nargs='?', help='票号, 如 LK-001 / SI-001')
+    ap.add_argument('--done-body', default=None, help='待校验的 done 回调 body(可选)')
+    ap.add_argument('--json', action='store_true', help='结构化 JSON 输出')
+    ap.add_argument('--g1-cmd', default=None, help="G1 重跑命令(默认 'pnpm typecheck';传空串 '' 跳过)")
+    ap.add_argument('--g2-cmd', default=None, help="G2 重跑命令(默认 'pnpm test';传空串 '' 跳过)")
+    ap.add_argument('--gate-timeout', type=float, default=GATE_TIMEOUT_DEFAULT, help='门命令超时秒数(默认 900)')
+    ap.add_argument('--selftest', action='store_true', help='内置自测(fixture: testdata/SI-001)')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.repo or not a.ref:
+        ap.print_help()
+        sys.exit(2)
+    res = verify(os.path.abspath(a.repo), a.ref, done_body=a.done_body,
+                 g1=a.g1_cmd, g2=a.g2_cmd, timeout=a.gate_timeout)
+    if a.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    else:
+        print_human(res)
+    sys.exit(0 if res['judgment'] != 'FAIL' else 1)
+
+
+if __name__ == '__main__':
+    main()
