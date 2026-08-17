@@ -70,6 +70,34 @@ else
 fi
 echo "mirror synced: $SRC/bin -> $MIRROR"
 
+# polyfill lane(0007/SI-003): 仓 plugins/host-callback-bridge → ~/.dsh/plugins/ 自包含副本。
+# 宿主 boot 经 run-web.sh --patch ~/.dsh/plugins/polyfill.patch.yml 装载该 lane;仓是
+# 唯一源头,部署面禁止手改。polyfill.patch.yml 的 insert 行由 --polyfill-register 一次性写入。
+POLYFILL_DIR="${DSH_HOME:-$HOME/.dsh}/plugins/host-callback-bridge"
+if [ -d "$SRC/plugins/host-callback-bridge" ]; then
+  mkdir -p "$(dirname "$POLYFILL_DIR")"
+  rm -rf "$POLYFILL_DIR"
+  cp -a "$SRC/plugins/host-callback-bridge" "$POLYFILL_DIR"
+  rm -rf "$POLYFILL_DIR/__pycache__"
+  echo "polyfill synced: $SRC/plugins/host-callback-bridge -> $POLYFILL_DIR"
+fi
+
+case "${1:-}" in
+--polyfill-register)
+  # 把 polyfill lane 插件行写入 ~/.dsh/plugins/polyfill.patch.yml(幂等: 已在册则不动)。
+  PATCH_FILE="${DSH_HOME:-$HOME/.dsh}/plugins/polyfill.patch.yml"
+  [ -f "$PATCH_FILE" ] || { echo "dev-sync --polyfill-register: $PATCH_FILE 不存在" >&2; exit 1; }
+  if grep -q "host-callback-bridge/index.js" "$PATCH_FILE"; then
+    echo "polyfill.patch.yml 已注册 host-callback-bridge(幂等跳过)"
+  else
+    printf '%s\n' "    - id: host-callback-bridge" "      name: '${POLYFILL_DIR}/index.js'" >> "$PATCH_FILE"
+    echo "polyfill registered: host-callback-bridge -> $PATCH_FILE"
+  fi
+  echo "reminder: polyfill.patch.yml 变更经 HMR 热载入;插件代码变更需重启 host"
+  exit 0
+  ;;
+esac
+
 # shared/ → ~/.agents/skills: 对端 harness(Orca/zap 里的 agent)的 skill 发现面。
 # 仓库是唯一源头;~/.agents/skills 与 ~/.claude/skills 的副本/软链均由这里派生。
 SHARED="${MAESTRO_SHARED_SKILLS:-$HOME/.agents/skills}"

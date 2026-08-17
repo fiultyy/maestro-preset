@@ -1,0 +1,7 @@
+{
+  "name": "@maestro/host-callback-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Host-boot callback bridge (polyfill lane): binds HTTP /callback at host startup, watches bridge inbox.log with fs.watch (no polling), routes each line per registry.json to the target session via loopback /api/session.prompt (ORCA-CB envelope). Replaces the session-owned link (SI-003): the orchestrator session only consumes turns. Source of truth: maestro-preset repo plugins/host-callback-bridge; deployed face: ~/.dsh/plugins/host-callback-bridge (self-contained copy, dev-sync --polyfill).",
+  "main": "index.js"
+}
