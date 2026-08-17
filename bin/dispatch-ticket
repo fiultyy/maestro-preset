@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""dispatch-ticket — 票派发一体化: 读票→组契约→terminal send→ledger 落账
+用法:
+  dispatch-ticket <LK-ID> --repo /path/to/repo --terminal term_xxx [--worker alias] [--dry-run]
+机制:
+  - 票源: <repo>/docs/tickets.md 中 "### <LK-ID>" 起至下一个 ^###/^## 的块
+  - 契约: ~/.dsh/maestro/templates/dispatch-preamble.md(占位符替换)
+  - 签名: $MAESTRO_ORCH_SIGNATURE 或 ~/.dsh/maestro/bridge/orch.signature
+  - 落账: ledger node(dispatched) + event(dispatched),project 按 repo 路径解析
+环境: ORCA_CLI_COMMAND(默认 orca-ide)
+"""
+import argparse, json, os, re, subprocess, sys
+
+HOME = os.path.expanduser('~/.dsh')
+MAESTRO = f'{HOME}/maestro'
+ORCA = os.environ.get('ORCA_CLI_COMMAND', 'orca-ide')
+
+def die(m, code=1):
+    print(f'dispatch-ticket: {m}', file=sys.stderr); sys.exit(code)
+
+def signature():
+    sig = os.environ.get('MAESTRO_ORCH_SIGNATURE') or ''
+    if not sig:
+        try:
+            with open(f'{MAESTRO}/bridge/orch.signature') as fh: sig = fh.read().strip()
+        except FileNotFoundError: pass
+    if not sig: die('orch 签名缺失: 设 MAESTRO_ORCH_SIGNATURE 或写 maestro/bridge/orch.signature')
+    return sig
+
+def ticket_block(repo, ref):
+    path = os.path.join(repo, 'docs', 'tickets.md')
+    try:
+        with open(path) as fh: text = fh.read()
+    except FileNotFoundError:
+        die(f'tickets.md not found: {path}')
+    m = re.search(rf'^(### {re.escape(ref)}\b[^\n]*)$(.*?)(?=^### |^## |\Z)', text, re.M | re.S)
+    if not m: die(f'ticket {ref} not found in {path}')
+    return (m.group(1) + m.group(2)).rstrip()
+
+def build_message(ref, worker, sig, block):
+    with open(f'{MAESTRO}/templates/dispatch-preamble.md') as fh:
+        tpl = fh.read()
+    return (tpl.replace('{REF}', ref).replace('{WORKER}', worker)
+               .replace('{SIG}', sig).replace('{TICKET_BLOCK}', block.strip()))
+
+def send(terminal, message):
+    proc = subprocess.run([ORCA, 'terminal', 'send', '--terminal', terminal,
+                           '--text', message, '--enter', '--json'],
+                          capture_output=True, text=True, timeout=30)
+    try:
+        ok = json.loads(proc.stdout).get('ok')
+    except json.JSONDecodeError:
+        ok = False
+    if not ok: die(f'terminal send failed: {proc.stdout}{proc.stderr}', 5)
+    return True
+
+def ledger(repo, ref, worker, terminal, title):
+    env = dict(os.environ)
+    env['MAESTRO_ORCH_SIGNATURE'] = signature()
+    refs = json.dumps({'ref': ref, 'terminal': terminal, 'worker': worker, 'deliverable': f'docs/reports/{ref}-report.md'}, ensure_ascii=False)
+    for args in (['node', repo, ref, 'task', title, 'dispatched', '--owner', worker, '--refs', refs],
+                 ['event', repo, ref, 'dispatched', f'dispatch-ticket -> {terminal} ({worker})']):
+        proc = subprocess.run([sys.executable, f'{MAESTRO}/bin/ledger', *args],
+                              capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0:
+            print(f'ledger write failed (continue): {proc.stderr.strip()}', file=sys.stderr)
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument('ref', help='票号, 如 LK-001')
+    ap.add_argument('--repo', required=True, help='仓库绝对路径')
+    ap.add_argument('--terminal', required=True, help='orca terminal handle')
+    ap.add_argument('--worker', default=None, help='worker 别名(默认 omp@<repo basename>)')
+    ap.add_argument('--title', default=None, help='ledger 节点标题(默认取票首行)')
+    ap.add_argument('--dry-run', action='store_true', help='只打印消息不发送不落账')
+    a = ap.parse_args()
+    worker = a.worker or f"omp@{os.path.basename(a.repo.rstrip('/'))}"
+    block = ticket_block(a.repo, a.ref)
+    msg = build_message(a.ref, worker, signature(), block)
+    title = a.title or re.sub(rf'^#+\s*{re.escape(a.ref)}\s*', '', block.split('\n', 1)[0]).strip() or a.ref
+    if a.dry_run:
+        print(msg); print(f'\n[dry-run] worker={worker} terminal={a.terminal} title={title}'); return
+    send(a.terminal, msg)
+    print(f'sent: {a.ref} -> {a.terminal} ({worker})')
+    ledger(a.repo, a.ref, worker, a.terminal, title)
+    print(f'ledger: {a.ref} dispatched')
+
+if __name__ == '__main__': main()
