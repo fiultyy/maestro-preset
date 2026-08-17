@@ -15,7 +15,11 @@
 # 信封: 单行 JSON {"type","from","to","body"};ref 折进 body 前缀 "[ref:<ref>] "
 #       (HTTP 通道丢弃未知字段,两通道统一此格式;编排者从 body 前缀解析 ref)
 # 传输: HTTP 直发(bridge/http.port,200/208 皆成功)优先;
-#       不可用(无端口文件/未 arm/连接失败)则降级文件桥(append inbox.log,游标消费不丢)。
+#       PORT-R1(0005): 端口旁挂 http.port.sig 记录持有者 sessionId;目标签名(取 to
+#       的 @ 后段)与持有者不符 → 不 POST 直落文件桥(跨代际"撞错桥"整类现场消除;
+#       to=* 广播与 sig 缺失[旧代际/宿主 lane 未写]不拦截, 保持后向兼容);
+#       不可用(无端口文件/未 arm/连接失败)或非 200/208(含 404 显式 to 失配/ADDR-R1、
+#       400、503)亦降级文件桥(append inbox.log,游标消费不丢)。
 # 依赖: curl + python3(与 session-send 同);二者皆无时按 SKILL.md 手拼 JSON。
 set -euo pipefail
 if [ "$#" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
@@ -28,7 +32,16 @@ print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
 ' "$typ" "$frm" "$to" "$ref" "$body")
 
 # 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)
-if [ -f "$B/http.port" ] && command -v curl >/dev/null 2>&1; then
+skip_http=0
+if [ -f "$B/http.port.sig" ] && [ "$to" != "*" ]; then
+  sig=$(tr -d '[:space:]' < "$B/http.port.sig")
+  tsid=${to##*@}
+  if [ -n "$sig" ] && [ "$tsid" != "$sig" ]; then
+    echo "cb-send: http.port holder ${sig} != target ${tsid}, falling back to file bridge" >&2
+    skip_http=1
+  fi
+fi
+if [ "$skip_http" -eq 0 ] && [ -f "$B/http.port" ] && command -v curl >/dev/null 2>&1; then
   port=$(tr -d '[:space:]' < "$B/http.port")
   tmp=$(mktemp)
   code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/callback" \

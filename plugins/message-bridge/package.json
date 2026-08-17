@@ -1,7 +1,7 @@
 {
   "name": "@maestro/message-bridge",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "type": "module",
-  "description": "Loopback HTTP direct-send callback endpoint for the maestro bridge: POST /callback on 127.0.0.1 (port published to bridge/http.port) driving agent turns via followup/inject, with (from,body) 60s idempotency (208) and 400 validation",
+  "description": "Loopback HTTP direct-send callback endpoint for the maestro bridge: POST /callback on 127.0.0.1 (port published to bridge/http.port, holder signature in bridge/http.port.sig) driving agent turns via followup/inject, with (from,body) 60s idempotency (208), 400 validation and 404 on explicit-to route miss (v1.3 ADDR-R1: no fallback absorption)",
   "main": "index.js"
 }

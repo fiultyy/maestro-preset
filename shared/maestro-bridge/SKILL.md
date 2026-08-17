@@ -38,7 +38,8 @@ CB=~/.dsh/.agent-presets/maestro/bin/cb-send    # 安装点
 - `<orch签名>` = 派发契约里编排者给的 `<alias>@<sessionId>`。**别填 `*`**(广播吵醒
   所有在册会话);实在没有就填 `orch1`。
 - `<ref>` = 派发消息 `[ref:…]` 里的任务号,没有填 `-`。
-- cb-send 自动选路: HTTP(有语义应答 200/208)优先,文件桥兜底,皆不丢消息。
+- cb-send 自动选路: HTTP(有语义应答 200/208)优先;显式 to 失配(404)、端口持有者
+  不符(PORT-R1)或 HTTP 不可用时自动降级文件桥,皆不丢消息。
 
 ## cb-send 不可用时: 手拼 JSON 写文件桥
 

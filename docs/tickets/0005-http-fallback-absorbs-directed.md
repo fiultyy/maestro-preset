@@ -1,6 +1,6 @@
 # 0005 — cb-send HTTP 兜底吸收显式定向消息:仅在文件桥注册的消费者收不到回调
 
-> 状态: DRAFT(待审) · 发现于 0004 后自迭代现场(selfiter-1, 2026-08-16 14:39Z)
+> 状态: IMPLEMENTED(v1.3, 分支 feat/bridge-routing-v1.3, 2026-08-17; 装点生效待 dev-sync+换代) · 发现于 0004 后自迭代现场(selfiter-1, 2026-08-16 14:39Z)
 
 ## 现场实录
 
@@ -30,11 +30,31 @@
 
 ## 验收
 
-- [ ] 双编排者场景(一 HTTP+文件桥,一仅文件桥): worker cb-send ack → 仅文件桥编排者
-      **经文件桥收到**(HTTP 404 → cb-send 降级 → registry 路由命中);
-- [ ] to 缺省仍兜底最近 armer(单会话便利性保留);
-- [ ] 死签名(to 指向不存在会话)→ HTTP 404 + 文件桥 dead.log(不再吸收);
-- [ ] 测试: message-bridge 路由用例更新 + cb-send 降级路径单测;全量回归绿。
+- [x] 双编排者场景(一 HTTP+文件桥,一仅文件桥): worker cb-send ack → 仅文件桥编排者
+      **经文件桥收到**(HTTP 404 → cb-send 降级 → registry 路由命中)——
+      单测覆盖: apply 层"显式 to 无 armed 槽 → 404 不吸收"(index.test.mjs) +
+      cb-send "404 → 降级 inbox.log 落行"(tests/test_cb_send.sh ③); 现场复演
+      待装点换代后新会话验证(护栏二);
+- [x] to 缺省仍兜底最近 armer(单会话便利性保留)——pickRecipient 单测 +
+      apply 层 "no to → last armer" 用例;
+- [x] 死签名(to 指向不存在会话)→ HTTP 404 + 文件桥落盘(不再吸收)——cb-send
+      落 inbox.log 后由文件泵按 registry 裁定投递或 dead.log 死信(v3.6 语义,
+      本票未动);
+- [x] 测试: message-bridge 路由用例更新(错投用例从"兜底"改"404") + cb-send
+      降级路径 + PORT-R1 校验单测(tests/test_cb_send.sh 17 断言), 全量回归绿。
+
+## 实施记录(2026-08-17)
+
+- ADDR-R1: pickRecipient 精确匹配(===sid / endsWith `@<sid>`, 弃 includes),
+  失配 `ROUTE_MISS` → 404; 仅缺省/空保留 last-armer。
+- PORT-R1: arm 旁挂写 `bridge/http.port.sig`(=持有者 sessionId); cb-send 比对
+  to 的 `@` 后段, 不符不 POST 直落文件桥; `*` 广播与 sig 缺失不拦截。
+- HTTP-R2 择一: **会话内选项(ii)**——HTTP 仅低延迟通知, 不回写 inbox, 驱动语义
+  归文件泵+session-send; 选项(i)(受理即落 inbox)由宿主 lane 承载
+  (host-callback-bridge, SI-003), 会话内实现被否的理由见 design §9.3。
+- 文件: plugins/message-bridge/{index.js,index.test.mjs,package.json}、
+  bin/cb-send、tests/test_cb_send.sh、USAGE §3.3、design §9.3、
+  skills/orca-bridge 与 shared/maestro-bridge 措辞同步。
 
 ## 关联
 
