@@ -335,3 +335,36 @@ MSGBR] 回合), 但**被兜底吸收的错投同样"成功"驱动了错误的会
   回合唯一实证可靠通道 = session-send。修复载体 = `docs/tickets/0005`(ADDR-R1 +
   cb-send 降级链), 本坑新增 PORT-R1/HTTP-R2 并入该票实施; 按 §10.2 plugins 强制
   git 分支路径, 禁安装点直改。
+
+### 9.3 实施记录(v1.3, 分支 feat/bridge-routing-v1.3, 2026-08-17)
+
+ticket 0005 载体落地, 本节三决策点全部关闭:
+
+- **ADDR-R1 已实施**: `pickRecipient` 显式非空 to 精确命中(`===sid` / 以
+  `@<sid>` 结尾, 弃 v1.2 的 `includes` 宽匹配——子串命中会把幽灵/错拼地址静默
+  路由到碰巧包含的槽), 失配返回 `ROUTE_MISS` → `404 {error:"no armed HTTP
+  slot for to=<sig>"}`(计数入 unrouted); 仅 to 缺省/空保留 last-armer 兜底。
+  §8.1 的"显式 to 失配兜底必须反转"由此落地——HTTP 面形态为 404 拒收+发送端
+  cb-send 降级文件桥(与 §8.1 建议的死信/400 同向: 请求级同步拒收, 由文件面
+  死信留痕)。
+- **PORT-R1 已实施**: arm 时旁挂写 `bridge/http.port.sig`(=持有者 sessionId,
+  每次 arm 覆写, 与 http.port 恒成对)。**不用 port 文件第二行**——cb-send 与
+  宿主 lane 读端口都是 `tr -d '[:space:]'` 整读, 双行会被拼成脏串; 旁挂文件对
+  不识别它的旧读取方零影响。`bin/cb-send` 读端口后取 to 的 `@` 后段与持有者
+  比对, 不符不 POST 直落文件桥; `to=*` 广播与 sig 缺失(旧代际/宿主 lane 未写)
+  不拦截, 后向兼容。
+- **HTTP-R2 已裁决——会话内选项(ii), 宿主 lane 选项(i)**: 会话内 HTTP 面
+  (message-bridge)不回写 inbox, 定位"低延迟通知"(delivered=进程内直发 wake,
+  非持久证据), 驱动语义与持久证据归文件泵(v3.6)+session-send; 回写式受理面
+  (受理即落 inbox, 200=accepted durable)由 host-callback-bridge(SI-003)承载,
+  两面分工不重叠。会话内实现选项(i)被否的理由: ①直发+回写并存 → armed 双通道
+  会话重复唤醒(HTTP 直发 wake 与泵 wake 各投一次, 60s 去重窗口两通道各算各的,
+  恰是 HTTP-R2 要消除的形态); ②去掉直发只回写 → HTTP-only armed 会话(未
+  bridge_arm)被泵 registry 死信(HTTP 槽表与泵 registry 是两张路由表),
+  200-delivered 契约破裂。
+- **cb-send 降级链确证可达**: HTTP 非 200/208(404/400/503/连接失败 000)与
+  PORT-R1 拦截一律落文件桥 append inbox.log(v1.2 已有该分支, 本票以
+  `tests/test_cb_send.sh` 伪服务端到端确证: 拦截/404/无端口/广播/信封形状
+  17 断言全绿)。
+- **边界**: 文件泵 v3.6 语义零接触(游标/死信/轮转/at-least-once 未动);
+  装点生效待 dev-sync + 代际切换(§10.2 护栏二, 用户拍板时机)。

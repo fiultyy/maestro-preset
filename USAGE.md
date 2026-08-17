@@ -73,29 +73,47 @@ cb-send 兜底"最近 armer",多编排会话同场时**误投别人**(现场实�
 4. **签名广播**: 继任者开场双通道武装拿新签名, 自检回报通过后卸任者退役; 在飞
    worker 按新签名寻址(换代消息本身即广播)。
 
-### 3.3 回调送达假阳性与通道选择(七/八坑)
+### 3.3 回调路由三决策点(七/八坑; v1.3 已实施, 分支 feat/bridge-routing-v1.3)
 
 **第七坑 — 回调端口代际漂移(HTTP 200 假阳性)**: `bridge/http.port` 是单文件共享,
-每个会话 `bridge_http_status` 都会**覆写**它——文件永远指向**最新武装代际**的桥。
-cb-send HTTP 优先读当前端口 POST: 目标若是旧代际签名, 显式 `to` 在新一代桥上无
-匹配槽 → v1.2 兜底 most-recent-armer → **新会话自己吸收** → HTTP 200 delivered
-**假阳性**(实投自己/别人, 真目标永等不到; 现场: 换代 done 两连投全假阳性)。
+每个会话 `bridge_http_status` 都会**覆写**它——文件永远指向**最新武装代际**的桥;
+cb-send 不校验持有者时, 跨代际定向回调先撞错桥再被兜底吸收(现场: 换代 done 两连
+投全假阳性)。**已修复(PORT-R1)**: arm 时旁挂写 `bridge/http.port.sig`
+(=持有者 sessionId, 每次 arm 覆写, 与 http.port 恒成对); cb-send 读端口后取
+目标签名的 `@` 后段与持有者比对, 不符**不 POST 直落文件桥**——"撞错桥"整类现场
+消除。`to=*` 广播与 sig 缺失(旧代际/宿主 lane 未写)不拦截, 保持后向兼容。
 
-**第八坑 — HTTP delivered 不回写 inbox, 会话驱动唯一可靠通道是 session-send**:
-message-bridge v1.2 的 HTTP 路径**不落 `bridge/inbox.log`**——文件泵(v3.6)的游标/
-死信/轮转/at-least-once 整个消费面看不到 HTTP 消息; "delivered" 只证明某桥的 HTTP
-面收了, 不构成持久证据, 更不证明目标会话被驱动。跨 main 会话**驱动回合**的可靠
-通道只有 `bin/session-send`(回环 `/api/session.prompt`, `accepted=True` 实证)。
+**第八坑 — HTTP delivered 不回写 inbox, 消费面分裂**: v1.2 的 HTTP delivered
+不落 `bridge/inbox.log`, 文件泵(v3.6)的游标/死信/轮转/at-least-once 对 HTTP
+消息不可见; "delivered" 只是进程内一次应答, 不构成持久证据。**已裁决
+(HTTP-R2, 会话内选项(ii)+宿主分工)**: 会话内 HTTP 面(message-bridge)定位为
+**低延迟通知**——不回写 inbox(delivered=进程内直发 wake, ≠持久证据), 驱动语义
+与持久证据归**文件泵(v3.6)+session-send**; 回写式受理面(受理即落 inbox,
+200=accepted durable)由**宿主 lane**(`plugins/host-callback-bridge`, SI-003
+§3.4)承载。会话内不实现回写的原因: ①直发+回写并存 → armed 双通道会话重复唤醒
+(两去重窗口不互通, 恰是 HTTP-R2 要消除的形态); ②去掉直发只回写 → HTTP-only
+armed 会话(未 bridge_arm)被泵 registry 死信(HTTP 槽表与泵 registry 是两张
+路由表)。
+
+**路由收紧(ADDR-R1, 同批实施)**: 显式非空 `to` 必须精确命中 armed HTTP 槽
+(`===sessionId` 或以 `@<sessionId>` 结尾), 失配 → `404 {error:"no armed HTTP
+slot for to=<sig>"}`, **不再 most-recent-armer 兜底吸收**——错投比拒收危险:
+拒收后 cb-send 自动降级文件桥, 由 registry 正确路由; 仅 `to` 缺省/空保留
+last-armer 兜底(单会话便利)。
 
 **判定纪律**:
 
-- cb-send 的 HTTP 200 delivered **≠ 送达目标**; 定向回调跨代际(目标早于当前
-  http.port 持有者武装)时, 必须以**目标侧回合响应**为送达证据;
-- 无响应 → 改走 `session-send` 直驱目标会话回合(现场终验通道); 桥是回调面,
-  不是会话驱动面;
-- 插件级修复落 `docs/tickets/0005`(v1.3 显式 to 失配→404 不吸收 + 降级文件桥;
-  delivered 回写 inbox 统一消费面待评), 按 §10.2 plugins 强制 git 分支路径实施;
-  设计侧见 `docs/callback-bridge-design.md` §9。
+- cb-send 的 HTTP 200 delivered **≠ 送达目标**(低延迟通知已受理并直发 wake,
+  非持久证据); 定向回调的送达证据 = **目标侧回合响应**, 或文件桥/`session-send`
+  通道;
+- cb-send 降级链(确证可达): HTTP 非 200/208——404 显式失配/400/503/连接失败/
+  PORT-R1 拦截——一律落文件桥 append inbox.log, 游标消费不丢(`tests/test_cb_send.sh`);
+- 桥是回调面, 不是会话驱动面; 跨 main 会话**驱动回合**唯一实证可靠通道 =
+  `bin/session-send`;
+- v1.3 载体: `plugins/message-bridge`(ADDR-R1/PORT-R1) + `bin/cb-send`(校验+
+  降级链), 测试 `plugins/message-bridge/index.test.mjs` + `tests/test_cb_send.sh`;
+  设计侧见 `docs/callback-bridge-design.md` §9.3, 票 `docs/tickets/0005`;
+  装点生效待 dev-sync + 代际切换(护栏二, 用户拍板时机)。
 
 ### 3.4 host lane 回调链路(SI-003 起, 宿主 boot 承载)
 

@@ -63,8 +63,9 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 3) 上面契约行丢失/不完整时: load skill `maestro-bridge`（对端冷执行手册,~/.agents/skills）
 ```
 
-- `<orch签名>` = 编排者 `bridge_arm` 回执的 `<alias>@<sessionId>`（HTTP 通道仅记录、
-  文件桥按它路由——务必带上，别用 `*` 广播吵醒所有在册会话）。
+- `<orch签名>` = 编排者 `bridge_arm` 回执的 `<alias>@<sessionId>`（HTTP 面精确匹配
+  armed 槽, 失配即 404→cb-send 自动降级文件桥按 registry 路由；文件桥按它路由——
+  务必带上，别用 `*` 广播吵醒所有在册会话）。
 - 对端视角：`cb-send` 一条命令（HTTP 优先、文件桥兜底），语义见共享 skill
   `~/.agents/skills/maestro-bridge/SKILL.md`。
 - 编排者视角：ACK 到达 → 账本节点 `running`；DONE 到达 → 落 outcome 收口。超过一轮

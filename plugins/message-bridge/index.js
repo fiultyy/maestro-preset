@@ -1,5 +1,5 @@
 /**
- * @maestro/message-bridge — HTTP 直发回调插件 (v1.0)
+ * @maestro/message-bridge — HTTP 直发回调插件 (v1.3)
  *
  * 与 orca-callback pump（文件桥）并列的第二条入向通道：不走 Orca 桥 pane /
  * inbox.log，而是本地回环 HTTP 微服务，供任何同机进程一条 curl 直发回调：
@@ -27,25 +27,41 @@
  *     - 200 校验通过且已投递（followup/inject 与 pump 同策略：idle→followup，忙→inject）
  *     - 400 校验失败（附错误详情），不投递
  *     - 208 同一 (from, body) 60s 内重复 → 已投递标记，不重复 wake
- *     - 405/404/413/403 非 POST / 路径不符 / 超过 256KB / 非回环来源
+ *     - 404 非显式路由: 路径不符, 或（v1.3 ADDR-R1）显式 to 无匹配 armed 槽
+ *     - 405/413/403 非 POST / 超过 256KB / 非回环来源
  *     - 503 尚未 arm（目标会话还没调过 bridge_http_status，无 agent 绑定）
  *     - 500 wake 抛错（计数入 failed）
- *   鉴权：仅监听 127.0.0.1，且逐请求校验 remoteAddress 为回环；`to` 字段仅
- *   记录不路由（与文件桥一致 —— 单消费者组，由 arm 时序决定谁收）。
- *   可观测：端口写 bridge/http.port；计数与元数据镜像 bridge/http.state.json
- *   （best-effort），bridge_http_status 工具返回端口/绑定/计数。
+ *   鉴权：仅监听 127.0.0.1，且逐请求校验 remoteAddress 为回环；`to` 自 v1.2 起
+ *     路由（v1.3 收紧为精确命中, 见上）, 缺省补 DEFAULT_TO 仅作记录。
  *
  * 工具:
  *   bridge_http_status — arm + 状态查询：绑定发起 agent、启动监听（幂等），
  *   返回端口/绑定/计数。会话开场调用一次即可。
+ *
+ * v1.3 相对 v1.2 的变更（ticket 0005 / design §9, 换代七/八坑现场）:
+ *   1. ADDR-R1 路由收紧: 显式非空 to 必须精确命中 armed HTTP 槽（to===sid 或
+ *      以 `@${sid}` 结尾, 弃 v1.2 的 includes 宽匹配）, 失配 →
+ *      404 {error:"no armed HTTP slot for to=<sig>"}——绝不 most-recent-armer
+ *      兜底吸收（错投比拒收危险: 拒收后 cb-send 降级文件桥仍可按 registry 正确
+ *      路由, 错投则双方都难察觉）; 仅 to 缺省/空保留 last-armer 兜底。
+ *   2. PORT-R1 端口持有者签名: arm 时旁挂写 bridge/http.port.sig（=持有者
+ *      sessionId, 每次 arm 覆写, 与 http.port 恒成对; 不用 port 文件第二行——
+ *      发送端 `tr -d '[:space:]'` 读取会把双行拼串）; bin/cb-send 读端口后校验
+ *      目标签名==持有者, 不符不 POST 直落文件桥（消除跨代际"撞错桥"整类现场）。
+ *   3. HTTP-R2 裁决（不回写 inbox）: 会话内 HTTP 面定位为"低延迟通知"——
+ *      delivered 是进程内一次直发 wake, 非持久证据; 驱动语义与持久证据归文件泵
+ *      （v3.6）+session-send。回写式受理面（受理即落 inbox, 200=accepted durable）
+ *      由宿主 lane 承载（plugins/host-callback-bridge, SI-003）。会话内实现回写
+ *      被否: 直发+回写并存 → armed 双通道会话重复唤醒（两去重窗口不互通）; 去掉
+ *      直发只回写 → HTTP-only armed 会话被泵 registry 死信（HTTP 槽表与泵
+ *      registry 是两张路由表）。
  */
-
 import { createServer } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 
 /** 版本指纹：bridge_http_status 回执携带，供会话与磁盘对账。 */
-export const version = '1.2.0'
+export const version = '1.3.0'
 
 export const inject = ['agents', 'tools']
 
@@ -288,8 +304,19 @@ export function createBridgeService(config) {
 
     const line = JSON.stringify({ type: payload.type, from: payload.from, to, body: payload.body })
     try {
-      wake(line)
+      // info.to = 请求原始 to（未混入 DEFAULT_TO 补全）: 缺省 → last-armer 兜底;
+      // 显式非空 → 必须精确命中 armed 槽（v1.3 ADDR-R1）。canonical line 仍带
+      // 补全后的 to（记录面不变）。
+      wake(line, { to: payload.to })
     } catch (error) {
+      if (error !== null && typeof error === 'object' && error.code === 'MSG_BRIDGE_ROUTE_MISS') {
+        // 显式定向失配: 拒收（非 5xx）——发送端 cb-send 据此降级文件桥按 registry
+        // 正确路由, 不再兜底吸收（ticket 0005 现场根因一）。
+        counters.unrouted += 1
+        sendJson(res, 404, { ok: false, error: errorMessage(error) })
+        await persistState()
+        return
+      }
       if (error !== null && typeof error === 'object' && error.code === 'MSG_BRIDGE_NOT_ARMED') {
         counters.unrouted += 1
         sendJson(res, 503, { ok: false, error: errorMessage(error) })
@@ -374,16 +401,22 @@ export function createBridgeService(config) {
 }
 
 /**
- * 按投递目标挑选唤醒槽（v1.2,incident 0003）:
- * to 形如 <alias>@<sessionId> / 裸 sessionId / 裸 alias 时精确路由;
- * 匹配不到或 to 缺省 → 最近 arm 的会话(向后兼容单会话行为)。
+ * 按投递目标挑选唤醒槽（v1.3,ticket 0005 ADDR-R1）:
+ * to 显式且非空 → 必须精确命中 armed 槽（to===sid 或 to 以 `@${sid}` 结尾;
+ *   弃 v1.2 的 includes 宽匹配——子串命中会把幽灵/错拼地址静默路由到碰巧包含
+ *   的槽）: 命中返回 sid, 失配返回 ROUTE_MISS（handle → 404 拒收, 由发送端
+ *   降级文件桥——错投比拒收危险）;
+ * to 缺省/空/非字符串 → lastArmedId 兜底（单会话便利性保留, v1.2 行为）。
  * 纯函数,导出供单测。
  */
+export const ROUTE_MISS = Symbol('pickRecipient: explicit to matched no armed slot')
+
 export function pickRecipient(to, knownSessionIds, lastArmedId) {
   if (typeof to === 'string' && to.length > 0) {
     for (const sid of knownSessionIds) {
-      if (to === sid || to.endsWith(`@${sid}`) || to.includes(sid)) return sid
+      if (to === sid || to.endsWith(`@${sid}`)) return sid
     }
+    return ROUTE_MISS
   }
   return lastArmedId ?? null
 }
@@ -403,13 +436,26 @@ export function apply(ctx) {
     state.hostRpcAvailable = false
   }
 
-  const wake = (line) => {
+  const wake = (line, info) => {
     let targetId = null
+    let missedTo = null
     try {
       const envelope = JSON.parse(line)
-      targetId = pickRecipient(envelope?.to, [...slots.keys()], lastArmedId)
+      // info 由 handle() 恒携带: {to: payload.to}。info.to === undefined 即"缺省"
+      // （不能回退 envelope.to——那是 DEFAULT_TO 补全后的记录面值, 回退会把缺省
+      // 误判成显式定向而 404）。仅在无 info 的旧式直调下才读 envelope。
+      const to = info !== undefined ? info.to : envelope?.to
+      const picked = pickRecipient(to, [...slots.keys()], lastArmedId)
+      if (picked === ROUTE_MISS) missedTo = to
+      else targetId = picked
     } catch {
       targetId = lastArmedId
+    }
+    if (missedTo !== null) {
+      throw Object.assign(
+        new Error(`no armed HTTP slot for to=${missedTo}`),
+        { code: 'MSG_BRIDGE_ROUTE_MISS' },
+      )
     }
     const agent = targetId === null ? null : slots.get(targetId) ?? null
     if (agent === null) {
@@ -431,7 +477,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'bridge_http_status',
     description:
-      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. Types: ack (dispatch handshake - peer turn started), done (completion summary), ping, status. Since v1.2 the to field routes: <alias>@<sessionId> or bare sessionId wakes exactly that armed session; unmatched or missing to wakes the most recent armer. HostConnectionRpc availability is reported for the record only.',
+      'Arm and inspect the message-bridge loopback HTTP callback endpoint (POST /callback on 127.0.0.1, random port published to bridge/http.port). First call in a session binds the calling agent and starts the listener (idempotent); every call returns port/bind/counters. Valid callbacks drive native followup/inject turns with 60s (from,body) idempotency (208 on duplicates) and 400 on validation failure. Types: ack (dispatch handshake - peer turn started), done (completion summary), ping, status. Since v1.3 the to field routes strictly: <alias>@<sessionId> or bare sessionId wakes exactly that armed session; an explicit unmatched to is rejected with 404 (no fallback absorption - the sender falls back to the file bridge, which routes via registry); only a missing to wakes the most recent armer. Arming also records the port-holder signature in bridge/http.port.sig (PORT-R1) so cb-send can refuse cross-generation POSTs. HTTP delivery is a low-latency notice, not durable evidence (HTTP-R2 option ii): durable semantics live in the file pump + session-send. HostConnectionRpc availability is reported for the record only.',
     parameters: {},
     output: {
       schema: { type: 'string' },
@@ -460,9 +506,17 @@ export function apply(ctx) {
       if (startedError !== null) {
         return `message-bridge failed to start listener: ${startedError}; counters: ${JSON.stringify(s.counters)}`
       }
+      // PORT-R1: 端口持有者签名旁挂（=本 sessionId; 每次 arm 覆写, 与 http.port
+      // 恒成对——进程级单例端口不变, 持有者随 arm 更新）。best-effort: 写失败仅记
+      // 日志, 不影响 arm 回执（与 service 内 http.port 写同策略）。
+      try {
+        await fsp.writeFile(`${bridgeDir}/http.port.sig`, `${sessionId}\n`)
+      } catch (error) {
+        console.error('message-bridge http.port.sig write failed:', errorMessage(error))
+      }
       return `message-bridge v${version} armed: ${s.endpoint} (pid ${s.pid}); `
-        + `this session ${sessionId} (${slots.size} armed slot(s), routing: to=<alias>@<sessionId> exact, else most-recent armer); `
-        + `port file ${s.portFile}; `
+        + `this session ${sessionId} (${slots.size} armed slot(s), routing: explicit to must hit an armed slot - miss → 404, no fallback absorption; missing to → most-recent armer); `
+        + `port file ${s.portFile} (holder sig http.port.sig=${sessionId}); `
         + `curl -X POST ${s.endpoint} -H 'content-type: application/json' `
         + `-d '{"type":"done","from":"<agent@loc>","body":"…"}'; `
         + `counters ${JSON.stringify(s.counters)}; `

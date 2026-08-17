@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createBridgeService, apply, pickRecipient, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS, TYPES } from './index.js'
+import { createBridgeService, apply, pickRecipient, ROUTE_MISS, version, MAX_BODY_BYTES, DEDUP_WINDOW_MS, TYPES } from './index.js'
 
 const bridgeDirs = []
 async function makeBridge() {
@@ -54,10 +54,12 @@ async function withService(fn, config = {}) {
 }
 
 test('exports version fingerprint', () => {
-  assert.equal(version, '1.2.0')
+  assert.equal(version, '1.3.0')
   assert.equal(DEDUP_WINDOW_MS, 60_000)
   assert.equal(MAX_BODY_BYTES, 256 * 1024)
   assert.deepEqual(TYPES, ['ack', 'done', 'ping', 'status'])
+  // ROUTE_MISS 是稳定判别哨: pickRecipient 显式失配返回它, apply 层映射为 404。
+  assert.equal(typeof ROUTE_MISS, 'symbol')
 })
 
 test('ack (dispatch handshake) → 200 delivered, same canonical line shape', async () => {
@@ -91,7 +93,13 @@ test('valid callback → 200 delivered; wake receives MSGBR-shaped canonical lin
     assert.equal(parsed.body, 'task finished')
 
     assert.equal((await readFile(join(dir, 'http.port'), 'utf8')).trim(), String(port))
-    const state = JSON.parse(await readFile(join(dir, 'http.state.json'), 'utf8'))
+    // http.state.json 是 best-effort 镜像, 写在应答之后——轮询收敛, 不赌时序。
+    let state = null
+    for (let i = 0; i < 100; i++) {
+      state = JSON.parse(await readFile(join(dir, 'http.state.json'), 'utf8'))
+      if (state.counters.delivered === 1) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
     assert.equal(state.counters.delivered, 1)
     assert.equal(state.last.from, 'worker@a1')
     assert.equal(state.last.to, '编排1')
@@ -148,7 +156,7 @@ test('validation failures → 400 with details, nothing delivered', async () => 
   })
 })
 
-test('unarmed wake → 503; wake error → 500', async () => {
+test('unarmed wake → 503; wake error → 500; route-miss wake → 404 (v1.3 ADDR-R1)', async () => {
   const dir = await makeBridge()
   const unrouted = createBridgeService({
     bridgeDir: dir,
@@ -177,6 +185,23 @@ test('unarmed wake → 503; wake error → 500', async () => {
   assert.equal(response.status, 500)
   assert.equal((await response.json()).ok, false)
   failing.stop()
+
+  // 显式 to 无匹配 armed 槽: 404 拒收（v1.2 是兜底吸收的 200 假阳性）。
+  const routeMiss = createBridgeService({
+    bridgeDir: dir,
+    wake: (_line, info) => { throw Object.assign(new Error(`no armed HTTP slot for to=${info?.to}`), { code: 'MSG_BRIDGE_ROUTE_MISS' }) },
+  })
+  const port3 = await routeMiss.start()
+  response = await fetch(`http://127.0.0.1:${port3}/callback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'done', from: 'w@t', to: 'orch@session-dead', body: '[ref:x] done' }),
+  })
+  assert.equal(response.status, 404)
+  const miss = await response.json()
+  assert.equal(miss.ok, false)
+  assert.equal(miss.error, 'no armed HTTP slot for to=orch@session-dead')
+  routeMiss.stop()
 })
 
 test('routing guard: wrong path → 404, non-POST → 405, oversized body → 413', async () => {
@@ -196,7 +221,7 @@ test('routing guard: wrong path → 404, non-POST → 405, oversized body → 41
 test('listener binds loopback only; status reports port/bind/counters', async () => {
   await withService(async ({ service, port }) => {
     const s = service.status()
-    assert.equal(s.version, '1.2.0')
+    assert.equal(s.version, '1.3.0')
     assert.equal(s.bind.host, '127.0.0.1')
     assert.equal(s.bind.port, port)
     assert.equal(s.endpoint, `http://127.0.0.1:${port}/callback`)
@@ -232,16 +257,21 @@ function fakeCtx() {
   return { ctx: harness, tools, harness }
 }
 
-test('pickRecipient: exact sid / alias@sid / bare sid route; unmatched or missing to → last armer', () => {
+test('pickRecipient (v1.3 ADDR-R1): exact sid / alias@sid route; explicit miss → ROUTE_MISS; missing/empty to → last armer', () => {
   const known = ['session-ka', 'session-kb']
   assert.equal(pickRecipient('session-ka', known, 'session-kb'), 'session-ka')
   assert.equal(pickRecipient('orchB@session-kb', known, 'session-ka'), 'session-kb')
-  assert.equal(pickRecipient('nobody@session-zz', known, 'session-ka'), 'session-ka')
+  // 显式定向失配: v1.2 兜底吸收给 last armer → v1.3 拒收(→404), 不再兜底。
+  assert.equal(pickRecipient('nobody@session-zz', known, 'session-ka'), ROUTE_MISS)
+  // 裸别名/缺省补全值不是 armed 槽: 同样拒收, 由文件桥按 registry 解析别名。
+  assert.equal(pickRecipient('orch1', known, 'session-ka'), ROUTE_MISS)
+  assert.equal(pickRecipient('编排1', known, 'session-ka'), ROUTE_MISS)
+  // to 缺省/空: last-armer 兜底保留（单会话便利, 0005 验收项）。
   assert.equal(pickRecipient(undefined, known, 'session-kb'), 'session-kb')
   assert.equal(pickRecipient('', known, null), null)
 })
 
-test('apply slots per session: to=<alias>@<sid> wakes exactly that session; missing to wakes last armer', async () => {
+test('apply slots per session: to=<alias>@<sid> wakes exactly that session; missing to wakes last armer; explicit miss → 404; arm writes http.port.sig (PORT-R1)', async () => {
   const dir = await makeBridge()
   const prev = process.env.MAESTRO_BRIDGE
   process.env.MAESTRO_BRIDGE = dir
@@ -255,6 +285,8 @@ test('apply slots per session: to=<alias>@<sid> wakes exactly that session; miss
     harness.current = B
     const receipt = await tools.get('bridge_http_status').execute()
     assert.match(receipt, /2 armed slot/)
+    // PORT-R1: 持有者签名旁挂 = 最近 armer 的 sessionId, 每次 arm 覆写。
+    assert.equal((await readFile(join(dir, 'http.port.sig'), 'utf8')).trim(), 'session-mb')
 
     const port = Number((await readFile(join(dir, 'http.port'), 'utf8')).trim())
     const post = (payload) => fetch(`http://127.0.0.1:${port}/callback`, {
@@ -270,6 +302,14 @@ test('apply slots per session: to=<alias>@<sid> wakes exactly that session; miss
     assert.equal(A.received.length, 1)
     assert.equal(B.received.length, 2)
     assert.match(A.received[0].content[0].text, /MSGBR\].*"to":"orch@session-ma"/)
+
+    // ADDR-R1: 显式 to 指向无 armed 槽的会话 → 404 拒收, 不吸收给 last armer
+    // （0005 现场: 仅文件桥编排者的回调不再被 HTTP 编排者错收）。
+    const miss = await post({ type: 'ack', from: 'w@t', to: 'orch1@session-ghost', body: '[ref:t9] turn started' })
+    assert.equal(miss.status, 404)
+    assert.equal((await miss.json()).error, 'no armed HTTP slot for to=orch1@session-ghost')
+    assert.equal(A.received.length, 1)
+    assert.equal(B.received.length, 2)
   } finally {
     harness.teardown?.() // 停 HTTP listener:放 finally,断言失败也不拖住进程
     if (prev === undefined) delete process.env.MAESTRO_BRIDGE
