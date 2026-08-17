@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""fleet-touch — 舰队心跳: 原子更新 fleet.json 条目 lastSeenAt(+可选 status)(ticket SI-001)
+
+用法:
+  fleet-touch <termid|code> [--status <新状态>] [--fleet <fleet.json 路径>]
+  fleet-touch --selftest                     # 内置自测(temp 副本,不动真实 fleet.json)
+
+机制:
+  - <termid|code>: fleet.fleet 的键 —— 短码(如 28c9)或 orca 终端 handle(如 term_…)
+  - lastSeenAt 更新为当前 UTC ISO 8601;--status 同时更新 status;其余字段原样保留
+  - 原子性: 全部校验通过后才落盘;写 = 同目录临时文件 + os.replace;
+    任何失败(键不存在 / JSON 损坏 / 结构异常)都不写、不留半写文件、不留临时文件
+  - 用途: 编排者在每次 ack/done 回调回合调用,廉价标记成员活着(orch-loop 债 #6)
+
+环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json);
+      --fleet 显式覆盖优先于环境变量。
+退出码: 0 = 成功 · 1 = 未知键 · 3 = fleet.json 缺失/损坏 · 2 = 用法错
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+FLEET_DEFAULT = os.environ.get('MAESTRO_FLEET') or os.path.join(HOME, 'maestro', 'fleet.json')
+TESTDATA = os.environ.get('MAESTRO_TESTDATA') or os.path.join(HOME, 'maestro', 'testdata', 'SI-001')
+
+TERM_KEY = 'term_00112233-4455-6677-8899-aabbccddeeff'
+
+
+def die(msg, code=1):
+    print(f'fleet-touch: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def load(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        die(f'fleet.json not found: {path}(不写入)', 3)
+    except json.JSONDecodeError as exc:
+        die(f'fleet.json 损坏,不写入(原样保留): {exc}', 3)
+    if not isinstance(data, dict) or not isinstance(data.get('fleet'), dict):
+        die("fleet.json 结构异常: 顶层缺 'fleet' 对象(不写入)", 3)
+    return data
+
+
+def save_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                               prefix='.fleet-touch-', suffix='.json')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def touch(key, status, path):
+    data = load(path)
+    entry = data['fleet'].get(key)
+    if not isinstance(entry, dict):
+        die(f'unknown fleet entry: {key}(不在 {path} 的 fleet 表中,未做任何写入)', 1)
+    entry['lastSeenAt'] = now_iso()
+    if status:
+        entry['status'] = status
+    save_atomic(path, data)
+    suffix = f' status={status}' if status else ' status unchanged'
+    print(f'touched {key}: lastSeenAt={entry["lastSeenAt"]}{suffix}')
+
+
+# ---------- selftest ----------
+
+def selftest():
+    sample = os.path.join(TESTDATA, 'fleet.sample.json')
+    if not os.path.isfile(sample):
+        die(f'fixture missing: {sample}(期望 testdata/SI-001/fleet.sample.json)', 3)
+    tmp = tempfile.mkdtemp(prefix='ft-selftest-')
+
+    def run_cli(args):
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def fresh(name):
+        t = os.path.join(tmp, name)
+        shutil.copyfile(sample, t)
+        return t
+
+    def sha(path):
+        with open(path, 'rb') as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def read_json(path):
+        with open(path, encoding='utf-8') as fh:
+            return json.load(fh)
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('ft:update-lastseen-ok')
+    def _():
+        t = fresh('f1.json')
+        proc = run_cli(['aa11', '--fleet', t])
+        assert proc.returncode == 0, proc.stderr
+        entry = read_json(t)['fleet']['aa11']
+        ts = entry.get('lastSeenAt')
+        assert ts, 'lastSeenAt 未写入'
+        when = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        assert when > datetime(2026, 8, 17, tzinfo=timezone.utc), f'时间戳可疑: {ts}'
+        assert entry['node'] == 'sample-a' and entry['sessionId'] == 'session-aa11', '原有字段被破坏'
+
+    @check('ft:status-update-ok')
+    def _():
+        t = fresh('f2.json')
+        proc = run_cli(['bb22', '--status', 'idle', '--fleet', t])
+        assert proc.returncode == 0, proc.stderr
+        entry = read_json(t)['fleet']['bb22']
+        assert entry['status'] == 'idle', entry
+        assert entry['lastSeenAt'], entry
+
+    @check('ft:term-handle-touch-ok')
+    def _():
+        t = fresh('f3.json')
+        proc = run_cli([TERM_KEY, '--fleet', t])
+        assert proc.returncode == 0, proc.stderr
+        entry = read_json(t)['fleet'][TERM_KEY]
+        assert entry['kind'] == 'orca-terminal' and entry['handle'] == TERM_KEY, entry
+        assert entry['lastSeenAt'] != '2026-08-17T00:00:00+00:00', entry
+        assert entry['alias'] == 'omp@sample', entry
+
+    @check('ft:unknown-id-nonzero-no-write')
+    def _():
+        t = fresh('f4.json')
+        before = sha(t)
+        proc = run_cli(['zz99', '--fleet', t])
+        assert proc.returncode != 0, '未知键应非零退出'
+        assert 'unknown fleet entry' in proc.stderr + proc.stdout, proc.stderr
+        assert sha(t) == before, '失败路径不应改写文件(无半写)'
+
+    @check('ft:malformed-json-no-write')
+    def _():
+        t = os.path.join(tmp, 'bad.json')
+        with open(t, 'w', encoding='utf-8') as fh:
+            fh.write('{ not valid json')
+        before = sha(t)
+        proc = run_cli(['aa11', '--fleet', t])
+        assert proc.returncode != 0, '损坏 JSON 应非零退出'
+        assert sha(t) == before, '损坏 JSON 不应被改写'
+
+    @check('ft:other-entries-preserved')
+    def _():
+        t = fresh('f5.json')
+        before = read_json(t)
+        proc = run_cli(['aa11', '--status', 'paused', '--fleet', t])
+        assert proc.returncode == 0, proc.stderr
+        after = read_json(t)
+        assert after['port'] == before['port'] and after['defaultWorkspaceId'] == before['defaultWorkspaceId']
+        assert after['fleet']['bb22'] == before['fleet']['bb22'], '无关条目被改动'
+        assert after['fleet'][TERM_KEY] == before['fleet'][TERM_KEY], '无关条目被改动'
+        a_b, a_a = before['fleet']['aa11'], after['fleet']['aa11']
+        for k in ('sessionId', 'role', 'node', 'preset', 'spawnedAt'):
+            assert a_a[k] == a_b[k], f'{k} 被改动'
+        assert a_a['status'] == 'paused' and a_a['lastSeenAt'], '目标更新未生效'
+
+    @check('ft:no-temp-residue')
+    def _():
+        junk = [n for n in os.listdir(tmp) if n.startswith('.fleet-touch-') or n.startswith('.fleet-')]
+        assert not junk, f'残留临时文件: {junk}'
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    print(f'fleet-touch selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description='fleet heartbeat touch (ticket SI-001)')
+    ap.add_argument('key', nargs='?', help='fleet 键: 短码(如 28c9)或终端 handle(如 term_…)')
+    ap.add_argument('--status', default=None, help='可选: 同时更新 status')
+    ap.add_argument('--fleet', default=None,
+                    help='fleet.json 路径(默认 $MAESTRO_FLEET 或 ~/.dsh/maestro/fleet.json)')
+    ap.add_argument('--selftest', action='store_true', help='内置自测(temp 副本,不动真实 fleet.json)')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.key:
+        ap.print_help()
+        sys.exit(2)
+    touch(a.key, a.status, a.fleet or FLEET_DEFAULT)
+
+
+if __name__ == '__main__':
+    main()
