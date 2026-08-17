@@ -6,12 +6,12 @@ description: >-
   turn natively. Use when a dispatched task message tells you to "cb-send",
   reply "ack"/"done" to an orchestrator, you see a "[ref:...]" callback contract,
   or you need to report to / ask the maestro coordinator from Orca terminals,
-  zap panes, cron, or any local agent process.
+  dais (formerly zap) panes, cron, or any local agent process.
 ---
 
 # maestro-bridge — 回调 DSH maestro 编排会话(对端 agent 冷执行手册)
 
-你在另一个 harness(Orca 终端 / zap 面板 / cron / 脚本)里干活,DSH maestro 编排会话
+你在另一个 harness(Orca 终端 / dais(原 zap)面板 / cron / 脚本)里干活,DSH maestro 编排会话
 是协调者。本手册让你**零上下文**完成回调: 消息直达编排者并驱动其回合,无需它轮询。
 
 ## 第一步: 自查身份(from 字段填什么)
