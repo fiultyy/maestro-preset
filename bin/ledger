@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# ledger — maestro 项目状态账本助手(替代手写 SQL)
+# 用法:
+#   ledger node   <project(path|key)> <node_id> <kind> <title> <status> [--owner X] [--refs '{"k":"v"}']
+#   ledger event  <project> <node_id> <type> <detail> [--source X]
+#   ledger review <project> <node_id> <pass|fail|rework> <note>      # 审查收口: node→reviewed-* + event
+#   ledger status [project]                                           # 节点+近事件一览
+#   ledger project <path> <name> [--repo-id X]                        # upsert project
+# project 参数: 仓库绝对路径或 projects.key;路径自动解析为 key,查无则报错(先 project 登记)。
+import argparse, json, os, sqlite3, sys, tempfile
+from datetime import datetime, timezone
+
+DB = os.environ.get('MAESTRO_LEDGER', os.path.expanduser('~/.dsh/maestro/ledger.db'))
+
+def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+def conn():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+def resolve_project(c, ident):
+    row = c.execute("SELECT key FROM projects WHERE key=? OR path=?", (ident, ident)).fetchone()
+    if not row: die(f'project not found: {ident} (先 ledger project <path> <name> 登记)')
+    return row['key']
+
+def die(msg, code=1):
+    print(f'ledger: {msg}', file=sys.stderr); sys.exit(code)
+
+def cmd_project(a):
+    with conn() as c:
+        c.execute("""INSERT INTO projects(key,name,path,repo_id,status,updated_at) VALUES(?,?,?,?, 'active',?)
+                     ON CONFLICT(key) DO UPDATE SET name=excluded.name,path=excluded.path,
+                     repo_id=COALESCE(excluded.repo_id,projects.repo_id),updated_at=excluded.updated_at""",
+                  (a.path, a.name, os.path.abspath(a.path), a.repo_id, now()))
+        print(c.execute("SELECT key FROM projects WHERE path=?", (os.path.abspath(a.path),)).fetchone()['key'])
+
+def cmd_node(a):
+    with conn() as c:
+        key = resolve_project(c, a.project)
+        c.execute("""INSERT INTO nodes(project_key,node_id,kind,title,status,owner,refs,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?)
+                     ON CONFLICT(project_key,node_id) DO UPDATE SET kind=excluded.kind,title=excluded.title,
+                     status=excluded.status,owner=COALESCE(excluded.owner,nodes.owner),
+                     refs=COALESCE(excluded.refs,nodes.refs),updated_at=excluded.updated_at""",
+                  (key, a.node_id, a.kind, a.title, a.status, a.owner, a.refs, now()))
+        print(f'{a.node_id} -> {a.status}')
+
+def cmd_event(a):
+    with conn() as c:
+        key = resolve_project(c, a.project)
+        c.execute("INSERT INTO events(ts,project_key,node_id,event_type,source,detail) VALUES(?,?,?,?,?,?)",
+                  (now(), key, a.node_id, a.type, a.source, a.detail))
+        print(f'event +{a.type} @ {a.node_id}')
+
+def cmd_review(a):
+    verdict = {'pass': 'reviewed-pass', 'fail': 'reviewed-fail', 'rework': 'reviewed-rework'}[a.verdict]
+    with conn() as c:
+        key = resolve_project(c, a.project)
+        c.execute("UPDATE nodes SET status=?,updated_at=? WHERE project_key=? AND node_id=?",
+                  (verdict, now(), key, a.node_id))
+        if c.total_changes == 0: die(f'node not found: {a.node_id}')
+        c.execute("INSERT INTO events(ts,project_key,node_id,event_type,source,detail) VALUES(?,?,?,?,?,?)",
+                  (now(), key, a.node_id, 'reviewed', 'orch1', a.note))
+        print(f'{a.node_id} -> {verdict}')
+
+def cmd_status(a):
+    with conn() as c:
+        keys = ([resolve_project(c, a.project)] if a.project
+                else [r['key'] for r in c.execute("SELECT key FROM projects ORDER BY updated_at DESC")])
+        for k in keys:
+            print(f'== {k}')
+            for n in c.execute("SELECT node_id,kind,status,owner FROM nodes WHERE project_key=? ORDER BY id", (k,)):
+                print(f"  {n['status']:<14} {n['node_id']:<24} {n['kind']:<10} {n['owner'] or ''}")
+            for e in c.execute("SELECT node_id,event_type,source,substr(detail,1,80) d,ts FROM events WHERE project_key=? ORDER BY id DESC LIMIT 5", (k,)):
+                print(f"  · [{e['ts'][5:16]}] {e['node_id']} {e['event_type']}({e['source']}): {e['d']}")
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description='maestro ledger helper')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('project'); p.add_argument('path'); p.add_argument('name'); p.add_argument('--repo-id'); p.set_defaults(f=cmd_project)
+    p = sub.add_parser('node'); p.add_argument('project'); p.add_argument('node_id'); p.add_argument('kind'); p.add_argument('title'); p.add_argument('status')
+    p.add_argument('--owner'); p.add_argument('--refs'); p.set_defaults(f=cmd_node)
+    p = sub.add_parser('event'); p.add_argument('project'); p.add_argument('node_id'); p.add_argument('type'); p.add_argument('detail'); p.add_argument('--source', default='orch1'); p.set_defaults(f=cmd_event)
+    p = sub.add_parser('review'); p.add_argument('project'); p.add_argument('node_id'); p.add_argument('verdict', choices=['pass','fail','rework']); p.add_argument('note'); p.set_defaults(f=cmd_review)
+    p = sub.add_parser('status'); p.add_argument('project', nargs='?'); p.set_defaults(f=cmd_status)
+    a = ap.parse_args()
+    if getattr(a, 'refs', None):
+        try: json.loads(a.refs)
+        except json.JSONDecodeError: die('--refs 必须是合法 JSON')
+    a.f(a)
+
+if __name__ == '__main__': main()
