@@ -21,7 +21,13 @@ fleet 条目(orca-terminal 类):
 
 环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json) / ORCA_CLI_COMMAND(默认 orca-ide)
       MAESTRO_PRESET_BIN(cb-send 位置,默认 ~/.dsh/.agent-presets/maestro/bin)
-"""
+      MAESTRO_BRIDGE(默认 ~/.dsh/maestro/bridge; 只读其 registry.json)
+
+签名 freshness(T12 现场收紧): 解析出的编排签名(env 或 orch.signature 文件)其
+sessionId 必须在 bridge/registry.json 在册消费者里,否则拒收(exit 8)并提示重新
+bridge_arm + 刷新 env——探测回调只会投给在册编排者,签名不在册=回调必然落空。
+registry 缺失/损坏(首装未武装)回落现状不拒,只 stderr 警告。
+ """
 import argparse
 import json
 import os
@@ -36,6 +42,8 @@ FLEET = os.environ.get('MAESTRO_FLEET', f'{HOME}/maestro/fleet.json')
 ORCA = os.environ.get('ORCA_CLI_COMMAND', 'orca-ide')
 PRESET_BIN = os.environ.get(
     'MAESTRO_PRESET_BIN', f'{HOME}/.agent-presets/maestro/bin')
+BRIDGE = os.environ.get('MAESTRO_BRIDGE', f'{HOME}/maestro/bridge')
+REGISTRY = f'{BRIDGE}/registry.json'
 PROBE_TIMEOUT_DEFAULT = 600  # probing 超 10 分钟由 sweep 判 unresponsive
 
 
@@ -124,6 +132,38 @@ def upsert_probing(fleet: dict, termid: str) -> dict:
     return entry
 
 
+def registry_session_ids() -> set | None:
+    """bridge 在册消费者 sessionId 集合(只读)。缺失/损坏/无 consumers → None。"""
+    try:
+        with open(REGISTRY) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    consumers = data.get('consumers') if isinstance(data, dict) else None
+    if not isinstance(consumers, dict):
+        return None
+    return set(consumers.keys())
+
+
+def check_sig_freshness(sig: str):
+    """T12 收紧: 签名 sessionId 不在 registry 在册消费者 → 拒收(exit 8)。
+
+    探测回调只投给在册编排者;签名指向未在册 session = env/文件滞后(host 重启
+    或换代后),探测必落空。registry 缺失(首装未武装)回落现状不拒,stderr 警告。
+    红线: 本检查绝不写 registry。
+    """
+    registered = registry_session_ids()
+    if registered is None:
+        print(f'warn: {REGISTRY} unreadable/absent (first install?) — '
+              'skipping signature freshness check', file=sys.stderr)
+        return
+    session_id = sig.rsplit('@', 1)[-1]
+    if session_id not in registered:
+        die(f'stale orch signature "{sig}": sessionId {session_id} not in {REGISTRY} '
+            f'({len(registered)} armed) — orchestrator likely restarted/superseded; '
+            f're-arm (bridge_arm) and refresh MAESTRO_ORCH_SIGNATURE', 8)
+
+
 def orch_sig() -> str:
     sig = os.environ.get('MAESTRO_ORCH_SIGNATURE', '')
     if not sig:
@@ -134,6 +174,7 @@ def orch_sig() -> str:
             sig = ''
     if not sig:
         die('MAESTRO_ORCH_SIGNATURE unset & orch.signature missing — pass <alias>@<sessionId>', 2)
+    check_sig_freshness(sig)
     return sig
 
 
