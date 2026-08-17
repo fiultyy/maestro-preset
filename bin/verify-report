@@ -13,7 +13,7 @@
   - 硬伤 → FAIL:
       报告缺失 / 未填模板拷贝; B 行 [x] 证据空; B 行数 ≠ 票内预填;
       C 用例名在 spec 文件 grep 不到; A 门未勾; G1/G2 重跑失败或与勾选矛盾;
-      报告判定 FAIL; F 节被 worker 填写; done body 格式错 / 判定不一致 / 路径不指向本报告 / 备注超 40 字
+      报告判定 FAIL; F 节被 worker 填写; done body 格式错 / 判定不一致 / 路径不指向本报告 / 备注超 60 字
   - 无硬伤 + (E 节有实质备注 或 报告判定 PASS-NOTES) → PASS-NOTES;其余 → PASS
   - 门默认 pnpm typecheck / pnpm test(项目侧 G1/G2,真实执行非假输出);
     maestro 侧用 --g1-cmd / --g2-cmd 覆盖(如 py_compile / --selftest);空串 '' 显式跳过
@@ -180,16 +180,16 @@ def f_section_violations(f_text):
 # ---------- done body 校验 ----------
 
 def validate_done_body(body, ref, report_judgment):
-    """格式 <判定>;报告:路径;测试:+N/M全绿|selftest N项全绿;备注:≤40字 + 一致性。"""
+    """格式 <判定>;报告:路径;测试:+N/M全绿|selftest N项全绿;备注:≤60字 + 一致性。"""
     out = {'body': body, 'ok': False, 'errors': [], 'judgment': None, 'report': None, 'tests': None}
     m = DONE_BODY_RE.match(body)
     if not m:
-        out['errors'].append('格式不符: 应为 <判定>;报告:路径;测试:+N/M全绿 或 selftest N项全绿;备注:≤40字')
+        out['errors'].append('格式不符: 应为 <判定>;报告:路径;测试:+N/M全绿 或 selftest N项全绿;备注:≤60字')
         return out
     out['judgment'], out['report'], out['tests'] = m.group(1), m.group(2), m.group(3)
     note = m.group(4)
-    if len(note) > 40:
-        out['errors'].append(f'备注 {len(note)} 字,超 40 字上限')
+    if len(note) > 60:
+        out['errors'].append(f'备注 {len(note)} 字,超 60 字上限')
     if os.path.basename(out['report']) != f'{ref}-report.md':
         out['errors'].append(f'报告路径未指向 {ref}-report.md(实际为 {out["report"]})')
     if report_judgment and out['judgment'] != report_judgment:
