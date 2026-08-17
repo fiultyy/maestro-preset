@@ -97,6 +97,35 @@ message-bridge v1.2 的 HTTP 路径**不落 `bridge/inbox.log`**——文件泵(
   delivered 回写 inbox 统一消费面待评), 按 §10.2 plugins 强制 git 分支路径实施;
   设计侧见 `docs/callback-bridge-design.md` §9。
 
+### 3.4 host lane 回调链路(SI-003 起, 宿主 boot 承载)
+
+**形态**: `plugins/host-callback-bridge`(polyfill lane, 部署面 `~/.dsh/plugins/` +
+`polyfill.patch.yml` 行)在**宿主 boot 时**绑定 HTTP `/callback`(优先复用
+`http.port` 记录端口, cb-send 协议零变更)并以 fs.watch 事件驱动消费 `inbox.log`
+(无轮询), 按 `registry.json` 把每行经回环 `/api/session.prompt` 注入目标会话
+(`ORCA-CB]` 信封)。坏行照旧 dead-letter;坏行/投递失败措辞与 v3.6 逐字一致。
+
+**编排会话的新纪律(链路已上移, 会话只保留"消费回合")**:
+
+1. **开场不再 `bridge_arm` / `bridge_http_status`**——host lane 已持有链路; 旧工具
+   仍在(preset 兼容), 但再 arm 会与 host lane 双消费(重复唤醒, 无丢失), 迁移期
+   尽量不用;
+2. **sessionId 是持久路由键**: 会话在 `~/.dsh/sessions/` 驻留, host 重启后同一
+   sessionId 仍可被 `session.prompt` 原生唤醒, registry 条目跨重启有效——
+   §3.1 的"重启后必做两步"(重 arm + 广播新签名)在 host lane 下**不再需要**,
+   除非换代换了 sessionId;
+3. **换代/新编排会话注册**: `POST /register {"sessionId","alias"}`(端口读
+   `bridge/http.port`), 或直接编辑 `registry.json`;
+4. **观测**: `GET /status`(端口/计数/在册消费者)、`bridge/state.json` 顶层
+   `hostBridge` 分节、`bridge/host-lane.log` 生命周期日志;
+5. **迁移窗护驻**: 插件热载入运行中 host 时若 `http.port` 记录端口仍被旧会话内
+   桥监听, host lane 全程待机零干扰, 下次 host boot 自动接管(一次性探活, 非轮询)。
+
+**HTTP 受理语义变化(v1.2 → host lane)**: `200 accepted` = 已受理并持久落
+`inbox.log`(HTTP-R2 选项(i): 受理即持久证据, 投递由文件消费面统一完成)——不再是
+"进程内一次应答"; 显式 `to` 失配照 ADDR-R1 方向拒收(400 附 reason), cb-send 自动
+降级文件桥, 由文件面 dead-letter 留痕, 不再 most-recent-armer 兜底误投。
+
 ## 4. 核心概念(30 秒版
 
 - **三平面**: Orca(worktree/terminal/repo/浏览器)、dais(原 zap,GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
