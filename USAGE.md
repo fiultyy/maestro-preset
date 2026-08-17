@@ -294,3 +294,42 @@ headless 进程/agent（无 `ORCA_TERMINAL_HANDLE`，如 cron、脚本、无 Orc
 ## 12. 信任与安全
 
 本 preset 的插件会写文件、开回环监听端口、驱动会话回合;技能会指使 agent 操作 Orca 终端。user preset 等同 shell 权限——只从信任来源安装,审阅 `agent.cordis.yml` 列的每一行后再挂载。
+
+## 13. flowc — 编排编译器(十动词监督面, v2)
+
+**定调**: 编排业务 = **十动词**(dispatch/callback/status/rollup/stop/redirect/
+escalate/close/succeed/retry), 全部幂等动作节点, 无深分支。flowc 把 `flow.yml`
+(动词+参数序列, 含 `chain`(`deps`)/`on_done`/`on_fail`/`gate`)编译成纯 SQLite
+状态机——**只编译监督面, 不替代 Orca 权威 dispatch**(派发仍走 worker-start/
+dispatch --inject; plugins 面零改)。
+
+```bash
+bin/flowc compile docs/flows/ticket-queue.yml   # → ~/.dsh/maestro/flows/<id>/
+bin/flowc inspect [flow-id]                     # v_status 一览 + 未决 escalation
+bin/flowc advance <flow> <node> --result done|failed|redirected [--note X]
+bin/flowc selftest                              # 16 项内置自测
+```
+
+**物化产物** `~/.dsh/maestro/flows/<id>/`:`state.db`(状态机, schema 含 CHECK
+约束: verb 限定十动词, state 限定 pending/ready/running/done/failed/skipped/
+closed)、`nodes/*.sh`(十动词节点脚本)、`units/`、`triggers.sql`(触发器族)。
+
+**触发器族(纯 SQL, 零守护进程)**:
+
+- `done` → 解锁 deps 全满足的后继为 `ready`(AND gate: `NOT EXISTS` 未完成依赖);
+- `failed` → `escalations` 行 + `escalated` 事件, 同时 flowc 落 pending JSON →
+  **硬链路 v1**(systemd path 单元 + orch-notify.sh + cb-send)唤醒编排者;
+- 终态重复 advance = 幂等 no-op(仅记事件);`redirected` = 本节点 skipped +
+  目标复活 ready(可复活 failed; 与 retry 区分——retry 计 attempts)。
+
+**十动词执行主体**: 机行(dispatch/callback/status/rollup/close/retry)由节点
+脚本执行; **agent 在环仅 escalate/redirect(+stop 回执面)**——escalation 经
+cb-send 直通编排者回合, callback 复用硬链路 v1(TRIGGER+path+cb-send)不重造。
+
+**状态机速查**: `pending`(等 deps)→ `ready`(可执行)→ `running` → `done`/
+`failed`; `closed`(收口)/`skipped`(被改向绕过)为终态。汇总: `v_rollup` 视图
+按 state 聚合计数。
+
+**首个生产流程**: `docs/flows/ticket-queue.yml`(create→dispatch→callback→
+verify→commit→next), 以 T-flowc 真实票全链实测。护栏二: flowc 是独立脚本
+(每次执行新进程, 无代际钉死), selftest + 实测即新进程验证。
