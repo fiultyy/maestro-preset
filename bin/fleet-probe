@@ -124,14 +124,25 @@ def upsert_probing(fleet: dict, termid: str) -> dict:
     return entry
 
 
+def orch_sig() -> str:
+    sig = os.environ.get('MAESTRO_ORCH_SIGNATURE', '')
+    if not sig:
+        try:
+            with open(f'{HOME}/maestro/bridge/orch.signature') as fh:
+                sig = fh.read().strip()
+        except FileNotFoundError:
+            sig = ''
+    if not sig:
+        die('MAESTRO_ORCH_SIGNATURE unset & orch.signature missing — pass <alias>@<sessionId>', 2)
+    return sig
+
+
 def probe(termid: str, wait: float):
     if not handle_alive(termid):
         die(f'handle dead or unreachable: {termid} (terminal read failed) — not probing', 4)
     fleet = load_fleet()
-    orch_sig = os.environ.get('MAESTRO_ORCH_SIGNATURE')
-    if not orch_sig:
-        die('MAESTRO_ORCH_SIGNATURE unset — pass <alias>@<sessionId> of this orchestrator', 2)
-    if not send_probe(termid, orch_sig):
+    sig = orch_sig()
+    if not send_probe(termid, sig):
         die(f'terminal send failed for {termid}', 5)
     entry = upsert_probing(fleet, termid)
     save_fleet(fleet)
@@ -160,13 +171,11 @@ def reverify(timeout: float):
     if not terms:
         print('no verified orca-terminal entries to reverify')
         return
-    orch_sig = os.environ.get('MAESTRO_ORCH_SIGNATURE')
-    if not orch_sig:
-        die('MAESTRO_ORCH_SIGNATURE unset — pass <alias>@<sessionId> of this orchestrator', 2)
+    orch_sig_ = orch_sig()
     stale, reprobed = [], []
     for termid in terms:
         if handle_alive(termid):
-            if send_probe(termid, orch_sig):
+            if send_probe(termid, orch_sig_):
                 fleet = load_fleet()  # 重读: 回调可能已并发落笔
                 fleet['fleet'][termid]['status'] = 'probing'
                 fleet['fleet'][termid]['probedAt'] = now_iso()
