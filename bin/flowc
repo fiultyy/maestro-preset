@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+# flowc — 编排编译器 v2(十动词监督面)
+# 用法:
+#   flowc compile <flow.yml>            # flow.yml → ~/.dsh/maestro/flows/<id>/{state.db,nodes/,units/,triggers.sql}
+#   flowc inspect [flow-id]             # 状态一览(默认 MAESTRO_FLOWC_ROOT 下全部)
+#   flowc advance <flow-id> <node> --result done|failed|redirected [--note X] [--payload JSON]
+#   flowc selftest                      # 内置自测(临时 FLOW_ROOT)
+#
+# 模型(用户定调): 编排业务 = 十动词, 全幂等动作节点, 无深分支:
+#   dispatch callback status rollup stop redirect escalate close succeed retry
+# 动词分类(执行主体):
+#   机行(脚本/node 物化即可执行)   : dispatch callback status rollup close retry
+#   编排者回合(agent 在环, 仅两处) : escalate redirect(+stop 的回执面)
+# 链语义(编译期展开, 运行期只走状态机):
+#   chain: A -> B -> C            # A.done 解锁 B; B.done 解锁 C(= 依赖边)
+#   on_done / on_fail             # 条件出边
+#   gate: [N1, N2]                # AND 汇合: 全部 done 才解锁后继
+# 触发器族(state.db 内, 纯 SQL):
+#   INSERT trigger: node done  → 解锁 deps 满足的后继(ready), 事件入 events
+#   INSERT trigger: node failed→ escalation 行 + 事件(编排者唤醒经硬链路 v1, 见下)
+# 硬链路 v1 复用(零重造):
+#   callback 节点 = orchestration.db TRIGGER + pending/*.json + maestro-orch-hardlink.path
+#                  + orch-notify.sh + cb-send —— 已在生产, flowc 只在 nodes/<n>.sh 里
+#                  复用该通道(orch-notify.sh 同款: 找 registry 最新 orch1, cb-send)。
+#   escalation 唤醒 = 同一条硬链路: escalation 行落 flow state.db 的同时, 由 flowc
+#                  写一行 pending JSON(同 orch-notify 格式), systemd path 单元拾起
+#                  → cb-send → 编排者回合注入。
+# 红线: 不替代 Orca 权威 dispatch(只编译监督面); plugins 面零改; agent 在环仅
+#       escalate/redirect。
+import argparse, json, os, re, shutil, sqlite3, sys, tempfile
+
+VERB_GROUPS = {
+    'machine': {'dispatch', 'callback', 'status', 'rollup', 'close', 'retry'},
+    'agent':   {'escalate', 'redirect', 'stop', 'succeed'},
+}
+VERBS = VERB_GROUPS['machine'] | VERB_GROUPS['agent']
+
+STATES = ('pending', 'ready', 'running', 'done', 'failed', 'skipped', 'closed')
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS nodes(
+  node_id   TEXT PRIMARY KEY,
+  verb      TEXT NOT NULL CHECK (verb IN ('dispatch','callback','status','rollup','stop','redirect','escalate','close','succeed','retry')),
+  title     TEXT NOT NULL,
+  state     TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','ready','running','done','failed','skipped','closed')),
+  deps      TEXT NOT NULL DEFAULT '[]',   -- JSON array of node ids (AND gate)
+  on_done   TEXT,                          -- successor node id or NULL
+  on_fail   TEXT,                          -- successor node id or NULL
+  attempts  INTEGER NOT NULL DEFAULT 0,
+  result    TEXT,                           -- last advance note
+  payload   TEXT,                           -- verb 参数(JSON, 编译期从 flow.yml 透传)
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id TEXT NOT NULL,
+  kind    TEXT NOT NULL,      -- armed|started|done|failed|escalated|redirected|closed|retried|skipped
+  detail  TEXT,
+  ts      TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS escalations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id TEXT NOT NULL,
+  reason  TEXT,
+  status  TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','acked')),
+  ts      TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE VIEW IF NOT EXISTS v_status AS
+  SELECT node_id, verb, title, state, attempts, result,
+         (SELECT count(*) FROM events e WHERE e.node_id=n.node_id) AS events
+  FROM nodes n ORDER BY node_id;
+CREATE VIEW IF NOT EXISTS v_rollup AS
+  SELECT state, count(*) AS n, group_concat(node_id) AS nodes
+  FROM nodes GROUP BY state ORDER BY state;
+"""
+
+# 触发器族: done → 解锁后继; failed → escalation 行 + pending 通知(硬链路 v1)。
+TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS trg_node_done_unlock
+AFTER UPDATE OF state ON nodes
+WHEN NEW.state='done' AND OLD.state NOT IN ('done')
+BEGIN
+  UPDATE nodes SET state='ready', updated_at=datetime('now')
+   WHERE state='pending'
+     AND json_array_length(deps)>0
+     AND NOT EXISTS (
+       SELECT 1 FROM json_each(nodes.deps) d
+       JOIN nodes dep ON dep.node_id = d.value
+       WHERE dep.state NOT IN ('done','skipped'));
+  INSERT INTO events(node_id,kind,detail) VALUES(
+    NEW.node_id,'done',COALESCE(NEW.result,''));
+END;
+CREATE TRIGGER IF NOT EXISTS trg_node_ready_event
+AFTER UPDATE OF state ON nodes
+WHEN NEW.state='ready' AND OLD.state='pending'
+BEGIN
+  INSERT INTO events(node_id,kind,detail) VALUES(NEW.node_id,'armed','deps satisfied');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_node_failed_escalate
+AFTER UPDATE OF state ON nodes
+WHEN NEW.state='failed' AND OLD.state NOT IN ('failed','done','skipped','closed')
+BEGIN
+  INSERT INTO escalations(node_id,reason) VALUES(NEW.node_id,COALESCE(NEW.result,'failed'));
+  INSERT INTO events(node_id,kind,detail) VALUES(NEW.node_id,'escalated',COALESCE(NEW.result,''));
+END;
+"""
+
+# 十动词节点物化模板。机行节点 = 可独立执行的 shell;agent 在环节点 = 回执注入面。
+def node_script(verb, node_id, payload, flow_id, root):
+    cb = "~/.dsh/.agent-presets/maestro/bin/cb-send"
+    hdr = f"""#!/usr/bin/env bash
+# flow node {node_id} ({verb}) — flow:{flow_id}
+# 幂等: state.db CAS(guarded UPDATE)是唯一推进器; 本脚本只做副作用面。
+set -uo pipefail
+ROOT={root}
+DB="$ROOT/state.db"
+flowc() {{ ~/.dsh/maestro/bin/flowc "$@"; }}
+mark() {{ sqlite3 "$DB" "UPDATE nodes SET state='$1', updated_at=datetime('now') WHERE node_id='{node_id}' AND state='$2';"; }}
+"""
+    body = {
+      # dispatch = 经专用壳 worker-start(spec+inject 是 Orca 权威面, 本节点只封装监督侧调用)
+      'dispatch': f'''
+TARGET=${{FLOWC_TARGET:-$$}}   # 专用壳: 派发目标终端/会话, 调用方注入
+SPEC=$(sqlite3 "$DB" "SELECT payload FROM nodes WHERE node_id='{node_id}';" | python3 -c "import json,sys; print(json.load(sys.stdin).get('spec',''))")
+echo "dispatch: {node_id} -> $TARGET (spec: ${{SPEC:0:60}}…)"
+# 权威派发由编排者经 Orca worker-start/dispatch --inject 执行(红线); 本节点
+# 记录派发意图并置 running, 结果由 callback 节点回流。
+mark running running || mark running ready
+''',
+      # callback = 硬链路 v1(TRIGGER+path+cb-send)复用, 不重造: 节点等待该 ref 的
+      # ack/done 事件; 事件到达时编排者(或其钩子)调 flowc advance 收口本节点。
+      'callback': f'''
+echo "callback: {node_id} waits on hardlink-v1 (orch-notify.sh → cb-send); close via: flowc advance {flow_id} {node_id} --result done"
+mark running ready || mark running pending
+''',
+      'status': f'''
+sqlite3 -header -column "$DB" "SELECT * FROM v_status;"
+mark done running
+''',
+      'rollup': f'''
+sqlite3 -header -column "$DB" "SELECT * FROM v_rollup;"
+mark done running
+''',
+      # escalate / redirect / stop = 编排者回合注入(escalation 经 cb-send 直通硬链路)
+      'escalate': f'''
+REASON=$(sqlite3 "$DB" "SELECT COALESCE(result,'') FROM nodes WHERE node_id='{node_id}';")
+{cb} status "flow@{flow_id}" "$(python3 - <<'PY'
+import json
+reg=json.load(open(os.path.expanduser('~/.dsh/maestro/bridge/registry.json')))
+cs={{k:v for k,v in reg['consumers'].items() if v.get('alias')=='orch1'}}
+k=sorted(cs,key=lambda x:cs[x].get('armedAt',''))[-1]
+print(f"orch1@{{k}}")
+PY
+)" {node_id} "escalation: $REASON" 2>/dev/null || echo "escalation queued in state.db (escalations row)"
+mark running ready || true
+''',
+      'redirect': f'''
+echo "redirect: {node_id} — 编排者回合注入面: 改向后 flowc advance {flow_id} <new-node> / 手动 UPDATE on_done"
+mark running ready
+''',
+      'stop': f'''
+echo "stop: {node_id} — 停止面; 后继由编排者裁定(skipped/redirected)"
+mark running ready
+''',
+      'close': f'''
+sqlite3 "$DB" "UPDATE nodes SET state='closed', updated_at=datetime('now') WHERE node_id='{node_id}' AND state IN ('running','ready');"
+''',
+      'succeed': f'''
+# 换代: 本流收口 + 通知(同 escalate 通道)
+SIG=$(python3 - <<'PY'
+import json, os
+reg=json.load(open(os.path.expanduser('~/.dsh/maestro/bridge/registry.json')))
+cs={{k:v for k,v in reg['consumers'].items() if v.get('alias')=='orch1'}}
+if cs:
+    k=sorted(cs,key=lambda x:cs[x].get('armedAt',''))[-1]
+    print(f"orch1@{{k}}")
+PY
+)
+{cb} status "flow@{flow_id}" "$SIG" {node_id} "flow succeeded" 2>/dev/null || echo "notify deferred (escalation row remains)"
+mark done running || mark done ready
+''',
+      'retry': f'''
+N=$(sqlite3 "$DB" "SELECT attempts FROM nodes WHERE node_id='{node_id}';")
+sqlite3 "$DB" "UPDATE nodes SET attempts=attempts+1, state='ready', updated_at=datetime('now') WHERE node_id='{node_id}';"
+echo "retry: {node_id} attempt $((N+1))"
+''',
+    }[verb]
+    return hdr + body
+
+def die(msg, code=1):
+    print(f'flowc: {msg}', file=sys.stderr); sys.exit(code)
+
+def root():
+    return os.environ.get('MAESTRO_FLOWC_ROOT', os.path.expanduser('~/.dsh/maestro/flows'))
+
+# ---- flow.yml 解析(极简: 不引 yaml 依赖, 手写子集解析器) ----
+# 支持形如:
+#   id: ticket-queue
+#   nodes:
+#     create:   {verb: status, title: 票据登记}
+#     dispatch: {verb: dispatch, deps: [create], on_done: callback, payload: {spec: ...}}
+#   entry: create
+def parse_flow(text):
+    flow = {'id': None, 'entry': None, 'nodes': {}}
+    cur = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        m = re.match(r'^(id|entry):\s*(\S+)$', line)
+        if m:
+            flow[m.group(1)] = m.group(2); continue
+        m = re.match(r'^  (\S+):\s*(\{.*\})\s*$', line)
+        if m:
+            cur = m.group(1)
+            flow['nodes'][cur] = parse_inline(m.group(2))
+            continue
+        m = re.match(r'^  (\S+):\s*$', line)
+        if m:
+            cur = m.group(1); flow['nodes'][cur] = {}; continue
+        m = re.match(r'^nodes:\s*$', line)
+        if m:
+            continue
+        m = re.match(r'^    (\S+):\s*(.*)$', line)
+        if m and cur:
+            k, v = m.group(1), m.group(2).strip()
+            flow['nodes'][cur][k] = parse_scalar(v); continue
+    if not flow['id']: die('flow.yml 缺 id:')
+    if not flow['nodes']: die('flow.yml 缺 nodes:')
+    return flow
+
+def parse_scalar(v):
+    v = v.strip()
+    if v.startswith('[') and v.endswith(']'):
+        inner = v[1:-1].strip()
+        return [x.strip() for x in inner.split(',')] if inner else []
+    if v.startswith('{') and v.endswith('}'):
+        return parse_inline(v)
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    return v
+
+def parse_inline(s):
+    s = s.strip()
+    if s.startswith('{') and s.endswith('}'):
+        s = s[1:-1].strip()
+        out = {}
+        # 顶层 {k: v, k2: v2} 拆分(不嵌套花括号深的场景足够)
+        depth = 0; parts = []; buf = ''
+        for ch in s:
+            if ch in '{[': depth += 1
+            if ch in '}]': depth -= 1
+            if ch == ',' and depth == 0:
+                parts.append(buf); buf = ''
+            else:
+                buf += ch
+        if buf.strip(): parts.append(buf)
+        for p in parts:
+            if ':' not in p: die(f'flow.yml 内联对象坏: {s!r}')
+            k, v = p.split(':', 1)
+            out[k.strip()] = parse_scalar(v)
+        return out
+    return parse_scalar(s)
+
+def validate(flow):
+    for nid, n in flow['nodes'].items():
+        verb = n.get('verb')
+        if verb not in VERBS: die(f'节点 {nid}: 未知动词 {verb!r}(十动词: {sorted(VERBS)})')
+        for d in n.get('deps', []) if isinstance(n.get('deps'), list) else ([n['deps']] if 'deps' in n else []):
+            if d not in flow['nodes']: die(f'节点 {nid}: dep {d!r} 不存在')
+        for key in ('on_done', 'on_fail'):
+            if n.get(key) and n[key] not in flow['nodes']:
+                die(f'节点 {nid}: {key} -> {n[key]!r} 不存在')
+    # 无深分支: on_done/on_fail 是唯一出边语义, 不做进一步限制。
+    if flow.get('entry') and flow['entry'] not in flow['nodes']:
+        die(f"entry {flow['entry']!r} 不在 nodes")
+
+def compile_flow(path):
+    text = open(path, encoding='utf-8').read()
+    flow = parse_flow(text)
+    validate(flow)
+    fid = flow['id']
+    fr = os.path.join(root(), fid)
+    os.makedirs(os.path.join(fr, 'nodes'), exist_ok=True)
+    os.makedirs(os.path.join(fr, 'units'), exist_ok=True)
+    db = os.path.join(fr, 'state.db')
+    if os.path.exists(db):
+        print(f'flowc: flow {fid} 已存在 → 幂等重建 schema(数据保留), nodes/units 重物化')
+    c = sqlite3.connect(db)
+    c.executescript(SCHEMA)
+    c.executescript(TRIGGERS)
+    with open(os.path.join(fr, 'triggers.sql'), 'w') as fh:
+        fh.write(TRIGGERS)
+    for nid, n in flow['nodes'].items():
+        payload = json.dumps(n.get('payload', {}), ensure_ascii=False)
+        deps = json.dumps(n.get('deps', []) if isinstance(n.get('deps'), list) else ([n['deps']] if n.get('deps') else []))
+        c.execute("""INSERT INTO nodes(node_id,verb,title,deps,on_done,on_fail,payload)
+                     VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(node_id) DO UPDATE SET verb=excluded.verb,title=excluded.title,
+                       deps=excluded.deps,on_done=excluded.on_done,on_fail=excluded.on_fail,
+                       payload=excluded.payload,updated_at=datetime('now')""",
+                  (nid, n['verb'], n.get('title', nid), deps, n.get('on_done'), n.get('on_fail'), payload))
+        script = os.path.join(fr, 'nodes', f'{nid}.sh')
+        with open(script, 'w') as fh:
+            fh.write(node_script(n['verb'], nid, payload, fid, fr))
+        os.chmod(script, 0o755)
+    # entry 节点置 ready
+    entry = flow.get('entry') or next(iter(flow['nodes']))
+    c.execute("UPDATE nodes SET state='ready' WHERE node_id=? AND state='pending'", (entry,))
+    c.commit()
+    with open(os.path.join(fr, 'flow.yml'), 'w') as fh:
+        fh.write(text)
+    print(f'flowc: compiled {fid} -> {fr} ({len(flow["nodes"])} nodes, entry={entry})')
+    return fr
+
+def list_flows():
+    r = root()
+    if not os.path.isdir(r): return []
+    return sorted(d for d in os.listdir(r) if os.path.isfile(os.path.join(r, d, 'state.db')))
+
+def cmd_inspect(a):
+    ids = [a.flow] if a.flow else list_flows()
+    if not ids: print('flowc: no flows'); return
+    for fid in ids:
+        db = os.path.join(root(), fid, 'state.db')
+        if not os.path.exists(db): die(f'flow {fid} 未编译')
+        c = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        c.row_factory = sqlite3.Row
+        print(f'== flow {fid}')
+        for row in c.execute('SELECT * FROM v_status'):
+            print(f'  {row["node_id"]:<16} {row["verb"]:<10} {row["state"]:<8} n={row["attempts"]} {row["title"]}')
+        esc = c.execute("SELECT count(*) FROM escalations WHERE status='open'").fetchone()[0]
+        if esc: print(f'  ⚠ open escalations: {esc}')
+        c.close()
+
+def cmd_advance(a):
+    db = os.path.join(root(), a.flow, 'state.db')
+    if not os.path.exists(db): die(f'flow {a.flow} 未编译')
+    if a.result not in ('done', 'failed', 'redirected'): die('--result 须 done|failed|redirected')
+    c = sqlite3.connect(db)
+    row = c.execute("SELECT state,verb FROM nodes WHERE node_id=?", (a.node,)).fetchone()
+    if row is None: die(f'node {a.node} 不在 flow {a.flow}')
+    cur, verb = row
+    note = a.note or ''
+    # 幂等推进: 终态重复 advance = no-op 记事件
+    if cur in ('done', 'failed', 'closed', 'skipped'):
+        c.execute("INSERT INTO events(node_id,kind,detail) VALUES(?,?,?)", (a.node, 'done' if a.result=='done' else 'failed', f'idempotent-repeat: {note}'))
+        c.commit(); print(f'flowc: {a.node} 已是终态 {cur}(幂等 no-op)'); return
+    # redirected: 改向 = 终结本节点 + on_fail/on_done 之外的显式后继
+    if a.result == 'redirected':
+        target = note
+        if target and target not in [r[0] for r in c.execute("SELECT node_id FROM nodes")]:
+            die(f'redirect 目标 {target!r} 不存在')
+        c.execute("UPDATE nodes SET state='skipped', result='redirected->'+?, updated_at=datetime('now') WHERE node_id=?", (target, a.node))
+        c.execute("INSERT INTO events(node_id,kind,detail) VALUES(?,?,?)", (a.node, 'redirected', target))
+        if target:
+            # 改向可复活 failed 目标(编排者裁决; retry 才计 attempts)
+            c.execute("UPDATE nodes SET state='ready' WHERE node_id=? AND state IN ('pending','failed')", (target,))
+        c.commit(); print(f'flowc: {a.node} redirected -> {target}'); return
+    # done|failed — 触发器族接管解锁/升级
+    try:
+        c.execute("UPDATE nodes SET state=?, result=?, updated_at=datetime('now') WHERE node_id=?", (a.result, note, a.node))
+    except sqlite3.OperationalError as e:
+        if 'locked' in str(e): die(f'state.db busy, retry: {e}', 3)
+        raise
+    if a.result == 'failed':
+        # 硬链路 v1: pending JSON → systemd path 单元 → orch-notify.sh → cb-send → 编排者唤醒
+        pend = os.path.join(os.environ.get('MAESTRO_HOOKS',
+                       os.path.expanduser('~/.dsh/maestro/hooks')), 'pending')
+        try:
+            os.makedirs(pend, exist_ok=True)
+            import uuid
+            fn = os.path.join(pend, f'flowc-{a.flow}-{uuid.uuid4().hex[:8]}.json')
+            with open(fn, 'w') as fh:
+                json.dump({'id': os.path.basename(fn)[:-5], 'run': f'flow:{a.flow}', 'msgs': [a.node],
+                           'ts': __import__('datetime').datetime.now().isoformat(), 'flow': a.flow,
+                           'node': a.node, 'verb': verb, 'kind': 'escalation'}, fh)
+            print(f'flowc: escalation queued -> {fn}')
+        except OSError as e:
+            print(f'flowc: pending 写入失败(escalation 仍在 state.db): {e}', file=sys.stderr)
+    c.commit()
+    print(f'flowc: {a.node} -> {a.result}')
+
+# ---- selftest ----
+def cmd_selftest(a):
+    tmp = tempfile.mkdtemp(prefix='flowc-')
+    os.environ['MAESTRO_FLOWC_ROOT'] = tmp
+    os.environ['MAESTRO_HOOKS'] = os.path.join(tmp, 'hooks')
+    fails = []
+    def check(name, ok, detail=''):
+        print(f'{"ok" if ok else "FAIL"} - {name}' + (f' ({detail})' if detail and not ok else ''))
+        if not ok: fails.append(name)
+    flow_yml = os.path.join(tmp, 't.yml')
+    open(flow_yml, 'w').write('''id: t-flow
+entry: create
+nodes:
+  create:   {verb: status, title: 登记}
+  verify:   {verb: status, deps: [create], on_done: commit}
+  commit:   {verb: close, deps: [verify]}
+  fallback: {verb: retry, title: 失败重试}
+''')
+    fr = compile_flow(flow_yml)
+    db = os.path.join(fr, 'state.db')
+    c = sqlite3.connect(db)
+    # 1. schema/触发器在位
+    check('schema 物化', os.path.isfile(os.path.join(fr, 'triggers.sql')))
+    check('nodes 物化', os.path.isfile(os.path.join(fr, 'nodes', 'create.sh')))
+    check('units 目录', os.path.isdir(os.path.join(fr, 'units')))
+    # 2. CHECK 约束
+    try:
+        c.execute("INSERT INTO nodes(node_id,verb,title) VALUES('x','fly','x')"); check('verb CHECK 拒非法动词', False)
+    except sqlite3.IntegrityError: check('verb CHECK 拒非法动词', True)
+    try:
+        c.execute("UPDATE nodes SET state='weird' WHERE node_id='create'"); check('state CHECK 拒非法态', False)
+    except sqlite3.IntegrityError: check('state CHECK 拒非法态', True)
+    # 3. entry ready, deps 未满足者 pending
+    st = dict(c.execute("SELECT node_id,state FROM nodes").fetchall())
+    check('entry ready', st['create'] == 'ready', str(st))
+    check('deps 后继 pending', st['verify'] == 'pending')
+    # 4. done → 解锁后继(触发器)
+    c.execute("UPDATE nodes SET state='done' WHERE node_id='create'")
+    st = dict(c.execute("SELECT node_id,state FROM nodes").fetchall())
+    check('done 解锁 deps 后继', st['verify'] == 'ready', str(st))
+    # 5. failed → escalation 行(触发器)
+    c.execute("UPDATE nodes SET state='running' WHERE node_id='fallback'")
+    c.execute("UPDATE nodes SET state='failed', result='boom' WHERE node_id='fallback'")
+    esc = c.execute("SELECT count(*) FROM escalations WHERE node_id='fallback'").fetchone()[0]
+    check('failed → escalation 行', esc == 1)
+    ev = c.execute("SELECT count(*) FROM events WHERE node_id='fallback' AND kind='escalated'").fetchone()[0]
+    check('failed → escalated 事件', ev == 1)
+    # 6. 视图
+    check('v_status 视图', c.execute("SELECT count(*) FROM v_status").fetchone()[0] == 4)
+    check('v_rollup 视图', c.execute("SELECT count(*) FROM v_rollup").fetchone()[0] >= 3)
+    # 7. advance 幂等: 终态重复 no-op(cmd_advance 自开连接, 先释放本连接写锁)
+    c.commit(); c.close()
+    class A: pass
+    aa = A(); aa.flow='t-flow'; aa.node='create'; aa.result='done'; aa.note=''; aa.payload=None
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_advance(aa)
+    c = sqlite3.connect(db)
+    st = c.execute("SELECT state FROM nodes WHERE node_id='create'").fetchone()[0]
+    check('advance 幂等(终态 no-op)', st == 'done')
+    # 8. redirect 语义
+    aa2 = A(); aa2.flow='t-flow'; aa2.node='commit'; aa2.result='redirected'; aa2.note='fallback'; aa2.payload=None
+    c.commit(); c.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_advance(aa2)
+    c = sqlite3.connect(db)
+    st = dict(c.execute("SELECT node_id,state FROM nodes").fetchall())
+    check('redirect 跳目标', st['fallback'] == 'ready' and st['commit'] == 'skipped', str(st))
+    # 9. 未知动词编译拒绝
+    bad = os.path.join(tmp, 'bad.yml')
+    open(bad, 'w').write('id: bad\nnodes:\n  x: {verb: fly}\n')
+    try:
+        with contextlib.redirect_stdout(io.StringIO()): compile_flow(bad)
+        check('编译拒绝未知动词', False)
+    except SystemExit: check('编译拒绝未知动词', True)
+    # 10. 十动词脚本全物化
+    ten = os.path.join(tmp, 'ten.yml')
+    open(ten, 'w').write('id: ten\nnodes:\n' + ''.join(
+        f'  v-{v}: {{verb: {v}, title: {v}}}\n' for v in sorted(VERBS)))
+    fr2 = compile_flow(ten)
+    missing = [v for v in VERBS if not os.path.isfile(os.path.join(fr2, 'nodes', f'v-{v}.sh'))]
+    check('十动词节点全物化', not missing, str(missing))
+    print('----')
+    print(f'flowc selftest: {"ALL GREEN" if not fails else "FAILED: " + ", ".join(fails)}')
+    shutil.rmtree(tmp, ignore_errors=True)
+    sys.exit(0 if not fails else 1)
+
+def main():
+    p = argparse.ArgumentParser(prog='flowc')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    c = sub.add_parser('compile'); c.add_argument('flow_yml')
+    i = sub.add_parser('inspect'); i.add_argument('flow', nargs='?')
+    a = sub.add_parser('advance')
+    a.add_argument('flow'); a.add_argument('node')
+    a.add_argument('--result', required=True, choices=['done', 'failed', 'redirected'])
+    a.add_argument('--note'); a.add_argument('--payload')
+    s = sub.add_parser('selftest')
+    args = p.parse_args()
+    {'compile': lambda: compile_flow(args.flow_yml),
+     'inspect': lambda: cmd_inspect(args),
+     'advance': lambda: cmd_advance(args),
+     'selftest': lambda: cmd_selftest(args)}[args.cmd]()
+
+if __name__ == '__main__':
+    main()

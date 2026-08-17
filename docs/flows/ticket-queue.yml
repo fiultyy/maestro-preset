@@ -1,0 +1,12 @@
+# ticket-queue — 票队列生产流程(flowc 首个实测)
+# 真实票: T-flowc(task_468b9272ba28, maestro-preset 编排编译器 v2)
+# 链: create → dispatch → callback → verify → commit → next
+id: ticket-queue
+entry: create
+nodes:
+  create:   {verb: status, title: "票登记: T-flowc 编排编译器v2"}
+  dispatch: {verb: dispatch, deps: [create], on_done: callback, payload: {task: task_468b9272ba28, terminal: term_9f57c416, spec: "T-flowc 编排编译器v2 十动词"}}
+  callback: {verb: callback, deps: [dispatch], on_done: verify, payload: {channel: hardlink-v1, ack: heartbeat-msg_e1e8337ebcd7}}
+  verify:   {verb: status, deps: [callback], on_done: commit, payload: {gate: "flowc selftest ALL GREEN"}}
+  commit:   {verb: close, deps: [verify], on_done: next, title: "git commit+push"}
+  next:     {verb: rollup, deps: [commit], title: "汇总+派下一张"}
