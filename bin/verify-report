@@ -300,14 +300,16 @@ def verify(repo, ref, done_body=None, g1=None, g2=None, timeout=GATE_TIMEOUT_DEF
 
     # 5) C 表 grep 抽查: 用例名必须真实存在于 spec 文件
     #    spec 列容忍 "file:line(-line)" 行号后缀(LK-001 真实报告形态)
+    #    用名列容忍圈号/序号映射前缀(LK-010 形态: "① real name") — grep 用剥离后名
     for row in info['c']:
         rel = re.sub(r':\d+(-\d+)?$', '', row['spec'])
         spec = os.path.join(repo, rel)
         if not os.path.isfile(spec):
             fail(f'C 用例 "{row["case"]}": spec 文件不存在 {row["spec"]}', line=row['line'])
             continue
+        case_name = re.sub(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳\d]+[.、\s]*', '', row['case']).strip() or row['case']
         with open(spec, encoding='utf-8', errors='replace') as fh:
-            if row['case'] not in fh.read():
+            if case_name not in fh.read():
                 fail(f'C 用例 "{row["case"]}" 在 {row["spec"]} 中 grep 不到(用例名不真实)',
                      line=row['line'])
 
