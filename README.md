@@ -1,6 +1,6 @@
 # maestro — 高级编排模式 (DSH agent preset)
 
-跨 Orca、zap、DSH 三平面的多 agent 编排套件,以 DSH **agent preset** 形态分发。本目录自包含: 插件、技能、脚本全部随包走,零 npm 依赖(仅 `node:*` 内建 + 相对 import)。
+跨 Orca、dais(原 zap,2026-08-17 改名)、DSH 三平面的多 agent 编排套件,以 DSH **agent preset** 形态分发。本目录自包含: 插件、技能、脚本全部随包走,零 npm 依赖(仅 `node:*` 内建 + 相对 import)。
 
 > 装好后怎么用 → **[使用说明 USAGE.md](./USAGE.md)**;开发调试(dev-sync 同步,禁用软链接)→ USAGE §10;打包规范(怎么装成插件/怎么发布)→ **[PACKAGING.md](./docs/PACKAGING.md)**。
 
@@ -12,7 +12,7 @@
 | Orca (`orca-ide`/`orca-dev`) | 桥 pane、terminal send、worktree 管理 | 仅剩普通编码能力,编排面不可用 |
 | sqlite3 CLI | 项目状态账本 | 账本技能不可用 |
 | python3 + curl | bin 脚本(session-send/cb-send/fleet-probe) | 对应脚本不可用 |
-| zap (可选) | zap 平面投递 | 该平面跳过 |
+| dais (原 zap,可选) | dais 平面投递 | 该平面跳过 |
 
 ## 安装
 

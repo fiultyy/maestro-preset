@@ -4,7 +4,7 @@
 
 ## 1. 这是什么
 
-一个 DSH **agent preset**: 把它挂到会话上,那个会话就变成「编排主管」,能跨 **Orca**(worktree/terminal)、**zap**(GUI/终端)、**DSH**(子 agent 会话)三个平面协调多 agent 干活、收发消息、折叠进度。配套一套回调桥(文件桥 + HTTP 直发)与 SQLite 账本。
+一个 DSH **agent preset**: 把它挂到会话上,那个会话就变成「编排主管」,能跨 **Orca**(worktree/terminal)、**dais**(GUI/终端,原 zap,2026-08-17 改名)、**DSH**(子 agent 会话)三个平面协调多 agent 干活、收发消息、折叠进度。配套一套回调桥(文件桥 + HTTP 直发)与 SQLite 账本。
 
 ## 2. 安装与前置
 
@@ -12,7 +12,7 @@
 git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/maestro
 ```
 
-可选但推荐——安装**对端共享 skill**(Orca/zap 等其他 harness 的 agent 冷发现回调协议用;不装则冷 agent 只能靠派发消息内嵌的契约行):
+可选但推荐——安装**对端共享 skill**(Orca/dais 等其他 harness 的 agent 冷发现回调协议用;不装则冷 agent 只能靠派发消息内嵌的契约行):
 
 ```bash
 mkdir -p ~/.agents/skills
@@ -22,7 +22,7 @@ ln -sfn ~/.agents/skills/maestro-bridge ~/.claude/skills/maestro-bridge   # clau
 
 开发流(`bin/dev-sync.sh`)自动镜像 shared/ → `~/.agents/skills` 并接好 claude 软链,无需手工。
 
-前置: DSH(宿主)、Orca CLI(编排面必需)、sqlite3 CLI(账本)。zap 可选。
+前置: DSH(宿主)、Orca CLI(编排面必需)、sqlite3 CLI(账本)。dais(原 zap)可选。
 
 装完**新建一个会话**,在 preset 选择器里选「高级编排模式」。preset 一经选用不可热切换,切换要开新会话。
 
@@ -99,7 +99,7 @@ message-bridge v1.2 的 HTTP 路径**不落 `bridge/inbox.log`**——文件泵(
 
 ## 4. 核心概念(30 秒版
 
-- **三平面**: Orca(worktree/terminal/repo/浏览器)、zap(GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
+- **三平面**: Orca(worktree/terminal/repo/浏览器)、dais(原 zap,GUI 终端)、DSH(子会话)。路由靠 persona 里的决策线判断,别硬背。
 - **DSHMSG 信封**: 每条跨会话消息首行是 `DSHMSG]{"from","to","type","ref","body"}`。`session-send` 帮你拼,回调桥帮你收。
 - **fleet 码表**: `~/.dsh/maestro/fleet.json` 把 `orch1`/`aa0a` 这种 4 位码映射到 sessionId(`session-spawn` 起会话自动登记)。0004 起 Orca 终端条目以 **termid** 为键(`kind: orca-terminal`,状态机 `probing→verified|mismatch|stale`),准入探测见 §5。
 - **回调桥**: 两条入向通道——文件桥(Orca pane 写 inbox.log)与 HTTP 直发(本机 curl POST /callback)。出向统一 `session-send`。
@@ -159,7 +159,7 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 - **orca-bridge**: 建桥 pane、布防 watcher、回复署名约定、派发握手契约模板。含 `scripts/watch.sh`(阻塞等一条回调)、`scripts/reply.sh`(回执)。
 - **maestro-ledger**: 账本读写(分发/回收全落账)。含 `scripts/sync.py`/`log.sh`。
-- **maestro-bridge**(shared/,不在本会话技能目录): **对端**冷执行手册——Orca/zap 侧
+- **maestro-bridge**(shared/,不在本会话技能目录): **对端**冷执行手册——Orca/dais 侧
   agent 凭它发现回调协议(cb-send 用法/ack·done 语义/红线/排查)。源头在仓库
   `shared/maestro-bridge/`,镜像到 `~/.agents/skills` + claude 软链(见 §2)。
 

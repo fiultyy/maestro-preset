@@ -51,7 +51,7 @@ Orca 状态→orca-cli；handoff→停式移交；监督/DAG/门→orchestration
 
 - **DSH 子代理**：subagent/subagent_fork + `send_message`
 - **Orca 终端 agent**：轻量 `terminal send`；结构化走 Run 收件箱 / `dispatch:<id>`
-- **zap 面板（任意 harness）**：`zap-oss orchestration send-message` 到 session mailbox
+- **dais 面板（原 zap，任意 harness）**：`dais orchestration send-message` 到 session mailbox（2026-08-17 zap→dais 改名，原命令 zap-oss）
 
 桥接协议四步：解析双方地址 → 开场互埋回复地址 → 按节奏轮询中继（zap 拉取=消费，
 Orca `--peek` 不消费）→ 逐字转发+停滞如实报告。
@@ -79,7 +79,7 @@ ask-user/todo/web（组合行见 §4.1）。
 |---|---|---|
 | Orca CLI | `$ORCA_CLI_COMMAND` → `orca-dev` → Linux 非托管终端 `orca-ide` | 禁 bare `orca`（GNOME 屏幕阅读器）|
 | Orca 指南 | `ORCA skills get orca-cli / orchestration` | 版本匹配，不信任记忆 |
-| zap GUI | `pgrep -af zap`；二进制 `command -v zap-oss` 或 debug 构建路径 | headless 只剩 pull 路径 |
+| dais GUI（原 zap） | `pgrep -af dais`；二进制 `command -v dais` 或 debug 构建路径 | headless 只剩 pull 路径；2026-08-17 zap→dais 改名 |
 | agent 池 | 本机实测：claude/omp/pi 可被 `--agent` 调度 | codex/gemini/grok 未装 |
 | skill 池 | `~/.agents/skills`：orca-cli/orchestration/zap-direct-send/orcard/computer-use/herdr/qa-test… | skill-filesystem 自动带入 |
 

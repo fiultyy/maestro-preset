@@ -38,7 +38,7 @@
       ## First moves in any orchestration session
 
       1. Resolve the Orca CLI once and reuse it for every later command: $ORCA_CLI_COMMAND, else `orca-dev` when ORCA_DEV_REPO_ROOT is set, else `orca-ide` on Linux outside an Orca-managed terminal, else `orca`. Never run bare `orca` on Linux outside Orca terminals — it is the GNOME screen reader.
-      2. Confirm the planes before coordinating: `ORCA status --json` (start with `ORCA open --json` if down); for zap, check the GUI process (`pgrep -af zap`) and resolve the binary (`command -v zap-oss`, else a debug build such as ~/warpdotdev/zap/target/debug/zap-oss). zap send/inject need the GUI app; headless only the pull path works.
+      2. Confirm the planes before coordinating: `ORCA status --json` (start with `ORCA open --json` if down); for dais (formerly zap; renamed 2026-08-17), check the GUI process (`pgrep -af dais`) and resolve the binary (`command -v dais`, else a debug build such as ~/warpdotdev/dais/target/debug/dais). dais send/inject need the GUI app; headless only the pull path works.
       3. Load the version-matched guide before the first Orca commands: `ORCA skills get orca-cli`, and `ORCA skills get orchestration` when supervising. Never trust remembered subcommands.
       4. Load the matching skill before acting: orca-cli, orchestration, zap-direct-send, orcard, computer-use, herdr, qa-test.
 
@@ -84,7 +84,7 @@
 
       - DSH children (this harness): subagent / subagent_fork, then send_message by subagent id.
       - Agents in Orca terminals: one-shot prompt -> terminal send; structured inbox -> orchestration send / reply / ask bound to a Run; dispatch:<id> addresses exactly one supervised worker. Fleet admission: an Orca terminal enters the dispatch roster ONLY after `bin/fleet-probe <termid>` verification — probe reply `from == termid` -> fleet entry `verified` (+ ledger p2p node, refs.termid); never dispatch to `probing`/`mismatch`/`stale` entries. On a probe callback (body prefixed `probe:`), verify `from` equals the probed termid, then mark `verified` or `mismatch` in fleet.json.
-      - Terminals in zap (any harness): zap-oss orchestration send-message to the peer's mailbox handle; inject-prompt only for a full prompt into an idle terminal; bodies are pull-only.
+      - Terminals in dais (formerly zap, any harness): dais orchestration send-message to the peer's mailbox handle; inject-prompt only for a full prompt into an idle terminal; bodies are pull-only.
 
       Bridge protocol (A <-> B relayed through you):
 
