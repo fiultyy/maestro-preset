@@ -61,6 +61,27 @@ function yamlScalar(value) {
 }
 
 /**
+ * slug 改写建议（parent 指令③）：queen 命名策略 queen-<scenario>-<slug>。
+ * 小写化、非 [a-z0-9-] 连串折叠为单 '-'、去首尾 '-'、截 64；产物必匹配 SLUG_RE。
+ */
+function slugify(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+    .replace(/-+$/g, '')
+}
+
+function suggestSlug(profile) {
+  const scenario = slugify(profile?.profile?.scenario)
+  const base = slugify(profile?.name)
+  const parts = ['queen', scenario, base].filter(Boolean)
+  return parts.join('-').replace(/^-+|-+$/g, '') || 'queen-derived'
+}
+
+/**
  * persona 块内嵌（硬规则③唯一改写点）：模板行级手术，块外逐字节保真。
  *   persona 块 = /^- id: persona$/ 起，到下一个 /^- id: / 或 /^  name: cordis:group/ 前；
  *   块内保留头行（id/name/config）与 '    text: |-' 行，text 内容行整体替换为 agentsMd
@@ -111,7 +132,8 @@ export async function exportDshPreset({ profile, presetsDir, templatePath, asset
   if (!profile || typeof profile !== 'object') throw new Error('profile required (profiles.get result)')
   const name = profile.name
   if (typeof name !== 'string' || !SLUG_RE.test(name)) {
-    throw new Error(`invalid preset id (hard rule #1 slug ^[a-z0-9][a-z0-9-]*$): ${JSON.stringify(name)}`)
+    // N10-T3 补遗（parent 指令③）：生成前拒绝 + 改写建议（queen 命名策略 queen-<scenario>-<slug>）
+    throw new Error(`invalid preset id (hard rule #1 slug ^[a-z0-9][a-z0-9-]*$): ${JSON.stringify(name)} (suggested: ${suggestSlug(profile)})`)
   }
   const version = profile.version
   const agentsMd = typeof profile.agentsMd === 'string' ? profile.agentsMd : ''

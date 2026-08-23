@@ -547,11 +547,16 @@ async function main() {
       try {
         await exportDshPreset({ profile: { name: 'Bad_Name', version: 1, agentsMd: GOOD_MD }, presetsDir, templatePath })
       } catch (e) { slugErr = e }
+      let slugErr2 = null
+      try {
+        await exportDshPreset({ profile: { name: 'Bad_Name', version: 1, agentsMd: GOOD_MD, profile: { scenario: 'Code Review' } }, presetsDir, templatePath })
+      } catch (e) { slugErr2 = e }
       const dup23 = await rpc(base, 'pool/export', { name: 'export-probe' })
       const force23 = await rpc(base, 'pool/export', { name: 'export-probe', force: true })
       const oldDirs23 = readdirSync(presetsDir).filter((e) => e.startsWith('export-probe.old-'))
-      ok('T23 slug/存在性守卫（非法名抛错/重复 -32000/force 覆盖+旧目录归档）',
-        /invalid preset id/.test(String(slugErr?.message))
+      ok('T23 slug/存在性守卫（非法名抛错+改写建议/重复 -32000/force 覆盖+旧目录归档）',
+        /invalid preset id/.test(String(slugErr?.message)) && /suggested: queen-bad-name/.test(String(slugErr?.message))
+          && /suggested: queen-code-review-bad-name/.test(String(slugErr2?.message))
           && dup23.body.error?.code === -32000 && /already exists/.test(dup23.body.error?.message)
           && force23.body.result?.export?.dir === expDir
           && existsSync(join(expDir, 'preset.yml')) && existsSync(join(expDir, 'agent.cordis.yml'))
