@@ -1,0 +1,71 @@
+<svg width="1280" height="320" viewBox="0 0 1280 320" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI','PingFang SC','Noto Sans CJK SC',sans-serif">
+  <!-- background -->
+  <rect width="1280" height="320" fill="#0d1117"/>
+  <!-- dot grid -->
+  <defs>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.1" fill="#21262d"/>
+    </pattern>
+    <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4d6bfe" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#4d6bfe" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" fill="url(#dots)"/>
+  <rect x="0" y="0" width="640" height="320" fill="url(#fade)"/>
+  <rect x="0" y="316" width="1280" height="4" fill="#4d6bfe"/>
+
+  <!-- wordmark -->
+  <text x="64" y="118" font-size="66" font-weight="700" fill="#f0f6fc" letter-spacing="1">maestro</text>
+  <rect x="66" y="134" width="58" height="5" rx="2.5" fill="#4d6bfe"/>
+
+  <text x="64" y="176" font-size="24" fill="#c9d1d9" font-weight="600">Multi-Agent Orchestration Preset</text>
+  <text x="64" y="206" font-size="17" fill="#8b949e">for the DeepSeek Harness (DSH)</text>
+
+  <!-- feature pills -->
+  <g font-size="14.5" font-weight="600">
+    <rect x="64" y="232" width="132" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+    <text x="130" y="252" fill="#79c0ff" text-anchor="middle">6 plugins</text>
+    <rect x="206" y="232" width="168" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+    <text x="290" y="252" fill="#79c0ff" text-anchor="middle">14 CLI tools</text>
+    <rect x="384" y="232" width="196" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+    <text x="482" y="252" fill="#3fb950" text-anchor="middle">zero npm deps</text>
+    <rect x="590" y="232" width="150" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+    <text x="665" y="252" fill="#3fb950" text-anchor="middle">self-contained</text>
+  </g>
+
+  <!-- right: three planes -> bridge hub -->
+  <g stroke="#30363d" stroke-width="1.6" fill="none">
+    <path d="M 900 92 C 960 92 980 140 1030 148"/>
+    <path d="M 900 160 L 1030 160"/>
+    <path d="M 900 228 C 960 228 980 180 1030 172"/>
+  </g>
+  <g stroke="#4d6bfe" stroke-width="2" fill="none" opacity="0.9">
+    <path d="M 900 92 C 960 92 980 140 1030 148"/>
+    <path d="M 900 160 L 1030 160"/>
+    <path d="M 900 228 C 960 228 980 180 1030 172"/>
+  </g>
+  <!-- plane nodes -->
+  <g font-size="17" font-weight="700" text-anchor="middle">
+    <rect x="812" y="64" width="88" height="34" rx="8" fill="#161b22" stroke="#4d6bfe"/>
+    <text x="856" y="87" fill="#79c0ff">Orca</text>
+    <rect x="800" y="132" width="112" height="34" rx="8" fill="#161b22" stroke="#d29922"/>
+    <text x="856" y="155" fill="#e3b341">dais</text>
+    <rect x="812" y="200" width="88" height="34" rx="8" fill="#161b22" stroke="#3fb950"/>
+    <text x="856" y="223" fill="#3fb950">DSH</text>
+  </g>
+  <!-- hub -->
+  <g>
+    <circle cx="1074" cy="160" r="44" fill="#0d1117" stroke="#4d6bfe" stroke-width="2"/>
+    <circle cx="1074" cy="160" r="52" fill="none" stroke="#4d6bfe" stroke-opacity="0.25" stroke-width="1.5" stroke-dasharray="4 5"/>
+    <text x="1074" y="154" font-size="15" font-weight="700" fill="#f0f6fc" text-anchor="middle">bridge</text>
+    <text x="1074" y="174" font-size="12" fill="#8b949e" text-anchor="middle">file + HTTP</text>
+  </g>
+  <!-- outgoing arrow -->
+  <g stroke="#3fb950" stroke-width="2" fill="none">
+    <path d="M 1126 160 L 1170 160"/>
+    <path d="M 1162 152 L 1172 160 L 1162 168"/>
+  </g>
+  <text x="1180" y="165" font-size="14.5" fill="#8b949e">agent turns</text>
+  <text x="1180" y="188" font-size="13" fill="#6e7681">ledger · fleet · flowc</text>
+</svg>
