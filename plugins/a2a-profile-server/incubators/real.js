@@ -6,6 +6,8 @@
 // dsh    : session-spawn（session.create+rename+fleet 登记）→ /api/session.prompt 注入
 //         （W5.1 扩展：role doctrine 段前置 + fleet 登记项扩 role/project/mailbox/profile_version/spawned_at）
 //
+// N10-T1（OF-012 · docs/10 §1）：另导出 pool/spawn 策略件 fanoutDsh（fanout-sub 扇出）
+// 与 bindProfile（binding-mode 在飞注入）；信封构造 injectionPrompt 与 incubateDsh 共用。
 // 幂等：同名同版本已孵化 → 直接返回现回执，不重复 spawn/写文件。
 
 import { execFile } from 'node:child_process'
@@ -51,6 +53,16 @@ async function rpc(method, payload) {
   if (!result.ok) throw new Error(`${method} failed: ${JSON.stringify(result.error ?? result)}`)
   return result.value
 }
+
+/**
+ * 注入信封构造（N10-T1 抽取共用）：ORCA-CB] PROFILE-INJECT] 头 + 可选 doctrine + agentsMd。
+ * incubateDsh 与 bindProfile（pool/spawn binding-mode）必须逐字节同形制。
+ */
+function injectionPrompt(name, version, agentsMd, doctrine) {
+  const injectBody = doctrine ? doctrine + '\n' + agentsMd : agentsMd
+  return `ORCA-CB] PROFILE-INJECT] ${name}@v${version}\n${injectBody}`
+}
+
 
 /**
  * role doctrine 段（N6§1.2 条款 + §1.6 唤醒模型；注入体 = doctrine 在前 + agentsMd 在后）。
@@ -110,8 +122,7 @@ export async function incubateDsh(ctx) {
   const sessionId = await resolveSessionId(code)
   // 首回合注入：信封前缀复用 loopback-sink 形制（ORCA-CB]）；role doctrine 在前，行为准则在后
   const doctrine = ext ? roleDoctrine(ext.role, ext) : ''
-  const injectBody = doctrine ? doctrine + '\n' + agentsMd : agentsMd
-  const prompt = `ORCA-CB] PROFILE-INJECT] ${name}@v${version}\n${injectBody}`
+  const prompt = injectionPrompt(name, version, agentsMd, doctrine)
   await rpc('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] })
   if (ext) {
     // fleet 登记项扩展（N6§1.5）：role/project/mailbox/profile_version/spawned_at
@@ -126,6 +137,52 @@ export async function incubateDsh(ctx) {
   return ext
     ? { target: `dsh-${ext.role}`, name, version, code, sessionId, mailbox: ext.mailbox, role: ext.role, project: ext.project, preset, marker }
     : { target: 'dsh', name, version, code, sessionId, preset, marker }
+}
+
+/**
+ * binding-mode（N10-T1 · OF-012 pool/spawn 策略③）：不 spawn，向在飞 session 队列注入
+ * profile 信封（车道A"穿衣"路径泛化——docs/10 §1）。
+ * ctx: { name, version, agentsMd, sessionId, role?, project?, mailbox? }
+ * 信封与 incubateDsh 完全同形制（injectionPrompt 共用）：
+ *   ORCA-CB] PROFILE-INJECT] <name>@v<version>\n + [role doctrine 若 role 已知] + agentsMd
+ * 回执 { target:'binding', name, version, sessionId, injected:true }。
+ */
+export async function bindProfile(ctx) {
+  const { name, version, agentsMd, sessionId } = ctx
+  if (typeof sessionId !== 'string' || !sessionId.trim()) {
+    throw new Error('bindProfile requires non-empty sessionId')
+  }
+  const ext = ctx.role !== undefined
+    ? { role: ctx.role, project: ctx.project ?? '', mailbox: ctx.mailbox ?? `agent_${name}` }
+    : null
+  const doctrine = ext ? roleDoctrine(ext.role, ext) : ''
+  const prompt = injectionPrompt(name, version, agentsMd, doctrine)
+  await rpc('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] })
+  return { target: 'binding', name, version, sessionId, injected: true }
+}
+
+/**
+ * fanout-sub（N10-T1 · OF-012 pool/spawn 策略②）：同 profile 注入 N 实例扇出
+ * （VO-007 manager 群语义）。mailbox 唯一化 = 基名 + '-' + 序号（1..N）；
+ * 逐实例各自 session-spawn + 注入 + fleet 登记；返回 N 条回执数组。
+ * ctx: { name, version, agentsMd, role?, project?, mailboxBase?, profile?, idempotent? }
+ */
+export async function fanoutDsh(ctx, count = 3) {
+  const base = ctx.mailboxBase ?? `agent_${ctx.name}`
+  const receipts = []
+  for (let i = 1; i <= count; i++) {
+    receipts.push(await incubateDsh({
+      name: ctx.name,
+      version: ctx.version,
+      agentsMd: ctx.agentsMd,
+      role: ctx.role ?? 'worker',
+      project: ctx.project ?? '',
+      mailbox: `${base}-${i}`,
+      idempotent: ctx.idempotent,
+      profile: ctx.profile,
+    }))
+  }
+  return receipts
 }
 
 /** fleet 条目定位：key==code / sessionId 前缀匹配（现行 resolveSessionId 反查规则原样）。 */

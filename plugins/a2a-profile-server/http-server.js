@@ -10,6 +10,12 @@
 //     tasks/cancel  {taskId}
 //     incubate      {name, targets:[...], projection:{agents_md, profile_json, description},
 //                   role?, project?, mailbox?}   // W5.1 扩参（N6§1.3）；targets += dsh-liaison/dsh-manager
+//     pool/spawn   {profile:'*new*'|<已有名>, strategy?='default'|'fanout-sub'|'binding-mode',
+//                   name?(*new* 必填), scenario?, role?, targets?=['dsh'], mailbox?, project?,
+//                   count?=3(1..8 fanout), binding?:{sessionId}(binding-mode 必填),
+//                   projection?(*new* 必填：agents_md/profile_json/description/template)}
+//                   ← N10-T1 池选型 spawn（OF-012；docs/10 §1）：具名复用版本钉死不 save；
+//                     queen 只派生不 spawn（-32000）；三策略分派见 incubators/real.js
 //     profiles/list {}
 //     profiles/get  {name}
 //     agents/registry {}                          ← W5.2 router 三 RPC（N6§2.4；需注入 router）
@@ -23,6 +29,7 @@ import { appendFile, mkdir, stat, rename } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
+import { fanoutDsh, bindProfile } from './incubators/real.js'
 
 const runBin = promisify(execFile)
 const HOME = homedir()
@@ -32,6 +39,10 @@ const INTERNAL_VERSION = 'internal-1'
 // W5.1 incubate 扩参（N6§1.3）：role 合法值 + role 孵化目标映射（复用 dsh 孵化器）
 const ROLE_VALUES = ['liaison', 'manager', 'worker', 'supervisor']
 const ROLE_TARGETS = { 'dsh-liaison': 'liaison', 'dsh-manager': 'manager' }
+// N10-T1 pool/spawn（OF-012）：策略面 + fanout 约束（count 1..8、dsh 族目标）
+const STRATEGY_VALUES = ['default', 'fanout-sub', 'binding-mode']
+const FANOUT_TARGETS = ['dsh', 'dsh-liaison', 'dsh-manager']
+const NEW_PROFILE = '*new*'
 
 // ---- W5.2 router（N6§2.4–2.5；VO-004）----
 
@@ -351,6 +362,136 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
       return { jsonrpc: '2.0', id, result: { profile: saved, receipts } }
     }
 
+    // ---- N10-T1 pool/spawn（OF-012；docs/10 §1）：池选型面 + 三策略分派 ----
+
+    if (method === 'pool/spawn') {
+      const profileName = params.profile
+      if (typeof profileName !== 'string' || !profileName.trim()) {
+        return rpcError(id, -32602, "profile required ('*new*' | <existing profile name>)")
+      }
+      const strategy = params.strategy ?? 'default'
+      if (!STRATEGY_VALUES.includes(strategy)) {
+        return rpcError(id, -32602, `invalid strategy: ${strategy} (legal: ${STRATEGY_VALUES.join('/')})`)
+      }
+      const role = params.role
+      if (role !== undefined && !ROLE_VALUES.includes(role)) {
+        return rpcError(id, -32602, `invalid role: ${role} (legal: ${ROLE_VALUES.join('/')})`)
+      }
+      if (params.mailbox !== undefined && (typeof params.mailbox !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(params.mailbox))) {
+        return rpcError(id, -32602, `invalid mailbox: ${params.mailbox}`)
+      }
+      if (params.project !== undefined && (typeof params.project !== 'string' || !params.project.trim())) {
+        return rpcError(id, -32602, `invalid project: ${params.project}`)
+      }
+      const count = params.count ?? 3
+      if (!Number.isInteger(count) || count < 1 || count > 8) {
+        return rpcError(id, -32602, `invalid count: ${count} (integer 1..8)`)
+      }
+      if (strategy === 'binding-mode'
+        && (typeof params.binding?.sessionId !== 'string' || !params.binding.sessionId.trim())) {
+        return rpcError(id, -32602, 'binding.sessionId required for binding-mode')
+      }
+      const targets = params.targets ?? ['dsh']
+      for (const target of targets) {
+        const implied = ROLE_TARGETS[target]
+        if (implied && role !== undefined && role !== implied) {
+          return rpcError(id, -32602, `role ${role} mismatches target ${target} (implies ${implied})`)
+        }
+      }
+      if (strategy === 'fanout-sub' && targets.some((t) => !FANOUT_TARGETS.includes(t))) {
+        return rpcError(id, -32602, `fanout-sub requires dsh-family targets (${FANOUT_TARGETS.join('/')})`)
+      }
+
+      // 选型面：*new* = 现行 incubate 全语义（校验+三门+save）；具名 = 库内复用（绝不 save、版本钉死 meta.version）
+      let saved = null
+      let record = null
+      if (profileName === NEW_PROFILE) {
+        if (typeof params.name !== 'string' || !params.name.trim()) {
+          return rpcError(id, -32602, 'name required for *new* profile')
+        }
+        const newMd = params.projection?.agents_md ?? ''
+        if (!newMd.trim()) return rpcError(id, -32602, 'projection.agents_md required for *new*')
+        if (gatesFn) {
+          const report = gatesFn(newMd)
+          if (!report.passed) return rpcError(id, -32000, `gate violations: ${JSON.stringify(report.violations)}`)
+        }
+        const pj = params.projection.profile_json ?? {}
+        saved = await profiles.save({
+          name: params.name,
+          agentsMd: newMd,
+          profile: {
+            ...pj,
+            scenario: pj.scenario ?? params.scenario ?? '',
+            description: params.projection.description ?? pj.description ?? '',
+          },
+          targets,
+          lineage: { template: params.projection.template ?? 'spawnAgentPrompt@v0.1' },
+        })
+        record = await profiles.get(saved.name)
+      } else {
+        record = await profiles.get(profileName)
+        if (!record) return rpcError(id, -32602, `unknown profile: ${profileName}`)
+      }
+      // queen 守卫（docs/10 §2 验⑤前置）：queen 只派生不 spawn
+      if (record?.profile?.vector19?.agent_role === 'queen') {
+        return rpcError(id, -32000, `queen profile cannot spawn (derive-only): ${record.name}`)
+      }
+
+      // 版本钉死：信封/回执/recordRun 一律引用库内 meta.version；AGENTS.md 直接读库注入（逐字节，不重排）
+      const { name, version, agentsMd } = record
+      const description = record.profile?.description ?? ''
+      const storedRole = record.profile?.vector19?.agent_role
+      const effectiveRole = role ?? (ROLE_VALUES.includes(storedRole) ? storedRole : undefined)
+
+      const receipts = []
+      if (strategy === 'binding-mode') {
+        // 策略③：绑定在飞 session（不 spawn），信封与 incubateDsh 完全同形制
+        receipts.push(await bindProfile({
+          name, version, agentsMd,
+          sessionId: params.binding.sessionId,
+          role: effectiveRole, project: params.project ?? '', mailbox: params.mailbox,
+        }))
+      } else if (strategy === 'fanout-sub') {
+        // 策略②：N 实例扇出，mailbox = 基名-<i>（1..N）；回执 = N 条数组
+        for (const target of targets) {
+          const implied = ROLE_TARGETS[target]
+          receipts.push(...await fanoutDsh({
+            name, version, agentsMd,
+            role: implied ?? effectiveRole ?? 'worker',
+            project: params.project ?? '',
+            mailboxBase: params.mailbox ?? `agent_${name}`,
+            profile: record, idempotent: false,
+          }, count))
+        }
+      } else {
+        // 策略① default：现行单实例孵化语义（target 分派/回执形状与 incubate 一致）
+        for (const target of targets) {
+          try {
+            const implied = ROLE_TARGETS[target]
+            const extend = implied !== undefined || role !== undefined
+              || params.mailbox !== undefined || params.project !== undefined || effectiveRole !== undefined
+            receipts.push(await incubate({
+              name, version,
+              target: implied !== undefined ? 'dsh' : target,
+              agentsMd, description, idempotent: false, profile: record,
+              ...(extend ? {
+                role: implied ?? effectiveRole ?? 'worker',
+                mailbox: params.mailbox ?? `agent_${name}`,
+                project: params.project ?? '',
+              } : {}),
+            }))
+          } catch (e) {
+            receipts.push({ target, error: String(e?.message ?? e) })
+          }
+        }
+      }
+      await profiles.recordRun(name, { op: 'pool-spawn', version, targets, strategy })
+      return {
+        jsonrpc: '2.0', id,
+        result: { profile: saved ?? { name, version, created: record.meta?.created }, receipts },
+      }
+    }
+
     if (method === 'profiles/list') {
       return { jsonrpc: '2.0', id, result: { profiles: await profiles.list() } }
     }
@@ -402,6 +543,7 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
             { id: 'dispatch', description: 'fan out a raw intent' },
             { id: 'query', description: 'task status' },
             { id: 'incubate', description: 'project & incubate a base profile' },
+            { id: 'pool-spawn', description: 'select profile from pool & spawn with strategy' },
           ],
           url: 'http://127.0.0.1:8790/',
           version: INTERNAL_VERSION,
