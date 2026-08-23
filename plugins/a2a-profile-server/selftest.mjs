@@ -10,6 +10,9 @@
 //   T11 VO-002 缺参回归一致         T14 dsh-manager 缺省 role 推导 + mailbox 默认
 //   T12 role 非法/冲突 → -32602     T15 扩参三门照常拦截（-32000）
 //   T13 dsh-liaison mock 孵化（回执/fleet/注入体）
+//   T16 pool/spawn *new* 回归同构  T19 binding-mode（信封/未 spawn/缺 sessionId）
+//   T17 具名复用（字节一致+版本钉死） T20 缺省 default/非法 strategy/unknown
+//   T18 fanout-sub count=3（回执/mailbox/fleet/注入） T21 queen 守卫 -32000
 //
 // 用法: node selftest.mjs [--verbose]   退出码 0=全绿 1=有失败。
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs'
@@ -320,6 +323,100 @@ async function main() {
       ok('T15 扩参三门照常拦截（-32000，不触发 spawn）',
         leakRole.body.error?.code === -32000 && /gate violations/.test(leakRole.body.error?.message)
           && mock.prompts.length === promptsBefore)
+
+      // ---- T16–T21 · N10-T1 pool/spawn（OF-012；全部走现有 mock，零 live）----
+
+      // T16 *new* 回归同构：pool/spawn{profile:'*new*'} 与 incubate 输出同形（验收④）
+      const incRef16 = await rpc(base, 'incubate', {
+        name: 'pool-ref-probe', targets: ['dsh'],
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '同构' }, description: 'd' },
+      })
+      const psNew = await rpc(base, 'pool/spawn', {
+        profile: '*new*', name: 'pool-new-probe', targets: ['dsh'],
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '同构' }, description: 'd' },
+      })
+      const ref16 = incRef16.body.result
+      const new16 = psNew.body.result
+      const card16 = await (await fetch(base + '/.well-known/agent-card.json')).json()
+      ok('T16 *new* 回归同构（与 incubate 输出同形 + agent-card skills 增项）',
+        new16?.profile?.version === 1
+          && Object.keys(ref16?.profile ?? {}).sort().join() === Object.keys(new16?.profile ?? {}).sort().join()
+          && Object.keys(ref16?.receipts?.[0] ?? {}).sort().join() === Object.keys(new16?.receipts?.[0] ?? {}).sort().join()
+          && new16?.receipts?.[0]?.target === 'dsh' && new16.receipts[0].name === 'pool-new-probe'
+          && new16.receipts[0].version === 1 && typeof new16.receipts[0].sessionId === 'string'
+          && card16.skills.some((s) => s.id === 'pool-spawn'))
+
+      // T17 具名复用：incubate 存底（explore-mvp@v2）→ pool/spawn 复用
+      const storedMd17 = readFileSync(join(profileRoot, 'explore-mvp', 'AGENTS.md'), 'utf8')
+      const reuse = await rpc(base, 'pool/spawn', { profile: 'explore-mvp', targets: ['dsh'] })
+      const ru17 = reuse.body.result
+      const ruPrompt17 = mock.prompts.at(-1)?.payload?.content?.[0]?.text ?? ''
+      const after17 = await rpc(base, 'profiles/get', { name: 'explore-mvp' })
+      const hist17 = readFileSync(join(profileRoot, 'explore-mvp', 'history.jsonl'), 'utf8')
+        .trim().split('\n').map((l) => JSON.parse(l))
+      ok('T17 具名复用（注入体逐字节一致 + 版本钉死不 bump + recordRun op:pool-spawn）',
+        ru17?.profile?.version === 2 && ru17?.receipts?.[0]?.version === 2
+          && ruPrompt17 === `ORCA-CB] PROFILE-INJECT] explore-mvp@v2\n${storedMd17}`
+          && after17.body.result?.profile?.version === 2
+          && hist17.some((h) => h.op === 'pool-spawn' && h.version === 2 && Array.isArray(h.targets)))
+
+      // T18 fanout-sub count=3：3 回执、mailbox base-1/2/3 两两不同、fleet 3 条含 profile_version、3 次注入
+      const promptsBefore18 = mock.prompts.length
+      const fan = await rpc(base, 'pool/spawn', {
+        profile: 'explore-mvp', strategy: 'fanout-sub', mailbox: 'fan-probe', count: 3, project: 'n10',
+      })
+      const fr18 = fan.body.result?.receipts ?? []
+      const fanFleet = Object.values(JSON.parse(readFileSync(fleetFile, 'utf8')).fleet)
+        .filter((e) => typeof e.mailbox === 'string' && e.mailbox.startsWith('fan-probe-'))
+      ok('T18 fanout-sub count=3（3 回执/mailbox 唯一/fleet 含 profile_version/3 次注入）',
+        fr18.length === 3
+          && new Set(fr18.map((r) => r.mailbox)).size === 3
+          && fr18.map((r) => r.mailbox).sort().join(',') === 'fan-probe-1,fan-probe-2,fan-probe-3'
+          && fanFleet.length === 3 && fanFleet.every((e) => e.profile_version === 2)
+          && mock.prompts.length === promptsBefore18 + 3
+          && mock.prompts.slice(-3).every((p) => (p.payload?.content?.[0]?.text ?? '')
+            .startsWith('ORCA-CB] PROFILE-INJECT] explore-mvp@v2\n')))
+
+      // T19 binding-mode：mock loopback 收到 session.prompt 信封；session-spawn 次数不变；缺 sessionId → -32602
+      const spawnCalls19 = readFileSync(argsLog, 'utf8').trim().split('\n').filter(Boolean).length
+      const promptsBefore19 = mock.prompts.length
+      const bind = await rpc(base, 'pool/spawn', {
+        profile: 'explore-mvp', strategy: 'binding-mode', binding: { sessionId: 'session-deadbeef' },
+      })
+      const bindP = mock.prompts.at(-1)?.payload
+      const bindMissing = await rpc(base, 'pool/spawn', { profile: 'explore-mvp', strategy: 'binding-mode' })
+      const spawnCallsAfter19 = readFileSync(argsLog, 'utf8').trim().split('\n').filter(Boolean).length
+      ok('T19a binding-mode（信封入在飞 session，与 incubateDsh 同形制）',
+        bind.body.result?.receipts?.[0]?.target === 'binding'
+          && bind.body.result.receipts[0].name === 'explore-mvp'
+          && bind.body.result.receipts[0].version === 2
+          && bind.body.result.receipts[0].sessionId === 'session-deadbeef'
+          && bind.body.result.receipts[0].injected === true
+          && bindP?.sessionId === 'session-deadbeef' && bindP?.mode === 'queue'
+          && (bindP?.content?.[0]?.text ?? '') === `ORCA-CB] PROFILE-INJECT] explore-mvp@v2\n${storedMd17}`)
+      ok('T19b binding-mode 不 spawn + 缺 binding.sessionId → -32602',
+        mock.prompts.length === promptsBefore19 + 1
+          && spawnCallsAfter19 === spawnCalls19
+          && bindMissing.body.error?.code === -32602 && /binding\.sessionId/.test(bindMissing.body.error?.message))
+
+      // T20 strategy 缺省=default 单回执；非法 strategy → -32602；unknown profile → -32602
+      const def20 = await rpc(base, 'pool/spawn', { profile: 'explore-mvp' })
+      const badStrategy = await rpc(base, 'pool/spawn', { profile: 'explore-mvp', strategy: 'cascade' })
+      const unknown20 = await rpc(base, 'pool/spawn', { profile: 'no-such-profile' })
+      ok('T20 缺省 default 单回执（targets 缺省 dsh）/非法 strategy/unknown profile → -32602',
+        def20.body.result?.receipts?.length === 1 && def20.body.result.receipts[0].target === 'dsh'
+          && def20.body.result.receipts[0].version === 2
+          && badStrategy.body.error?.code === -32602 && /invalid strategy/.test(badStrategy.body.error?.message)
+          && unknown20.body.error?.code === -32602 && /unknown profile/.test(unknown20.body.error?.message))
+
+      // T21 queen 守卫：库存 vector19.agent_role='queen' → -32000 拒 spawn
+      await rpc(base, 'incubate', {
+        name: 'queen-mother', targets: ['dry'],
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '派生', vector19: { agent_role: 'queen' } }, description: 'q' },
+      })
+      const qs21 = await rpc(base, 'pool/spawn', { profile: 'queen-mother' })
+      ok('T21 queen 守卫（agent_role=queen → -32000 拒 spawn）',
+        qs21.body.error?.code === -32000 && /queen/.test(qs21.body.error?.message))
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k]
