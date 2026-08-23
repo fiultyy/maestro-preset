@@ -1,0 +1,204 @@
+--- /home/yy/.agents/skills/incubation-wizard/wizard.py	2026-08-23 16:10:13.673684306 +0800
++++ projector/wizard.py	2026-08-24 02:02:05.625099470 +0800
+@@ -16,6 +16,11 @@
+       --scenario "<自然语言场景>" --name <slug> \\
+       [--role worker] [--targets dry] [--model glm-5-turbo]
+ 
++派生模式（queen，N10-T2 · docs/10 §2）：
++  wizard.py --scenario "<场景>" --name <slug> --derive \\
++      --answers-file <json> [--parent <亲本profile名>] [--targets dry]
++  answers-file = {维度key: 答案} 映射（grill 清单 18 维，缺维取建议值）。
++
+ 退出码：0=成功；1=参数/环境缺料；2=投影或三门失败；3=端点不可达；4=RPC 错误。
+ """
+ 
+@@ -35,7 +40,7 @@
+     "~/workspace-claw-02/pipecat-poc/examples/realtime-provider-poc",
+ )).expanduser()
+ 
+-ROLES = ("liaison", "manager", "worker", "supervisor")
++ROLES = ("liaison", "manager", "queen", "supervisor", "worker")
+ # 与插件 http-server.js ROLE_TARGETS 同源（G5 不漂移）：目标蕴含 role
+ ROLE_TARGETS = {"dsh-liaison": "liaison", "dsh-manager": "manager"}
+ TARGETS = ("dsh", "dsh-liaison", "dsh-manager", "omp", "claude", "dry")
+@@ -62,8 +67,32 @@
+                          "（默认 dry=只记录不落系统，冒烟安全档）")
+     ap.add_argument("--model", default=None,
+                     help="GLM 模型（缺省取 GLM_PROJECTOR_MODEL 或 glm-5-turbo）")
++    ap.add_argument("--derive", action="store_true",
++                    help="派生模式（queen）：grill 清单打印→合并答案→投影→"
++                         "incubate 带 lineage；此模式下 --role 由答案 agent_role 决定")
++    ap.add_argument("--parent", default="",
++                    help="派生血缘亲本 profile 名（可省，省则 lineage.parent 留空）")
++    ap.add_argument("--answers-file", default=None,
++                    help="--derive 必填：JSON 文件 {维度key: 答案}；缺维取 grill 建议值")
+     args = ap.parse_args(argv)
+ 
++    answers: dict[str, str] = {}
++    if args.answers_file:
++        try:
++            with open(args.answers_file, encoding="utf-8") as fh:
++                raw = json.load(fh)
++        except (OSError, json.JSONDecodeError) as exc:
++            ap.error(f"--answers-file 读取/解析失败: {exc}")
++        if not isinstance(raw, dict):
++            ap.error("--answers-file 须是 JSON 对象 {维度key: 答案}")
++        for k, v in raw.items():
++            if isinstance(v, (dict, list)):
++                ap.error(f"--answers-file 答案 [{k}] 须是标量字符串")
++            answers[str(k)] = str(v)
++    if args.derive and not args.answers_file:
++        ap.error("--derive 必填 --answers-file（{维度key: 答案} JSON 映射；缺维将取 grill 建议值）")
++    args.answers = answers
++
+     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+     bad = [t for t in targets if t not in TARGETS]
+     if bad:
+@@ -106,6 +135,89 @@
+               file=sys.stderr)
+         raise SystemExit(3)
+ 
++def _finish_incubate(out: dict) -> int:
++    """incubate 回执处理与回显（derive 与非 derive 共用尾部）。"""
++    if "error" in out:
++        err = out["error"]
++        print(f"[wizard] incubate 失败: {err.get('code')} {err.get('message')}",
++              file=sys.stderr)
++        raise SystemExit(4)
++
++    result = out["result"]
++    profile, receipts = result["profile"], result["receipts"]
++
++    # 产物回执回显（name + version + receipts）
++    print("\n== 孵化回执 ==")
++    print(f"  name:    {profile.get('name')}")
++    print(f"  version: {profile.get('version')}")
++    for r in receipts:
++        print(f"  receipt: {json.dumps(r, ensure_ascii=False)}")
++    print("INCUBATION-RECEIPT]" + json.dumps(
++        {"name": profile.get("name"), "version": profile.get("version"),
++         "receipts": receipts}, ensure_ascii=False))
++    return 0
++
++
++def run_derive(args, Projector, ProjectionError, run_gates,
++               grill_checklist, sanitize_mustache) -> int:
++    """--derive 派生流（queen）：grill 清单→合并答案→消毒→投影→三门→lineage 入池。
++
++    本函数只做参数构造与纯函数调用；RPC 面由插件票（N10-T3）消费 lineage。
++    """
++    checklist = grill_checklist(args.scenario)
++    print("\n== grill 追问清单（供 queen 会话内向用户转述；建议值=场景先验推断，用户终审）==")
++    for i, item in enumerate(checklist, 1):
++        print(f"  {i:>2}. [{item['key']}] {item['question']}")
++        print(f"      建议值: {item['suggested']}")
++
++    filled = sum(1 for item in checklist if item["key"] in args.answers)
++    merged = {
++        item["key"]: sanitize_mustache(args.answers.get(item["key"], item["suggested"]))
++        for item in checklist
++    }
++    role = next(
++        (r for r in ROLES if r in merged.get("agent_role", "")), "worker"
++    )
++    print(f"\n== 派生参数 ==")
++    print(f"  role={role}（取自答案 agent_role，缺省 worker）  "
++          f"parent={args.parent or '(无)'}")
++    print(f"  answers: 用户已答 {filled}/{len(checklist)} 维，缺维取建议值；答案已过 '{{' 消毒")
++
++    try:
++        proj = asyncio.run(Projector(model=args.model).project(
++            args.scenario,
++            answers=[f"{k}: {v}" for k, v in merged.items()],
++            role=role,
++        ))
++    except ProjectionError as e:
++        print(f"[wizard] 派生投影失败（三门重试耗尽）: {e}", file=sys.stderr)
++        raise SystemExit(2)
++
++    print("\n== 投影产物 ==")
++    print(f"  description: {proj.description.strip()[:120]}")
++    print(f"  agents_md: {len(proj.agents_md)} chars  "
++          f"agent_role={proj.profile_json.get('agent_role')}")
++
++    # 三门报告回显（终产物逐门复核；projector 已内部过门，此处为零漂移复核）
++    if not echo_gates(run_gates(proj.agents_md)):
++        print("[wizard] 三门未过（不应发生：projector 已内部过门）", file=sys.stderr)
++        raise SystemExit(2)
++
++    out = incubate_rpc({
++        "name": args.name,
++        "targets": args.targets,
++        "role": role,
++        "projection": {
++            "agents_md": proj.agents_md,
++            "profile_json": proj.profile_json,
++            "description": proj.description,
++        },
++        # 插件侧 N10-T3 才消费 lineage；当前多余参数被无害忽略
++        "lineage": {"derived-by": "queen", "parent": args.parent or ""},
++    })
++    return _finish_incubate(out)
++
++
+ 
+ def main(argv: list[str] | None = None) -> int:
+     args = parse_args(argv)
+@@ -122,7 +234,8 @@
+ 
+     sys.path.insert(0, str(REPO_DIR))
+     try:
+-        from rt_projector import Projector, ProjectionError
++        from rt_projector import (Projector, ProjectionError, grill_checklist,
++                                  sanitize_mustache)
+         from rt_projection_gates import run_gates
+     except ImportError as e:
+         print(f"[wizard] 无法导入投影器（{REPO_DIR}）: {e}", file=sys.stderr)
+@@ -134,6 +247,10 @@
+               file=sys.stderr)
+         raise SystemExit(1)
+ 
++    if args.derive:
++        return run_derive(args, Projector, ProjectionError, run_gates,
++                          grill_checklist, sanitize_mustache)
++
+     # 投影（含 role doctrine 注入；内部三门失败升温重试 ≤2，耗尽抛 ProjectionError）
+     try:
+         proj = asyncio.run(Projector(model=args.model).project(
+@@ -152,7 +269,7 @@
+         print("[wizard] 三门未过（不应发生：projector 已内部过门）", file=sys.stderr)
+         raise SystemExit(2)
+ 
+-    out = incubate_rpc({
++    return _finish_incubate(incubate_rpc({
+         "name": args.name,
+         "targets": args.targets,
+         "role": args.role,
+@@ -161,26 +278,7 @@
+             "profile_json": proj.profile_json,
+             "description": proj.description,
+         },
+-    })
+-    if "error" in out:
+-        err = out["error"]
+-        print(f"[wizard] incubate 失败: {err.get('code')} {err.get('message')}",
+-              file=sys.stderr)
+-        raise SystemExit(4)
+-
+-    result = out["result"]
+-    profile, receipts = result["profile"], result["receipts"]
+-
+-    # 产物回执回显（name + version + receipts）
+-    print("\n== 孵化回执 ==")
+-    print(f"  name:    {profile.get('name')}")
+-    print(f"  version: {profile.get('version')}")
+-    for r in receipts:
+-        print(f"  receipt: {json.dumps(r, ensure_ascii=False)}")
+-    print("INCUBATION-RECEIPT]" + json.dumps(
+-        {"name": profile.get("name"), "version": profile.get("version"),
+-         "receipts": receipts}, ensure_ascii=False))
+-    return 0
++    }))
+ 
+ 
+ if __name__ == "__main__":
