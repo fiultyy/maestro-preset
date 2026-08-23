@@ -43,6 +43,9 @@ const MAX_BODY_BYTES = 256 * 1024
 const INTERNAL_VERSION = 'internal-1'
 // W5.1 incubate 扩参（N6§1.3）：role 合法值 + role 孵化目标映射（复用 dsh 孵化器）
 const ROLE_VALUES = ['liaison', 'manager', 'worker', 'supervisor']
+// N10-T4 集成接缝：queen（OF-013 派生者）仅在 incubate 面合法——queen 会话由运营者
+// 经 incubate 直建（doctrine 已由投影器嵌进产物）；pool/spawn 拒 queen（守卫语义不变）。
+const INCUBATE_ROLE_VALUES = [...ROLE_VALUES, 'queen']
 const ROLE_TARGETS = { 'dsh-liaison': 'liaison', 'dsh-manager': 'manager' }
 // N10-T1 pool/spawn（OF-012）：策略面 + fanout 约束（count 1..8、dsh 族目标）
 const STRATEGY_VALUES = ['default', 'fanout-sub', 'binding-mode']
@@ -300,10 +303,10 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
     if (method === 'incubate') {
       const agentsMd = params.projection?.agents_md ?? ''
       if (!agentsMd.trim()) return rpcError(id, -32602, 'projection.agents_md required')
-      // W5.1 扩参（N6§1.3；缺省即现行语义）：role ∈ {liaison,manager,worker,supervisor}
+      // W5.1 扩参（N6§1.3；缺省即现行语义）：role ∈ {liaison,manager,worker,supervisor,queen(N10-T4)}
       const role = params.role
-      if (role !== undefined && !ROLE_VALUES.includes(role)) {
-        return rpcError(id, -32602, `invalid role: ${role} (legal: ${ROLE_VALUES.join('/')})`)
+      if (role !== undefined && !INCUBATE_ROLE_VALUES.includes(role)) {
+        return rpcError(id, -32602, `invalid role: ${role} (legal: ${INCUBATE_ROLE_VALUES.join('/')})`)
       }
       if (params.mailbox !== undefined && (typeof params.mailbox !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(params.mailbox))) {
         return rpcError(id, -32602, `invalid mailbox: ${params.mailbox}`)

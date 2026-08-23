@@ -473,6 +473,16 @@ async function main() {
       const qs21 = await rpc(base, 'pool/spawn', { profile: 'queen-mother' })
       ok('T21 queen 守卫（agent_role=queen → -32000 拒 spawn）',
         qs21.body.error?.code === -32000 && /queen/.test(qs21.body.error?.message))
+
+      // T29 queen role 接缝（N10-T4）：incubate 收 queen（运营者直建）；pool/spawn 拒 queen role 参数
+      const qinc = await rpc(base, 'incubate', {
+        name: 'queen-persona', targets: ['dry'], role: 'queen',
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '派生主持' }, description: 'q' },
+      })
+      const qsp = await rpc(base, 'pool/spawn', { profile: 'queen-persona', role: 'queen' })
+      ok('T29 queen role 接缝（incubate 合法 / pool/spawn -32602）',
+        qinc.body.result?.profile?.version === 1 && qinc.body.result?.receipts?.[0]?.target === 'dry'
+          && qsp.body.error?.code === -32602 && /invalid role: queen/.test(qsp.body.error?.message))
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k]
