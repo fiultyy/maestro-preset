@@ -15,6 +15,11 @@ DSH maestro 预设与孵化池机制的统一开发仓库。当前波次：**N10
 ## 红线（继承 orch-index §4）
 
 - worker 不碰默认分支不改别人的域；集成合并由编排者（maestro 会话）做。
+
+## 两级指挥（2026-08-24 用户 ruling）
+
+- **parent（session-20d0a3ee，长时模式）**：长程指挥、监督管理、最终汇报；裁决收敛顺序冲突 / gate 判定 / 预算；pipecat-poc 仓的回流 commit 由 parent 做（worker/9a8b 只备 patch）；9a8b 失效时 parent 兜底直接收敛。
+- **9a8b（maestro 现场集成者）**：wt 收敛 + 票粒度 commit（本仓库内）；上抛触发=分支收敛顺序冲突、gate 二跑不绿、预算超限、需动 pipecat-poc 仓。
 - 不 push；跨会话只有 `bin/session-send` 回程通道。
 - live 测试禁止同 mailbox 并发实例；21:30 后 live 预算 ×1.5。
 - 禁 dais spawning（实例锁强制）。
