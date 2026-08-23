@@ -1,0 +1,7 @@
+{
+  "name": "@voice-head/a2a-profile-server",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Internal-contract A2A endpoint + base-profile store for the voice orchestration head (WS2, docs/kg/02-ws2-a2a-profile.md). Exposes agent-card + JSON-RPC (message/send, tasks/get, tasks/cancel, incubate, profiles/*) on 127.0.0.1; public exposure is reverse-proxied by the WS4 gateway. Mirrors the plugin shape of @maestro/host-callback-bridge.",
+  "main": "index.js"
+}
