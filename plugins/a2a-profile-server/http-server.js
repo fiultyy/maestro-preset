@@ -331,15 +331,24 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
         if (!report.passed) return rpcError(id, -32000, `gate violations: ${JSON.stringify(report.violations)}`)
       }
       // 有效 role：显式 role 优先；全部 role-target 蕴含同一 role 时采用之
-      // （agent_role 落 profile.json 需 profile-store 扩展落盘键，本票范围外——见 VO-002 报告）
+      // N10-T4 承重补齐（VO-002 遗留缺口关闭）：有效 role 并入 vector19.agent_role 落盘——
+      // T1 守卫与 reuse 角色推断都读该键；此前 Projector 的顶层 agent_role 被 store 窄写丢弃。
       const uniqueImplied = [...new Set(targets.map((t) => ROLE_TARGETS[t]).filter(Boolean))]
-      const effectiveRole = role ?? (uniqueImplied.length === 1 ? uniqueImplied[0] : undefined)
+      const pj0 = params.projection.profile_json ?? {}
+      const effectiveRole = role
+        ?? (uniqueImplied.length === 1 ? uniqueImplied[0] : undefined)
+        ?? (INCUBATE_ROLE_VALUES.includes(pj0.agent_role) ? pj0.agent_role : undefined)
+        ?? (INCUBATE_ROLE_VALUES.includes(pj0.vector19?.agent_role) ? pj0.vector19.agent_role : undefined)
       const saved = await profiles.save({
         name: params.name,
         agentsMd,
         profile: {
-          ...params.projection.profile_json ?? {},
-          description: params.projection.description ?? (params.projection.profile_json ?? {}).description ?? '',
+          ...pj0,
+          vector19: {
+            ...(pj0.vector19 ?? {}),
+            ...(effectiveRole !== undefined ? { agent_role: effectiveRole } : {}),
+          },
+          description: params.projection.description ?? pj0.description ?? '',
         },
         targets,
         lineage: {
@@ -431,12 +440,20 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
           if (!report.passed) return rpcError(id, -32000, `gate violations: ${JSON.stringify(report.violations)}`)
         }
         const pj = params.projection.profile_json ?? {}
+        // N10-T4 承重补齐：同 incubate——有效 role 并入 vector19.agent_role 落盘（守卫/推断读此键）
+        const newRole = role
+          ?? (INCUBATE_ROLE_VALUES.includes(pj.agent_role) ? pj.agent_role : undefined)
+          ?? (INCUBATE_ROLE_VALUES.includes(pj.vector19?.agent_role) ? pj.vector19.agent_role : undefined)
         saved = await profiles.save({
           name: params.name,
           agentsMd: newMd,
           profile: {
             ...pj,
             scenario: pj.scenario ?? params.scenario ?? '',
+            vector19: {
+              ...(pj.vector19 ?? {}),
+              ...(newRole !== undefined ? { agent_role: newRole } : {}),
+            },
             description: params.projection.description ?? pj.description ?? '',
           },
           targets,

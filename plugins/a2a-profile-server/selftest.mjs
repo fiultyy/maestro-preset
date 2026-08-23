@@ -474,15 +474,20 @@ async function main() {
       ok('T21 queen 守卫（agent_role=queen → -32000 拒 spawn）',
         qs21.body.error?.code === -32000 && /queen/.test(qs21.body.error?.message))
 
-      // T29 queen role 接缝（N10-T4）：incubate 收 queen（运营者直建）；pool/spawn 拒 queen role 参数
+      // T29 queen role 接缝（N10-T4）：incubate 收 queen（运营者直建）；pool/spawn 拒 queen role 参数；
+      // 有效 role 落 vector19.agent_role（承重补齐）→ 守卫对落库 queen 生效
       const qinc = await rpc(base, 'incubate', {
         name: 'queen-persona', targets: ['dry'], role: 'queen',
         projection: { agents_md: GOOD_MD, profile_json: { scenario: '派生主持' }, description: 'q' },
       })
+      const qgot = await rpc(base, 'profiles/get', { name: 'queen-persona' })
       const qsp = await rpc(base, 'pool/spawn', { profile: 'queen-persona', role: 'queen' })
-      ok('T29 queen role 接缝（incubate 合法 / pool/spawn -32602）',
+      const qsp2 = await rpc(base, 'pool/spawn', { profile: 'queen-persona' })
+      ok('T29 queen role 接缝（incubate 合法+vector19 落键 / pool/spawn -32602 / 守卫 -32000）',
         qinc.body.result?.profile?.version === 1 && qinc.body.result?.receipts?.[0]?.target === 'dry'
-          && qsp.body.error?.code === -32602 && /invalid role: queen/.test(qsp.body.error?.message))
+          && qgot.body.result?.profile?.profile?.vector19?.agent_role === 'queen'
+          && qsp.body.error?.code === -32602 && /invalid role: queen/.test(qsp.body.error?.message)
+          && qsp2.body.error?.code === -32000 && /queen/.test(qsp2.body.error?.message))
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k]
