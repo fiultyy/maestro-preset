@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""wave-checkpoint — 波次检查点机器可读(OF-007)
+
+用法:
+  wave-checkpoint [--wave W6] [--notes "..."] [--round N] [--dry-run] [--file PATH]
+  wave-checkpoint --tail N [--file PATH]
+
+追加单行 JSON 到 state/wave-checkpoints.jsonl(缺省 <maestro>/state/,--file 覆盖):
+  {round, ts, wave, tickets:[{id,state}], git:{head}, env:{dais,orca}, notes}
+
+- 原子追加: O_APPEND + 单次 os.write 整行 + fsync;kiss -9 中断不留半行
+- round: 从上一行读(首行 round=1);显式 --round 且 ≠ last+1 → stderr WARN(防漏轮),照写
+- tickets: 读 MAESTRO_LEDGER 指向库的 tickets 表(OF-005);无表旧库 → 空集容错
+- git.head: `git -C <maestro 根> rev-parse --short HEAD`,非 git 域 → null
+- env: dais/orca --version 首行,探测失败 → 路径或 null
+- --tail N: 回读末 N 行原样 JSONL(jq 友好);文件不存在 → stderr 提示,exit 1
+- OF-010: 追加成功后单向投影 longtask(复用 bin/ledger 的 deliver_projection;
+  活跃判定/pending 补投/静默跳过语义见 ledger 同名注释;--dry-run 不投影)
+
+断点续传(新编排者会话重建波次视图):
+  bin/wave-checkpoint --tail 1 | jq '{round, wave, head: .git.head, tickets: [.tickets[] | {(.id): .state}] | add}'
+"""
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_FILE = os.path.join(ROOT, 'state', 'wave-checkpoints.jsonl')
+DB = os.environ.get('MAESTRO_LEDGER', os.path.join(ROOT, 'ledger.db'))
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def read_last_line(path):
+    """回读末行(倒序小块);空/缺文件 → None。"""
+    if not os.path.exists(path):
+        return None
+    size = os.path.getsize(path)
+    if size == 0:
+        return None
+    with open(path, 'rb') as f:
+        chunk = min(size, 8192)
+        f.seek(-chunk, os.SEEK_END)
+        data = f.read().decode('utf-8', errors='replace')
+    lines = [l for l in data.split('\n') if l.strip()]
+    return lines[-1] if lines else None
+
+
+def read_last_n(path, n):
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding='utf-8') as f:
+        lines = [l for l in f.read().split('\n') if l.strip()]
+    return lines[-n:] if n > 0 else []
+
+
+def read_tickets():
+    """tickets 面快照:[{id,state}];无表旧库容错 → 空集。"""
+    try:
+        c = sqlite3.connect(DB)
+        try:
+            rows = c.execute("SELECT ticket_id,state FROM tickets ORDER BY ticket_id").fetchall()
+            return [{'id': r[0], 'state': r[1]} for r in rows]
+        finally:
+            c.close()
+    except sqlite3.OperationalError:
+        return []
+
+
+def probe_git():
+    try:
+        r = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def probe_env():
+    out = {}
+    for key, bins in (('dais', ['dais']), ('orca', ['orca-ide', 'orca'])):
+        val = None
+        for b in bins:
+            p = shutil.which(b)
+            if not p:
+                continue
+            try:
+                r = subprocess.run([b, '--version'], capture_output=True, text=True, timeout=3)
+                first = (r.stdout or r.stderr).strip().splitlines()
+                val = (first[0] if first else p)
+                break
+            except Exception:
+                val = p  # 探测失败退化为路径存在性
+                break
+        out[key] = val
+    return out
+
+
+def append_checkpoint(path, wave=None, notes=None, round_override=None, dry_run=False,
+                      collect_env=True):
+    """计算并(可选)原子追加一条检查点;返回写入的 record dict。"""
+    last_raw = read_last_line(path)
+    last = json.loads(last_raw) if last_raw else None
+    last_round = last['round'] if last else 0
+    if round_override is not None and round_override != last_round + 1:
+        print(f'wave-checkpoint: WARN round 跳号: last={last_round} -> next={round_override} '
+              f'(预期 {last_round + 1},防漏轮核查)', file=sys.stderr)
+    rnd = round_override if round_override is not None else last_round + 1
+    wave = wave if wave is not None else (last or {}).get('wave')
+    rec = {
+        'round': rnd,
+        'ts': now(),
+        'wave': wave,
+        'tickets': read_tickets(),
+        'git': {'head': probe_git() if collect_env else None},
+        'env': probe_env() if collect_env else {'dais': None, 'orca': None},
+        'notes': notes,
+    }
+    line = json.dumps(rec, ensure_ascii=False, separators=(',', ':')) + '\n'
+    if dry_run:
+        return rec
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        data = line.encode('utf-8')
+        while data:  # 常规文件单次即写完;循环仅作残写兜底,O_APPEND 保证不覆盖他人
+            n = os.write(fd, data)
+            data = data[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return rec
+
+_LEDGER_MOD = None
+
+
+def project_to_longtask(rec):
+    """OF-010:checkpoint 行同步投影(lazy 加载 bin/ledger,复用同一钩子;任何失败不冒泡)。"""
+    global _LEDGER_MOD
+    try:
+        if _LEDGER_MOD is None:
+            import importlib.machinery
+            import importlib.util
+            p = os.path.join(ROOT, 'bin', 'ledger')
+            loader = importlib.machinery.SourceFileLoader('ledger_lt', p)
+            spec = importlib.util.spec_from_loader('ledger_lt', loader)
+            _LEDGER_MOD = importlib.util.module_from_spec(spec)
+            loader.exec_module(_LEDGER_MOD)
+        _LEDGER_MOD.deliver_projection({'kind': 'wave', 'round': rec['round'],
+                                        'wave': rec['wave'], 'tickets': rec['tickets']})
+    except Exception as e:  # 双保险:投影永不阻塞 checkpoint 主流程
+        print(f'wave-checkpoint: WARN 投影异常(不阻塞): {e}', file=sys.stderr)
+
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='wave-checkpoint', add_help=True,
+                                 description='波次检查点追加/回读(OF-007)')
+    ap.add_argument('--tail', type=int, metavar='N', help='回读末 N 行原样 JSONL')
+    ap.add_argument('--wave')
+    ap.add_argument('--notes')
+    ap.add_argument('--round', type=int)
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--file', default=DEFAULT_FILE, help='检查点文件路径(缺省 state/wave-checkpoints.jsonl)')
+    a = ap.parse_args()
+    if a.tail is not None and (a.wave or a.notes or a.round or a.dry_run):
+        ap.error('--tail 是回读模式,与追加参数(--wave/--notes/--round/--dry-run)互斥')
+    if a.tail is not None:
+        lines = read_last_n(a.file, a.tail)
+        if lines is None:
+            print(f'wave-checkpoint: no checkpoints file: {a.file}', file=sys.stderr)
+            sys.exit(1)
+        for l in lines:
+            print(l)
+        return
+    rec = append_checkpoint(a.file, wave=a.wave, notes=a.notes, round_override=a.round,
+                            dry_run=a.dry_run)
+    dest = '(dry-run)' if a.dry_run else a.file
+    print(f"checkpoint round={rec['round']} wave={rec['wave']} tickets={len(rec['tickets'])} -> {dest}")
+    if not a.dry_run:
+        project_to_longtask(rec)
+
+
+if __name__ == '__main__':
+    main()

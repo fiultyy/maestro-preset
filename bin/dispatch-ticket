@@ -5,6 +5,7 @@
 机制:
   - 票源: <repo>/docs/tickets.md 中 "### <LK-ID>" 起至下一个 ^###/^## 的块
   - 契约: ~/.dsh/maestro/templates/dispatch-preamble.md(占位符替换)
+  - 契约头: 生成的派发 prompt 头部自动嵌入"控制消息两段式"契约(OF-003,见 STEER_TWO_PHASE)
   - 签名: $MAESTRO_ORCH_SIGNATURE 或 ~/.dsh/maestro/bridge/orch.signature
   - 落账: ledger node(dispatched) + event(dispatched),project 按 repo 路径解析
 环境: ORCA_CLI_COMMAND(默认 orca-ide)
@@ -14,6 +15,18 @@ import argparse, json, os, re, subprocess, sys
 HOME = os.path.expanduser('~/.dsh')
 MAESTRO = f'{HOME}/maestro'
 ORCA = os.environ.get('ORCA_CLI_COMMAND', 'orca-ide')
+
+# OF-003 控制消息两段式契约: 生成的派发 prompt 头部自动携带(与 orch-loop.md
+# §控制消息两段式 / ~/.agents/skills/maestro-bridge/SKILL.md 三处同文,grep 勾稽)。
+STEER_TWO_PHASE = """─── 控制消息两段式(two-phase steer,OF-003;收到 steer 必答)───
+steer 发出后,收方回合首动作 = `session-send <self> <from> ack <ref> 'steer-accepted'`(已读将执行)
+或 `session-send <self> <from> nack <ref> 'busy:queued'`(正忙: 消息保留、入列,下回合首处理)。
+nack busy 语义钉死 = 不丢不重: 消息由收方回合队列持有,下回合首先处理;同 msgid(OF-001 信封)
+重复投递由 bin/msg-dedup 在去重窗口拦截(exit 3),收方零重复执行。类型复用现有 ack/nack,不新增。
+无契约旧 peer: 发送方零阻塞——不等待 ack/nack,发送即返回;未回 ack 不构成失败,不重发、不升级,
+沿用"机械核查为仲裁"原则(回调逾期才触发人工核查)。
+──────────────────────────────────────────────
+"""
 
 def die(m, code=1):
     print(f'dispatch-ticket: {m}', file=sys.stderr); sys.exit(code)
@@ -40,8 +53,9 @@ def ticket_block(repo, ref):
 def build_message(ref, worker, sig, block):
     with open(f'{MAESTRO}/templates/dispatch-preamble.md') as fh:
         tpl = fh.read()
-    return (tpl.replace('{REF}', ref).replace('{WORKER}', worker)
+    body = (tpl.replace('{REF}', ref).replace('{WORKER}', worker)
                .replace('{SIG}', sig).replace('{TICKET_BLOCK}', block.strip()))
+    return STEER_TWO_PHASE + '\n' + body  # OF-003: 契约头嵌 prompt 头部
 
 def send(terminal, message):
     proc = subprocess.run([ORCA, 'terminal', 'send', '--terminal', terminal,

@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """session-send — 跨 main 会话消息直发(loopback /api 包装)
 
-用法: session-send <from> <to> <type> <ref> <body>
+用法: session-send [--msgid <id>] <from> <to> <type> <ref> <body>
   from/to: fleet.json 里的 4 位码(如 orch1/2437),sessionId 前 4 位,或完整 sessionId
   type:    ping|pong|done|ask|steer|nack|ack
   ref:     关联的 ledger node_id(无则填 -)
   body:    单行正文
+  --msgid: 可选,透传既有 msgid(重发保号);缺省自动生成 uuid4
 
-信封: 收方回合首行 = DSHMSG]{"from","to","type","ref","body"}
-      方向语义显式可解析,与文件桥 v3.5 的 {"type","from","to","body"} 同一心智模型。
+信封 v2(OF-001): 收方回合首行 = DSHMSG]{"from","to","type","ref","body","msgid","ts"}
+      msgid=uuid4(重发可保号),ts=epoch ms;老键全保留、只增不改(OG5),
+      老消费者按 ']'+json.loads 解析,忽略未知键即兼容。
+      收方回合首动作可跑 bin/msg-dedup 做同 msgid 去重。
+steer 闸(OF-002): resolve 后,type=steer 时查 to 的 fleet 条目属主租约——
+      owner 有效且 ≠ from → 拒绝 exit 4 + 冲突行落 <fleet 目录>/fleet-conflicts.jsonl
+      (键: msgid/from/to/ts);owner=from/无主/已过期/无条目(直投 sessionId)→ 放行
+      + 审计行落 $MAESTRO_STATE/steer-journal.jsonl(reason=owner-self|unowned|
+      lease-expired|no-entry)。其余消息类型零影响(OG1)。
 
 环境: DSH_PORT(默认 3080)/ MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)
 """
 import json
 import os
 import sys
+import time
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 
 def resolve(key: str, fleet: dict) -> str:
@@ -32,18 +42,90 @@ def resolve(key: str, fleet: dict) -> str:
     sys.exit(f'session-send: unknown code {key!r} (not in fleet.json, not a sessionId prefix)')
 
 
+def parse_ts(val):
+    """ISO 8601 → aware datetime(容忍 Z;naive 视作 UTC);缺/坏 → None。"""
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def find_entry(key, fleet):
+    """按 resolve 同款规则取 to 的 fleet 条目(短码→sessionId 前缀);找不到 → None。"""
+    ent = fleet.get('fleet', {}).get(key)
+    if isinstance(ent, dict):
+        return ent
+    for ent in fleet.get('fleet', {}).values():
+        sid = ent.get('sessionId') if isinstance(ent, dict) else None
+        if sid and sid.startswith('session-' + key):
+            return ent
+    return None
+
+
+def append_jsonl(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps(obj, ensure_ascii=False) + '\n')
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def steer_gate(frm, to, fleet, fleet_path, msgid, ts):
+    """OF-002 控制面闸(只拦 steer): 属主有效且≠from → exit 4+冲突行;否则放行+审计行。"""
+    entry = find_entry(to, fleet)
+    owner = entry.get('owner') if entry else None
+    expires = parse_ts(entry.get('leaseExpiresAt')) if entry else None
+    alive = bool(owner and expires and expires > datetime.now(timezone.utc))
+    if alive and owner != frm:
+        conflicts = os.path.join(os.path.dirname(os.path.abspath(fleet_path)),
+                                 'fleet-conflicts.jsonl')
+        append_jsonl(conflicts, {'msgid': msgid, 'from': frm, 'to': to, 'ts': ts})
+        print(f'session-send: steer REFUSED — {to} leased by {owner} until '
+              f'{entry.get("leaseExpiresAt")}; conflict journaled ({conflicts}) msgid={msgid}',
+              file=sys.stderr)
+        sys.exit(4)
+    if alive:
+        reason = 'owner-self'
+    elif entry is None:
+        reason = 'no-entry'
+    elif owner:
+        reason = 'lease-expired'
+    else:
+        reason = 'unowned'
+    state_dir = os.environ.get('MAESTRO_STATE', os.path.expanduser('~/.dsh/maestro/state'))
+    append_jsonl(os.path.join(state_dir, 'steer-journal.jsonl'),
+                 {'msgid': msgid, 'from': frm, 'to': to, 'ts': ts, 'reason': reason})
+
+
 def main() -> None:
-    if len(sys.argv) != 6:
+    argv = sys.argv[1:]
+    msgid = None
+    if '--msgid' in argv:
+        i = argv.index('--msgid')
+        if i + 1 >= len(argv):
+            print('session-send: --msgid requires a value', file=sys.stderr)
+            sys.exit(2)
+        msgid = argv[i + 1]
+        del argv[i:i + 2]
+    if len(argv) != 5:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    frm, to, typ, ref, body = sys.argv[1:6]
+    frm, to, typ, ref, body = argv
     port = os.environ.get('DSH_PORT', '3080')
     fleet_path = os.environ.get('MAESTRO_FLEET', os.path.expanduser('~/.dsh/maestro/fleet.json'))
     with open(fleet_path) as fh:
         fleet = json.load(fh)
     port = str(fleet.get('port', port))
     to_sid = resolve(to, fleet)
-    envelope = {'from': frm, 'to': to, 'type': typ, 'ref': ref, 'body': body}
+    msgid = msgid or str(uuid.uuid4())
+    ts = int(time.time() * 1000)
+    if typ == 'steer':  # OF-002 控制面闸(仅 steer;其余类型零影响)
+        steer_gate(frm, to, fleet, fleet_path, msgid, ts)
+    envelope = {'from': frm, 'to': to, 'type': typ, 'ref': ref, 'body': body,
+                'msgid': msgid, 'ts': ts}
     line = 'DSHMSG]' + json.dumps(envelope, ensure_ascii=False)
     payload = {
         'sessionId': to_sid,

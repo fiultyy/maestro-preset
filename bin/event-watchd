@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""event-watchd — 回合制外常驻事件守护(OF-006 · relay 泛化,治 D-09)
+
+用法:
+  event-watchd --config watch.json                     常驻循环(nohup 起,非 agent 回合)
+  event-watchd --config watch.json --once              单轮巡检后退出(测试/一次性)
+  event-watchd --config watch.json --max-rounds N --interval S   寿命/节奏
+
+配置(watch.json,声明式四类看守面):
+  {
+    "interval": 5, "max_rounds": 0,                  // 0=不限轮(常驻)
+    "notify": "stdout" | "session-send",             // 事件出口
+    "owner": {"from": "watchd", "to": "orch1"},      // session-send 模式收方(fleet 码)
+    "faces": {
+      "file":    [{"name": "…", "glob": "…"}   // 事件类型固定: file-landed/file-grew],
+      "process": [{"name": "…", "pid": 1234} 或 {"name": "…", "pattern": "…"},
+                   "cpu_max": 1.0, "stale_min": 10, "log": "/path/log"}],
+      "sla":     [ … ],                              // ③ 留位:本票 NotImplemented
+      "lease":   [ … ]                               // ④ 留位:本票 NotImplemented
+    }
+  }
+
+看守面语义:
+  ① 文件面: glob → 事件;首轮基线不报(OF-001 base 语义),之后新文件=file-landed、
+     增长=file-grew(old→new 字节);事件后位点推进,同内容重放零回声。
+  ② 进程面: 进程存活 且 CPU(生命周期均值)≤cpu_max 且 日志 mtime 陈旧≥stale_min
+     ——双条件与判定(单条件不触发,VO-007 式挂死合成);连续挂死只报一次(latch),
+     条件解除后复位。进程缺席 → 不判定(非本面职责)。
+  ③ SLA 面 / ④ 租约面: 留位——逐项打印 WATCHD-STUB NotImplemented 提示(不崩溃、
+     不进事件流不投递),patch 位:③=OF-005 tickets 非终态超 ttl;④=OF-002 fleet lease。
+
+自续期(D-09 ②): --max-rounds N>0 时,轮数到期边界若①②有活动
+  (=本轮有事件 或 任一进程看守目标存活)则顺延 N 轮并打 WATCHD-RENEW;无活动才退场。
+
+升级终点(§6 非目标钉死): notify=session-send 投递失败(owner 失联)→
+  追加单行 JSON 到 alerts.log(用户可见告警面)——只此一层,不做递归监督。
+
+单实例: flock(LOCK_EX|LOCK_NB) <state_dir>/watchd.lock;后起实例 exit 3 并打印持有者。
+信号: SIGTERM/SIGINT 优雅退出(打点+落盘位点),无残留进程/锁。
+env: WATCHD_STATE_DIR(默认 ~/.dsh/maestro/state/watch)
+     WATCHD_ALERTS   (默认 ~/.dsh/maestro/state/alerts.log)
+     MAESTRO_FLEET/DSH_PORT 透传给 session-send(notify 模式;测试用 stub)
+"""
+import fcntl
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+MAESTRO = os.path.expanduser('~/.dsh/maestro')
+SESSION_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'session-send')
+HZ = os.sysconf('SC_CLK_TCK')
+
+STOP = {'flag': False, 'signal': None}
+
+
+def die(msg, code=2):
+    print(f'event-watchd: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    cfg = None
+    once = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--config':
+            i += 1
+            if i >= len(argv):
+                die('--config requires a path')
+            cfg = argv[i]
+        elif a == '--once':
+            once = True
+        elif a in ('-h', '--help'):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            die(f'unknown arg {a!r}')
+        i += 1
+    if not cfg:
+        die('missing --config')
+    return cfg, once
+
+
+def load_state(path):
+    try:
+        with open(path) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault('files', {})
+    st.setdefault('latch', {})
+    st.setdefault('bootstrapped', False)
+    return st
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.watchd-state-')
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            json.dump(state, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# ---------- 看守面①: 文件落地(OF-001 base 语义:基线+位点推进+防回声) ----------
+
+def scan_file_face(entry, state, events):
+    name = entry.get('name') or entry['glob']
+    pattern = os.path.expanduser(entry['glob'])
+    matched = sorted(glob.glob(pattern, recursive=True))
+    current = {}
+    for path in matched:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        current[path] = size
+    state_files = state['files']
+    if not state['bootstrapped']:
+        # 首轮基线(OF-001 base 语义): 只记位点不出事件
+        state_files.clear()
+        state_files.update(current)
+        state['bootstrapped'] = True
+        return
+    for path, size in current.items():
+        prev = state_files.get(path)
+        if prev is None:
+            events.append({'face': 'file', 'watch': name, 'type': 'file-landed',
+                           'detail': f'path={path} size={size}'})
+        elif size > prev:
+            events.append({'face': 'file', 'watch': name, 'type': 'file-grew',
+                           'detail': f'path={path} bytes {prev}->{size}'})
+    # 位点推进(事件后即推进 → 同内容重放零回声);消失文件清出
+    for path in list(state_files):
+        if path not in current:
+            del state_files[path]
+    state_files.update(current)
+
+
+# ---------- 看守面②: 进程活性(低 CPU + 日志陈旧 双条件与判定) ----------
+
+def proc_alive(pid):
+    """存活判定: /proc 存在 且 状态非 Z(zombie)/X(dead) —— 僵尸=已死,不算活动票。"""
+    try:
+        with open(f'/proc/{pid}/stat') as fh:
+            state = fh.read().split()[2]
+        return state not in ('Z', 'X', 'x')
+    except (OSError, IndexError):
+        return False
+
+
+def find_pid(entry):
+    if entry.get('pid'):
+        pid = int(entry['pid'])
+        return pid if proc_alive(pid) else None
+    pat = entry.get('pattern')
+    if not pat:
+        return None
+    try:
+        out = subprocess.run(['pgrep', '-f', pat], capture_output=True, text=True, timeout=10)
+        pids = [int(x) for x in out.stdout.split()]
+        pids = [p for p in pids if proc_alive(p)]
+        return pids[0] if pids else None
+    except (OSError, ValueError):
+        return None
+
+
+def proc_cpu_lifetime_pct(pid):
+    """/proc 生命周期均值 CPU%: (utime+stime)/elapsed —— --once 单轮即可判定。"""
+    try:
+        with open(f'/proc/{pid}/stat') as fh:
+            parts = fh.read().split()
+        utime, stime, starttime = int(parts[13]), int(parts[14]), int(parts[21])
+        with open('/proc/uptime') as fh:
+            uptime = float(fh.read().split()[0])
+        elapsed = uptime - starttime / HZ
+        if elapsed < 1.0:
+            return None  # 太新,无法判定
+        return (utime + stime) / HZ / elapsed * 100.0
+    except (OSError, IndexError, ValueError, ZeroDivisionError):
+        return None
+
+
+def scan_process_face(entry, latch, events):
+    name = entry.get('name') or f"pid:{entry.get('pid') or entry.get('pattern')}"
+    pid = find_pid(entry)
+    if pid is None:
+        latch.pop(name, None)  # 进程缺席/已死: 复位 latch,不判定
+        return False
+    cpu = proc_cpu_lifetime_pct(pid)
+    log = entry.get('log')
+    stale_min = float(entry.get('stale_min', 10))
+    cpu_max = float(entry.get('cpu_max', 1.0))
+    age_min = None
+    if log and os.path.exists(log):
+        age_min = (time.time() - os.path.getmtime(log)) / 60.0
+    hung = (cpu is not None and cpu <= cpu_max
+            and age_min is not None and age_min >= stale_min)
+    if hung and not latch.get(name):
+        events.append({'face': 'process', 'watch': name, 'type': 'process-hung',
+                       'detail': f'pid={pid} cpu={cpu:.2f}%<={cpu_max}% '
+                                 f'log_age={age_min:.0f}m>={stale_min}m (dual-condition hit)'})
+        latch[name] = True
+    elif not hung:
+        latch.pop(name, None)
+    return True  # 目标存活 → 活动票
+
+
+# ---------- ③④ 留位 ----------
+
+def scan_stub_faces(faces, key, plan_ref):
+    """③SLA/④租约留位: 逐项打印 NotImplemented 提示(不崩溃、不进事件流不投递)。"""
+    for entry in faces.get(key) or []:
+        name = entry.get('name', '(unnamed)') if isinstance(entry, dict) else str(entry)
+        print(f'WATCHD-STUB face={key} watch={name}: NotImplemented — '
+              f'patch 位={plan_ref}(OF-006 分期留位,本票不实现不崩溃)')
+
+
+# ---------- 事件出口: stdout / session-send / owner 失联→alerts ----------
+
+def event_line(ev):
+    return f"{ev['type']} watch={ev['watch']} face={ev['face']} {ev['detail']}"
+
+
+def append_alert(alerts_path, obj):
+    os.makedirs(os.path.dirname(alerts_path), exist_ok=True)
+    with open(alerts_path, 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps(obj, ensure_ascii=False) + '\n')
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def deliver(cfg, ev, alerts_path):
+    line = event_line(ev)
+    print(f'WATCHD-EVENT {line}')
+    if cfg.get('notify') != 'session-send':
+        return
+    owner = cfg.get('owner') or {}
+    to = owner.get('to')
+    if not to:
+        append_alert(alerts_path, {'ts': datetime.now(timezone.utc).isoformat(),
+                                   'event': ev['type'], 'watch': ev['watch'],
+                                   'error': 'config: notify=session-send but owner.to missing'})
+        return
+    frm = owner.get('from', 'watchd')
+    try:
+        r = subprocess.run([SESSION_SEND, frm, to, 'report', ev['watch'], line[:4000]],
+                           capture_output=True, text=True, timeout=60)
+        ok = r.returncode == 0
+        err = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout) else ''
+    except subprocess.TimeoutExpired:
+        ok, err = False, 'session-send timeout'
+    except OSError as e:
+        ok, err = False, f'session-send exec: {e}'
+    if not ok:
+        # 升级终点(§6 非目标): owner 失联 → 用户可见告警面,只此一层
+        print(f'WATCHD-WARN owner unreachable — alert appended: {err[:120]}')
+        append_alert(alerts_path, {'ts': datetime.now(timezone.utc).isoformat(),
+                                   'event': ev['type'], 'watch': ev['watch'],
+                                   'error': 'owner unreachable',
+                                   'detail': line[:4000], 'cause': err[:200]})
+
+
+# ---------- 主循环 ----------
+
+def main():
+    cfg_path, once = parse_args(sys.argv[1:])
+    try:
+        with open(cfg_path) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as e:
+        die(f'cannot load config {cfg_path}: {e}')
+
+    state_dir = os.environ.get('WATCHD_STATE_DIR', os.path.join(MAESTRO, 'state', 'watch'))
+    alerts_path = os.environ.get('WATCHD_ALERTS', os.path.join(MAESTRO, 'state', 'alerts.log'))
+    interval = float(cfg.get('interval', 5))
+    max_rounds = int(cfg.get('max_rounds', 0))
+    effective_limit = max_rounds if max_rounds > 0 else None
+    faces = cfg.get('faces') or {}
+    state_path = os.path.join(state_dir, os.path.basename(cfg_path) + '.state.json')
+    state = load_state(state_path)
+
+    # 单实例锁(flock;进程退出自动释放,无残留)
+    os.makedirs(state_dir, exist_ok=True)
+    lock_path = os.path.join(state_dir, 'watchd.lock')
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = os.pread(lock_fd, 512, 0).decode(errors='replace').strip()
+        die(f'instance lock held by {holder or "another watchd"} — refusing second instance '
+            f'(lock: {lock_path})', 3)
+    os.pwrite(lock_fd, f'pid={os.getpid()} cfg={os.path.abspath(cfg_path)} '
+                       f'ts={int(time.time())}\n'.encode(), 0)
+    os.ftruncate(lock_fd, 512)
+
+    def on_signal(signum, _frame):
+        STOP['flag'] = True
+        STOP['signal'] = signal.Signals(signum).name
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    rnd = 0
+    print(f'WATCHD-START pid={os.getpid()} cfg={os.path.abspath(cfg_path)} '
+          f'interval={interval}s max_rounds={max_rounds or "∞"} once={int(once)}')
+    while True:
+        rnd += 1
+        events = []
+        alive_targets = 0
+        for entry in faces.get('file') or []:
+            scan_file_face(entry, state, events)
+        for entry in faces.get('process') or []:
+            if scan_process_face(entry, state['latch'], events):
+                alive_targets += 1
+        scan_stub_faces(faces, 'sla', 'OF-005 tickets ttl')
+        scan_stub_faces(faces, 'lease', 'OF-002 fleet lease')
+        for ev in events:
+            deliver(cfg, ev, alerts_path)
+        save_state(state_path, state)
+        if STOP['flag']:
+            print(f"WATCHD-SHUTDOWN signal={STOP['signal']} round={rnd} state={state_path}")
+            return 0
+        if once:
+            print(f'WATCHD-DONE rounds=1 events={len(events)} state={state_path}')
+            return 0
+        # 自续期: 到期边界有活动(事件/存活目标)→顺延;无活动→退场(D-09 ②)
+        if effective_limit is not None and rnd >= effective_limit:
+            if events or alive_targets:
+                effective_limit += max_rounds
+                print(f'WATCHD-RENEW round={rnd} new_limit={effective_limit} '
+                      f'reason=activity(events={len(events)} alive={alive_targets})')
+            else:
+                print(f'WATCHD-EXIT reason=max-rounds-reached round={rnd}')
+                return 0
+        # 分片 sleep: 信号到达 ≤0.5s 内打断,不拖整 interval
+        slept = 0.0
+        while slept < interval and not STOP['flag']:
+            step = min(0.5, interval - slept)
+            time.sleep(step)
+            slept += step
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

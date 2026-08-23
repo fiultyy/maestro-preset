@@ -3,7 +3,7 @@
 > 与 handoff-orch-gen2.md 互补:gen2 是 zap 时代 orca-run 形态;本文是 **terminal-send 直派 + 桥回调** 形态,
 > 首次全链实证于 dsh-lark 项目(2026-08-17,larkbiz-001 派发 + v4 票制)。
 
-## 全链(七步)
+## 全链(八步,2026-08-23 嵌 checkpoint)
 
 ```
 1 arm      bridge_arm{alias} + bridge_http_status;签名落笔 maestro/bridge/orch.signature
@@ -14,7 +14,39 @@
 6 done     核验报告文件与 done body 一致 → bin/verify-report(待建)抽查 ≥2 项 B 证据(重跑单测/grep 用例)
            → ledger review pass|fail|rework → tickets.md 票打 ☑/打回(-R1 新 ref)
 7 wave     下一波;波次批准时全部票先建 ledger pending 节点(消 ticket↔ledger 双账)
+8 checkpoint 回合收尾:bin/wave-checkpoint --wave <W> --notes "..." → state/wave-checkpoints.jsonl
+           单行 JSON {round,ts,wave,tickets:[{id,state}],git:{head},env:{dais,orca},notes};
+           原子追加(O_APPEND+单 write+fsync);round 从上一行读(首行=1);跳号仅 WARN 不阻断
 ```
+
+## 断点续传(OF-007,新编排者会话重建波次视图)
+
+```bash
+bin/wave-checkpoint --tail 1
+bin/wave-checkpoint --tail 1 | jq '{round, wave, head: .git.head, tickets: [.tickets[] | {(.id): .state}] | add}'
+```
+
+末 1 行即含 id/state/git head 三字段,可直接重建波次视图;文件不存在 → stderr 提示 exit 1
+(视为新编排域,首条 round=1)。tickets 面读 `MAESTRO_LEDGER` 指向库,无 tickets 表旧库 → 空集容错(OF-005 同模式)。
+
+## 控制消息两段式(OF-003,编排环契约增量)
+
+> steer 面的细化契约(OF-002 闸放行之后的收方义务);派发任务的 ack/done 契约(第 5 步)不变。
+
+```
+控制消息两段式(two-phase steer,OF-003):
+steer 发出后,收方回合首动作 = `session-send <self> <from> ack <ref> 'steer-accepted'`(已读将执行)
+或 `session-send <self> <from> nack <ref> 'busy:queued'`(正忙: 消息保留、入列,下回合首处理)。
+nack busy 语义钉死 = 不丢不重: 消息由收方回合队列持有,下回合首先处理;同 msgid(OF-001 信封)
+重复投递由 bin/msg-dedup 在去重窗口拦截(exit 3),收方零重复执行。类型复用现有 ack/nack,不新增。
+无契约旧 peer: 发送方零阻塞——不等待 ack/nack,发送即返回;未回 ack 不构成失败,不重发、不升级,
+沿用"机械核查为仲裁"原则(回调逾期才触发人工核查)。
+```
+
+补充: ①收方 `<self>`/`<from>` 用 fleet 短码或完整 sessionId 皆可(session-send 双兼容);
+②steer 本身受 OF-002 属主租约闸保护——非属主 steer 在**发送侧**即被拒(exit 4 +
+fleet-conflicts.jsonl 落冲突行),两段式契约只处理"闸已放行"的消息;
+③派发模板(bin/dispatch-ticket 生成的 prompt 头部)自动携带本契约。
 
 ## Artifact 路径表
 
@@ -67,6 +99,30 @@
 
 **ledger 事件纪律**: 只落真信号(dispatched / ack / done / ask / 带产物证据的阶段迁移,
 如"排查转入修复,工作区出现 model.rs 改动"),不落逐轮 progress 噪音。
+
+## relay→watchd 迁移指南(OF-006,2026-08-23)
+
+> relay 的"轮询文件→回报事件"职责已泛化为 `bin/event-watchd`(回合制外常驻守护,
+> 治 D-09:VO-007 挂死 2h 零告警 + relay 固定寿命手工 re-arm)。本票分期:①文件面+②进程面
+> 已可用;③SLA 面(patch 位=OF-005)/④租约面(patch 位=OF-002)留位 NotImplemented。
+
+迁移三步(relay 面改 watchd,零代码):
+
+1. **文件面平移**:relay 现行 glob 面改写成 watch.json 的 `faces.file` 条目
+   (`{"name": "<旧 relay 名>", "glob": "<同一路径>"}`);首轮基线不报、位点推进、
+   同内容重放零回声——语义与 OF-001 base 推进同源,旧 relay 的回报幂等口径不变。
+2. **值守投递**:`notify: "session-send"` + `owner: {from: "watchd", "to": "<orch 码>"}`,
+   事件即 DSHMSG report(信封 v2,自带 msgid 可去重);投递失败(owner 失联)自动升级
+   `state/alerts.log` 落行——替代 relay 的"回报失败无人知"。
+3. **起停**:`nohup ~/.dsh/maestro/bin/event-watchd --config watch.json &`;
+   单实例 flock(后起 exit 3);SIGTERM/SIGINT 优雅退出;`--max-rounds N` 到期边界
+   有活动(事件/存活目标)自续期,替代 60 轮寿命手工 re-arm。
+
+进程面可直接新增(无需等 relay):worker/pytest 级长任务给 `faces.process` 条目
+(pid 或 pattern + cpu_max + stale_min + log 路径),低 CPU 且日志陈旧双条件命中
+→ process-hung 事件直达 owner(单条件不误报)。
+
+自测:`python3 tests/of006-selftest.py`(27 项,全 temp 域零真实投递)。
 
 ## 纪律
 

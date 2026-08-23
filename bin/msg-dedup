@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""msg-dedup — 收方回合首动作去重助手(OF-001,信封 v2)
+
+用法: msg-dedup '<DSHMSG]{...} 行'      # 整行信封,按 ']' 切一刀解析 from/to/msgid
+      msg-dedup <from> <msgid> <to>     # 直接三元组(to=去重窗口码/fleet 码)
+
+语义: 查 state/dedup/<to>.jsonl 去重窗口——
+  60s 内 (from,msgid) 已见过 → exit 3(重复,收方丢弃);
+  新消息 → 记录一行 {"from","msgid","ts"} 后 exit 0(放行);
+  信封无 msgid(v2 前老信封) → exit 0 不记录(无键不可判重,不误伤)。
+GC:   窗口文件 >1000 行 → 截半(保留最近 len//2 行,重写走 temp+rename)。
+
+环境: MAESTRO_STATE(默认 ~/.dsh/maestro/state;目录自动创建)
+"""
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+
+WINDOW_MS = 60_000
+GC_MAX_LINES = 1000
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f'msg-dedup: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    if len(argv) == 1:
+        line = argv[0]
+        try:
+            head, _, rest = line.partition(']')
+            env = json.loads(rest)
+        except ValueError:
+            die(f'unparsable DSHMSG line: {line[:60]!r}')
+        frm, to = env.get('from'), env.get('to')
+        msgid = env.get('msgid')
+        if not frm or not to:
+            die('envelope missing from/to')
+        return frm, msgid, to
+    if len(argv) == 3:
+        return argv[0], argv[1], argv[2]
+    print(__doc__, file=sys.stderr)
+    sys.exit(2)
+
+
+def window_path(to: str, state_dir: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', to)
+    return os.path.join(state_dir, 'dedup', safe + '.jsonl')
+
+
+def load_lines(path: str) -> list:
+    rows = []
+    try:
+        with open(path, encoding='utf-8') as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rows.append(json.loads(raw))
+                except ValueError:
+                    continue  # 崩溃半写行:跳过不致命
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def write_all(path: str, rows: list) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.dedup-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            for r in rows:
+                fh.write(json.dumps(r, ensure_ascii=False) + '\n')
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main() -> None:
+    frm, msgid, to = parse_args(sys.argv[1:])
+    if not msgid:
+        print('msg-dedup: no msgid (pre-v2 envelope) — pass')
+        sys.exit(0)
+    state_dir = os.environ.get('MAESTRO_STATE', os.path.expanduser('~/.dsh/maestro/state'))
+    path = window_path(to, state_dir)
+    now = int(time.time() * 1000)
+    rows = load_lines(path)
+    if len(rows) > GC_MAX_LINES:
+        rows = rows[-(len(rows) // 2):]
+        rewrite = True
+    else:
+        rewrite = False
+    for r in rows:
+        if r.get('from') == frm and r.get('msgid') == msgid \
+                and now - int(r.get('ts', 0)) <= WINDOW_MS:
+            age = now - int(r.get('ts', 0))
+            print(f'msg-dedup: DUPLICATE from={frm} msgid={msgid} age={age}ms '
+                  f'(window {WINDOW_MS}ms) — drop', file=sys.stderr)
+            sys.exit(3)
+    rows.append({'from': frm, 'msgid': msgid, 'ts': now})
+    if rewrite:
+        write_all(path, rows)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(rows[-1], ensure_ascii=False) + '\n')
+            fh.flush()
+            os.fsync(fh.fileno())
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

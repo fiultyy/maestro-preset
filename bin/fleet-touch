@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""fleet-touch — 舰队心跳: 原子更新 fleet.json 条目 lastSeenAt(+可选 status)(ticket SI-001)
+"""fleet-touch — 舰队心跳与属主租约: 原子更新 fleet.json 条目(SI-001 + OF-002)
 
 用法:
-  fleet-touch <termid|code> [--status <新状态>] [--fleet <fleet.json 路径>]
+  fleet-touch <termid|code> [--status <新状态>] [--fleet <fleet.json 路径>]     # 心跳(SI-001 原路径)
+  fleet-touch claim <code> --owner <sid> --ttl-min N [--fleet <路径>]           # OF-002: 取属主租约
+  fleet-touch heartbeat <code> [--ttl-min N] [--fleet <路径>]                   # OF-002: 续期(默认沿用 claim ttl)
+  fleet-touch release <code> [--fleet <路径>]                                   # OF-002: 释放租约(幂等)
+  fleet-touch sweep [--days N] [--apply] [--fleet <路径>]                       # OF-002: 陈旧 active→retired(D-07)
   fleet-touch --selftest                     # 内置自测(temp 副本,不动真实 fleet.json)
 
 机制:
   - <termid|code>: fleet.fleet 的键 —— 短码(如 28c9)或 orca 终端 handle(如 term_…)
   - lastSeenAt 更新为当前 UTC ISO 8601;--status 同时更新 status;其余字段原样保留
+  - 租约(OF-002): claim 写 owner/leaseExpiresAt/heartbeatAt(+辅键 leaseTtlMin 供续期);
+    他人有效租约在身时 claim 被拒(exit 1),过期可接管;heartbeat 无租约 → exit 1;
+    release 清四键(幂等)。session-send 的 steer 闸据 owner 拒第三方 steer。
+  - sweep: status=active 且 lastSeenAt/heartbeatAt 较新者陈旧 >--days 天(默认 7)→ 候选;
+    --dry-run 为默认(零写入),--apply 才改 status=retired;两时间戳皆缺的条目保守跳过。
   - 原子性: 全部校验通过后才落盘;写 = 同目录临时文件 + os.replace;
+    所有写动作(touch/claim/heartbeat/release/sweep --apply)经 flock
+    ($MAESTRO_STATE/<basename>.lock,稳定 inode)串行 读-改-写,并发双写不丢失不撕裂;
     任何失败(键不存在 / JSON 损坏 / 结构异常)都不写、不留半写文件、不留临时文件
-  - 用途: 编排者在每次 ack/done 回调回合调用,廉价标记成员活着(orch-loop 债 #6)
+  - 用途: 编排者在每次 ack/done 回程 touch 廉价标记成员活着(orch-loop 债 #6);
+    GM/workflow 用 claim-heartbeat-release 持租约;sweep 收 D-07 存量
 
-环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json);
-      --fleet 显式覆盖优先于环境变量。
-退出码: 0 = 成功 · 1 = 未知键 · 3 = fleet.json 缺失/损坏 · 2 = 用法错
+环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)
+      MAESTRO_STATE(默认 ~/.dsh/maestro/state;flock 锁文件落此,gitignored)
+      MAESTRO_TESTDATA(selftest fixture);--fleet 显式覆盖优先于环境变量。
+退出码: 0 = 成功 · 1 = 未知键/租约冲突/无租约可续 · 3 = fleet.json 缺失/损坏 · 2 = 用法错
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -24,7 +38,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
 FLEET_DEFAULT = os.environ.get('MAESTRO_FLEET') or os.path.join(HOME, 'maestro', 'fleet.json')
@@ -38,8 +53,8 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def now_iso(dt=None):
+    return (dt or datetime.now(timezone.utc)).isoformat(timespec='seconds')
 
 
 def load(path):
@@ -72,16 +87,187 @@ def save_atomic(path, data):
 
 
 def touch(key, status, path):
-    data = load(path)
-    entry = data['fleet'].get(key)
-    if not isinstance(entry, dict):
-        die(f'unknown fleet entry: {key}(不在 {path} 的 fleet 表中,未做任何写入)', 1)
-    entry['lastSeenAt'] = now_iso()
-    if status:
-        entry['status'] = status
-    save_atomic(path, data)
+    with fleet_lock(path):
+        data = load(path)
+        entry = data['fleet'].get(key)
+        if not isinstance(entry, dict):
+            die(f'unknown fleet entry: {key}(不在 {path} 的 fleet 表中,未做任何写入)', 1)
+        entry['lastSeenAt'] = now_iso()
+        if status:
+            entry['status'] = status
+        save_atomic(path, data)
     suffix = f' status={status}' if status else ' status unchanged'
     print(f'touched {key}: lastSeenAt={entry["lastSeenAt"]}{suffix}')
+
+
+# ---------- lease & sweep (OF-002) ----------
+
+LEASE_KEYS = ('owner', 'leaseExpiresAt', 'heartbeatAt', 'leaseTtlMin')
+
+
+@contextmanager
+def fleet_lock(path):
+    """写路径互斥(flock): touch/claim/heartbeat/release/sweep --apply 的 读-改-写 全程串行,
+    并发双写不丢失更新(temp+rename 只保证单次写原子,flock 保证读-改-写原子)。
+    锁文件 = $MAESTRO_STATE/<fleet basename>.lock —— 独立 inode 不随 os.replace 换代,
+    落 gitignored state/ 目录;对既有调用方零行为影响。"""
+    state = os.environ.get('MAESTRO_STATE') or os.path.join(HOME, 'maestro', 'state')
+    os.makedirs(state, exist_ok=True)
+    lock_path = os.path.join(state, os.path.basename(os.path.abspath(path)) + '.lock')
+    fh = open(lock_path, 'a+', encoding='utf-8')
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def parse_iso(val):
+    """fleet 时间戳(ISO 8601,容忍 Z;naive 视作 UTC);缺/坏 → None。"""
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def get_entry(data, key):
+    entry = data['fleet'].get(key)
+    if not isinstance(entry, dict):
+        die(f'unknown fleet entry: {key}(不在 fleet 表中,未做任何写入)', 1)
+    return entry
+
+
+def lease_alive(entry, now=None):
+    """有效租约 = owner 在且 leaseExpiresAt 未过(时间戳缺/坏视为过期,fail-open)。"""
+    exp = parse_iso(entry.get('leaseExpiresAt'))
+    return bool(entry.get('owner') and exp and exp > (now or datetime.now(timezone.utc)))
+
+
+def cmd_claim(key, owner, ttl_min, path):
+    if ttl_min <= 0:
+        die(f'--ttl-min must be > 0 (got {ttl_min})', 2)
+    with fleet_lock(path):
+        data = load(path)
+        entry = get_entry(data, key)
+        now = datetime.now(timezone.utc)
+        cur = entry.get('owner')
+        if cur and cur != owner and lease_alive(entry, now):
+            die(f'lease conflict: {key} held by {cur} until {entry["leaseExpiresAt"]}'
+                '(有效租约在身,claim 被拒;先 release 或待过期接管)', 1)
+        entry['owner'] = owner
+        entry['leaseTtlMin'] = ttl_min
+        entry['leaseExpiresAt'] = now_iso(now + timedelta(minutes=ttl_min))
+        entry['heartbeatAt'] = now_iso(now)
+        save_atomic(path, data)
+    print(f'claimed {key}: owner={owner} ttl={ttl_min}min leaseExpiresAt={entry["leaseExpiresAt"]}')
+
+
+def cmd_heartbeat(key, ttl_min, path):
+    with fleet_lock(path):
+        data = load(path)
+        entry = get_entry(data, key)
+        owner = entry.get('owner')
+        if not owner:
+            die(f'no lease on {key}(heartbeat 需先 claim)', 1)
+        ttl = ttl_min if ttl_min is not None else entry.get('leaseTtlMin')
+        if not ttl or int(ttl) <= 0:
+            die('heartbeat: 无 --ttl-min 且条目无 leaseTtlMin — 显式给 --ttl-min', 2)
+        ttl = int(ttl)
+        now = datetime.now(timezone.utc)
+        entry['leaseTtlMin'] = ttl
+        entry['leaseExpiresAt'] = now_iso(now + timedelta(minutes=ttl))
+        entry['heartbeatAt'] = now_iso(now)
+        save_atomic(path, data)
+    print(f'heartbeat {key}: owner={owner} renewed ttl={ttl}min leaseExpiresAt={entry["leaseExpiresAt"]}')
+
+
+def cmd_release(key, path):
+    with fleet_lock(path):
+        data = load(path)
+        entry = get_entry(data, key)
+        cleared = [k for k in LEASE_KEYS if k in entry]
+        for k in cleared:
+            del entry[k]
+        if cleared:
+            save_atomic(path, data)
+    detail = f'cleared {cleared}' if cleared else 'no lease (nothing to clear)'
+    print(f'released {key}: {detail}')
+
+
+def cmd_sweep(path, days, apply):
+    if days <= 0:
+        die(f'--days must be > 0 (got {days})', 2)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    stale = []
+
+    def scan(data):
+        for key in sorted(data['fleet']):
+            ent = data['fleet'][key]
+            if not isinstance(ent, dict) or ent.get('status') != 'active':
+                continue
+            marks = [(parse_iso(ent.get(f)), f) for f in ('lastSeenAt', 'heartbeatAt')]
+            marks = [(t, f) for t, f in marks if t is not None]
+            if not marks:
+                continue  # 两时间戳皆缺: 无法判定,保守跳过
+            freshest_t, freshest_f = max(marks)
+            if freshest_t < cutoff:
+                stale.append((key, freshest_t, freshest_f, ent.get(freshest_f)))
+
+    if apply:
+        with fleet_lock(path):
+            data = load(path)
+            scan(data)
+            for key, _, _, _ in stale:
+                data['fleet'][key]['status'] = 'retired'
+            if stale:
+                save_atomic(path, data)
+        for key, t, f, raw in stale:
+            age = (datetime.now(timezone.utc) - t).total_seconds() / 86400
+            print(f'sweep[apply]: {key} stale={age:.1f}d freshest={f}={raw} -> retired')
+        unit = 'entry' if len(stale) == 1 else 'entries'
+        print(f'sweep[apply]: retired {len(stale)} {unit} (status active only, > {days}d)')
+    else:
+        scan(load(path))
+        for key, t, f, raw in stale:
+            age = (datetime.now(timezone.utc) - t).total_seconds() / 86400
+            print(f'sweep[dry-run]: {key} stale={age:.1f}d freshest={f}={raw} -> would retire')
+        unit = 'candidate' if len(stale) == 1 else 'candidates'
+        print(f'sweep[dry-run]: {len(stale)} {unit} (status active only, > {days}d) — 零写入,--apply 才动真')
+
+
+def sub_main(argv):
+    ap = argparse.ArgumentParser(prog='fleet-touch', description='fleet lease & sweep (OF-002)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('claim', help='取属主租约: 写 owner/leaseExpiresAt/heartbeatAt(+leaseTtlMin)')
+    p.add_argument('key', help='fleet 键(短码/终端 handle)')
+    p.add_argument('--owner', required=True, help='属主标识(fleet 短码,如 of002)')
+    p.add_argument('--ttl-min', type=int, required=True, help='租约时长(分钟,>0)')
+    p.add_argument('--fleet', default=None)
+    p = sub.add_parser('heartbeat', help='续期: leaseExpiresAt=now+ttl(默认沿用 claim 时 ttl)')
+    p.add_argument('key')
+    p.add_argument('--ttl-min', type=int, default=None, help='覆盖 ttl(缺省用 leaseTtlMin)')
+    p.add_argument('--fleet', default=None)
+    p = sub.add_parser('release', help='释放: 清租约四键(幂等,无租约也 rc0)')
+    p.add_argument('key')
+    p.add_argument('--fleet', default=None)
+    p = sub.add_parser('sweep', help='D-07 存量清理: 陈旧 active -> retired(默认 dry-run 零写入)')
+    p.add_argument('--days', type=int, default=7, help='陈旧阈值天数(默认 7)')
+    p.add_argument('--apply', action='store_true', help='真写入(缺省 dry-run)')
+    p.add_argument('--fleet', default=None)
+    a = ap.parse_args(argv)
+    path = a.fleet or FLEET_DEFAULT
+    if a.cmd == 'claim':
+        cmd_claim(a.key, a.owner, a.ttl_min, path)
+    elif a.cmd == 'heartbeat':
+        cmd_heartbeat(a.key, a.ttl_min, path)
+    elif a.cmd == 'release':
+        cmd_release(a.key, path)
+    else:
+        cmd_sweep(path, a.days, a.apply)
 
 
 # ---------- selftest ----------
@@ -203,13 +389,17 @@ def selftest():
 
 
 def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ('claim', 'heartbeat', 'release', 'sweep'):
+        sub_main(argv)
+        return
     ap = argparse.ArgumentParser(add_help=True, description='fleet heartbeat touch (ticket SI-001)')
     ap.add_argument('key', nargs='?', help='fleet 键: 短码(如 28c9)或终端 handle(如 term_…)')
     ap.add_argument('--status', default=None, help='可选: 同时更新 status')
     ap.add_argument('--fleet', default=None,
                     help='fleet.json 路径(默认 $MAESTRO_FLEET 或 ~/.dsh/maestro/fleet.json)')
     ap.add_argument('--selftest', action='store_true', help='内置自测(temp 副本,不动真实 fleet.json)')
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.selftest:
         sys.exit(selftest())
     if not a.key:

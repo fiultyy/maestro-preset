@@ -5,10 +5,17 @@
 #   ledger event  <project> <node_id> <type> <detail> [--source X]
 #   ledger review <project> <node_id> <pass|fail|rework> <note>      # 审查收口: node→reviewed-* + event
 #   ledger status [project]                                           # 节点+近事件一览
-#   ledger project <path> <name> [--repo-id X]                        # upsert project
-# project 参数: 仓库绝对路径或 projects.key;路径自动解析为 key,查无则报错(先 project 登记)。
-import argparse, json, os, sqlite3, sys, tempfile
-from datetime import datetime, timezone
+#   ledger ticket add <ticket_id> <title> [--deps '["OF-001"]'] [--refs '{"worktree":"/wt","run":"/run","session":"s1","verify":"/path/spec"}'] [--outcome X]
+#   ledger ticket state <ticket_id> <new_state> [--force] [--note X]   # 状态机迁移;迁入 running/done 前 deps 须 done(--force 旁路并 journal)
+#   ledger ticket dep <ticket_id> <dep_id> [--rm]                      # 依赖边(自依赖/成环拒绝;dep 可指向未入库票,视为未 done)
+#   ledger ticket lease <ticket_id> [owner] [--release]                # 认领/释放租约
+#   ledger ticket list [--state X] [--since 24h] [--json]              # 回溯查询(since: <N>h|<N>d|<N>=小时)
+#   ledger ticket render [-o <path>]                                   # v4 兼容票板渲染(缺省 <maestro>/tickets.md;手写内容保留于 <!-- hand --> 区;幂等)
+# ticket 状态机: dispatched→running→blocked→done→merged,终态另含 rejected/rolled-back;非法迁移拒绝。
+# ticket 写路径一律 flock(<db>.lock) 串行,事件追加 ticket_events(append-only);读路径不建 schema 不落锁。
+import argparse, fcntl, json, os, re, sqlite3, sys, tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
 
 DB = os.environ.get('MAESTRO_LEDGER', os.path.expanduser('~/.dsh/maestro/ledger.db'))
 
@@ -75,6 +82,336 @@ def cmd_status(a):
             for e in c.execute("SELECT node_id,event_type,source,substr(detail,1,80) d,ts FROM events WHERE project_key=? ORDER BY id DESC LIMIT 5", (k,)):
                 print(f"  · [{e['ts'][5:16]}] {e['node_id']} {e['event_type']}({e['source']}): {e['d']}")
 
+# ── OF-005 tickets:票据 DAG 数据化 ─────────────────────────────────────────────
+# 写路径 flock(<db>.lock) 串行;读路径容忍缺表(不建 schema 不落锁);既有 node/event/review/status/project 行为零变化。
+
+DEFAULT_TICKETS_MD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tickets.md')
+TICKET_STATES = ['dispatched', 'running', 'blocked', 'done', 'merged', 'rejected', 'rolled-back']
+TICKET_TRANSITIONS = {  # 合法迁移表;不在表内即非法,拒绝
+    'dispatched':  {'running', 'rejected'},
+    'running':     {'blocked', 'done', 'rejected'},
+    'blocked':     {'running', 'done', 'rejected'},
+    'done':        {'running', 'merged', 'rejected'},
+    'merged':      {'rolled-back'},
+    'rejected':    set(),
+    'rolled-back': set(),
+}
+TICKET_SYMBOL = {s: '☐' for s in ('dispatched',)}
+TICKET_SYMBOL.update({s: '◐' for s in ('running', 'blocked')})
+TICKET_SYMBOL.update({s: '☑' for s in ('done', 'merged', 'rejected', 'rolled-back')})
+DEP_SAT = {'done', 'merged'}           # 前置视为就绪(merged 隐含曾过 done)
+DEP_GATED_TARGETS = {'running', 'done'}  # 迁入这些状态须 deps 就绪;reject/rolled-back 永不设门
+HAND_OPEN, HAND_CLOSE = '<!-- hand -->', '<!-- /hand -->'
+TICKET_TERMINAL = {'done', 'merged', 'rejected', 'rolled-back'}  # 终态=投影触发面(OF-010)
+
+# ── OF-010 tickets→longtask 单向投影(通道 b:文件承接件,仿 ledger-carryover Checkpoints 形制) ──
+# 方向钉死:maestro 为源,longtask 为渲染视图;承接件只追加、maestro 永不读回(⑤);
+# 无活跃 longtask → 静默跳过零副作用(③);投影失败不阻塞主迁移(WARN+journal+pending 补投,②)。
+
+def _lt_root():
+    return os.path.dirname(os.path.abspath(DB))
+
+def _lt_paths():
+    carry = os.environ.get('MAESTRO_LONGTASK_CARRYOVER') or os.path.join(_lt_root(), 'state', 'longtask-carryover.md')
+    return carry
+
+def longtask_active():
+    """活跃 longtask 会话判定:env MAESTRO_LONGTASK_SESSION 或 <root>/state/longtask-session 标记文件。"""
+    if os.environ.get('MAESTRO_LONGTASK_SESSION'):
+        return True
+    try:
+        return os.path.getsize(os.path.join(_lt_root(), 'state', 'longtask-session')) > 0
+    except OSError:
+        return False
+
+CARRYOVER_HEADER = """# longtask carryover(OF-010 单向投影 · maestro→longtask)
+
+> 形制仿 ledger-carryover Checkpoints(陈述+verifiedBy)。maestro 只追加、永不读回;
+> 恢复/resume 时由 longtask 侧会话或人工读取渲染。方向钉死:不反向同步、不改 Objective/goal 本体。
+
+## Checkpoints
+
+| # | 陈述 | verifiedBy |
+|---|---|---|
+"""
+
+def _carry_line(seq, p):
+    if p['kind'] == 'ticket-final':
+        stmt = f"{p['tid']} 已收口(state={p['state']})"
+        vb = p['tid']
+    else:
+        tix = '; '.join(f"{t['id']}={t['state']}" for t in p['tickets']) or '(无在册票)'
+        stmt = f"wave={p['wave']} round={p['round']} 票态: {tix}"
+        vb = f"wave-checkpoint round={p['round']}"
+    return f"| {seq} | {stmt} | {vb} |\n"
+
+def _carry_append(lines):
+    path = _lt_paths()
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fresh = not os.path.exists(path) or os.path.getsize(path) == 0
+    data = ((CARRYOVER_HEADER if fresh else '') + ''.join(lines)).encode('utf-8')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def deliver_projection(payload):
+    """投影一次(wave-checkpoint 复用)。永不 raise、永不打印 stdout;失败=WARN(stderr)+pending 补投。
+    序号=已成功投影 journal 行数(DB 为源,不读承接件)。"""
+    if not longtask_active():
+        return  # 静默跳过(③):不建文件、不落锁、零输出
+    try:
+        with ticket_db_write() as c:
+            seq0 = c.execute("SELECT COUNT(*) n FROM ticket_events WHERE event_type='projected'").fetchone()['n']
+            pend = c.execute("SELECT id,payload FROM ticket_projection_pending ORDER BY id").fetchall()
+            lines, seq = [], seq0
+            for r in pend:
+                seq += 1
+                lines.append(_carry_line(seq, json.loads(r['payload'])))
+            seq += 1
+            lines.append(_carry_line(seq, payload))
+            _carry_append(lines)                       # 原子追加(单 write+fsync)
+            c.execute("DELETE FROM ticket_projection_pending")
+            for i, r in enumerate(pend):
+                p = json.loads(r['payload'])
+                ticket_ev(c, p.get('tid', '-'), 'projected', 'of010', f"补投 seq={seq0 + i + 1}")
+            ticket_ev(c, payload.get('tid', '-'), 'projected', 'of010', f"投影 seq={seq}")
+    except OSError as e:
+        print(f'ledger: WARN 投影失败(不阻塞主流程,待补投): {e}', file=sys.stderr)
+        try:
+            with ticket_db_write() as c:
+                c.execute("INSERT INTO ticket_projection_pending(ts,payload) VALUES(?,?)",
+                          (now(), json.dumps(payload, ensure_ascii=False)))
+                if payload.get('tid'):
+                    ticket_ev(c, payload['tid'], 'project-warn', 'of010', f'承接件拒写: {e}')
+        except Exception as e2:
+            print(f'ledger: WARN pending 落库亦失败(放弃本次投影): {e2}', file=sys.stderr)
+
+def ensure_ticket_schema(c):
+    c.executescript("""
+      CREATE TABLE IF NOT EXISTS tickets(
+        ticket_id   TEXT PRIMARY KEY,
+        title       TEXT NOT NULL,
+        state       TEXT NOT NULL DEFAULT 'dispatched',
+        deps        TEXT NOT NULL DEFAULT '[]',
+        lease_owner TEXT,
+        refs        TEXT NOT NULL DEFAULT '{}',
+        outcome     TEXT,
+        updated_at  TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ticket_events(
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         TEXT NOT NULL,
+        ticket_id  TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        source     TEXT,
+        detail     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_ticket_events ON ticket_events(ticket_id, id);
+      CREATE TABLE IF NOT EXISTS ticket_projection_pending(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+    """)
+
+@contextmanager
+def ticket_db_write():
+    """串行写:flock(<db>.lock) 排他锁内开连接、建 schema、单事务提交——并发双进程不丢行不撕裂。"""
+    lock = os.path.abspath(DB) + '.lock'
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        c = sqlite3.connect(DB, timeout=30)
+        c.row_factory = sqlite3.Row
+        try:
+            ensure_ticket_schema(c)
+            with c:  # 异常(含 die 的 SystemExit)→回滚,锁与连接必释
+                yield c
+        finally:
+            c.close()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+def ticket_rows(state=None, since_cutoff=None):
+    """读路径:纯 SELECT,不建 schema、不落锁;tickets 表未初始化(旧库纯读)→空集。"""
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    try:
+        sql, params = "SELECT * FROM tickets", []
+        if state is not None: sql += " WHERE state=?"; params.append(state)
+        if since_cutoff is not None:
+            sql += " AND updated_at>=?" if state is not None else " WHERE updated_at>=?"
+            params.append(since_cutoff)
+        sql += " ORDER BY ticket_id"
+        return c.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        c.close()
+
+def ticket_ev(c, tid, etype, source, detail):
+    c.execute("INSERT INTO ticket_events(ts,ticket_id,event_type,source,detail) VALUES(?,?,?,?,?)",
+              (now(), tid, etype, source, detail))
+
+def get_ticket(c, tid):
+    row = c.execute("SELECT * FROM tickets WHERE ticket_id=?", (tid,)).fetchone()
+    if not row: die(f'ticket not found: {tid}')
+    return row
+
+def unmet_deps(c, deps):
+    out = []
+    for d in deps:
+        r = c.execute("SELECT state FROM tickets WHERE ticket_id=?", (d,)).fetchone()
+        if not r or r['state'] not in DEP_SAT: out.append(d)  # 未入库依赖票视为未 done
+    return out
+
+def parse_json_arg(raw, flag, want):
+    try: v = json.loads(raw)
+    except json.JSONDecodeError: die(f'{flag} 必须是合法 JSON')
+    if not isinstance(v, want): die(f"{flag} 必须是{'数组' if want is list else '对象'}")
+    return v
+
+def cmd_ticket_add(a):
+    deps = parse_json_arg(a.deps, '--deps', list)
+    refs = parse_json_arg(a.refs, '--refs', dict)
+    with ticket_db_write() as c:
+        if c.execute("SELECT 1 FROM tickets WHERE ticket_id=?", (a.ticket_id,)).fetchone():
+            die(f'ticket exists: {a.ticket_id}')
+        c.execute("INSERT INTO tickets(ticket_id,title,state,deps,lease_owner,refs,outcome,updated_at) VALUES(?,?,'dispatched',?,NULL,?,?,?)",
+                  (a.ticket_id, a.title, json.dumps(deps, ensure_ascii=False),
+                   json.dumps(refs, ensure_ascii=False), a.outcome, now()))
+        ticket_ev(c, a.ticket_id, 'added', a.source, f'dispatched title={a.title} deps={len(deps)}')
+    print(f'{a.ticket_id} +dispatched')
+
+def cmd_ticket_state(a):
+    with ticket_db_write() as c:
+        row = get_ticket(c, a.ticket_id)
+        cur = row['state']
+        legal = sorted(TICKET_TRANSITIONS.get(cur, set()))
+        if a.state not in legal:
+            die(f"illegal transition: {cur} -> {a.state} (legal: {', '.join(legal) or '无(终态)'})")
+        blocked = unmet_deps(c, json.loads(row['deps'])) if a.state in DEP_GATED_TARGETS else []
+        if blocked and not a.force:
+            die(f"deps 未就绪: {', '.join(blocked)} 非 done(--force 旁路)")
+        c.execute("UPDATE tickets SET state=?,updated_at=? WHERE ticket_id=?", (a.state, now(), a.ticket_id))
+        if blocked and a.force:
+            ticket_ev(c, a.ticket_id, 'deps-forced', a.source, f"force 放行未就绪 deps: {', '.join(blocked)}")
+        detail = f'{cur} -> {a.state}'
+        if a.note: detail += f' | {a.note}'
+        ticket_ev(c, a.ticket_id, 'state', a.source, detail)
+    print(f'{a.ticket_id} {cur} -> {a.state}' + (' (forced)' if blocked and a.force else ''))
+    if a.state in TICKET_TERMINAL:  # OF-010:终态单向投影(主迁移已提交;失败不阻塞)
+        deliver_projection({'kind': 'ticket-final', 'tid': a.ticket_id, 'state': a.state})
+
+def dep_reaches(c, src, target, _seen=None):
+    if src == target: return True
+    _seen = set() if _seen is None else _seen
+    if src in _seen: return False
+    _seen.add(src)
+    r = c.execute("SELECT deps FROM tickets WHERE ticket_id=?", (src,)).fetchone()
+    if not r: return False
+    return any(dep_reaches(c, d, target, _seen) for d in json.loads(r['deps']))
+
+def cmd_ticket_dep(a):
+    with ticket_db_write() as c:
+        row = get_ticket(c, a.ticket_id)
+        deps = json.loads(row['deps'])
+        if a.rm:
+            if a.dep_id not in deps: die(f'no such dep: {a.dep_id} @ {a.ticket_id}')
+            deps.remove(a.dep_id); detail = f'dep- {a.dep_id}'
+        else:
+            if a.dep_id == a.ticket_id: die('self-dep 拒绝')
+            if dep_reaches(c, a.dep_id, a.ticket_id):
+                die(f'环依赖拒绝: {a.dep_id} →…→ {a.ticket_id} → {a.dep_id}')
+            if a.dep_id in deps: die(f'dep exists: {a.dep_id} @ {a.ticket_id}')
+            deps.append(a.dep_id); detail = f'dep+ {a.dep_id}'
+        c.execute("UPDATE tickets SET deps=?,updated_at=? WHERE ticket_id=?",
+                  (json.dumps(deps, ensure_ascii=False), now(), a.ticket_id))
+        ticket_ev(c, a.ticket_id, 'dep', a.source, detail)
+    print(f'{a.ticket_id} {detail}')
+
+def cmd_ticket_lease(a):
+    if not a.release and not a.owner:
+        die('用法: ticket lease <ticket_id> <owner> | ticket lease <ticket_id> --release')
+    with ticket_db_write() as c:
+        get_ticket(c, a.ticket_id)
+        owner = None if a.release else a.owner
+        c.execute("UPDATE tickets SET lease_owner=?,updated_at=? WHERE ticket_id=?", (owner, now(), a.ticket_id))
+        ticket_ev(c, a.ticket_id, 'lease', a.source, f'lease_owner={owner or "-"}')
+    print(f'{a.ticket_id} lease_owner={owner or "-"}')
+
+def parse_since(raw):
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)(h|d)?', raw.strip())
+    if not m: die('--since 格式: <N>h|<N>d|<N>(小时),如 24h')
+    return float(m.group(1)) * (24.0 if m.group(2) == 'd' else 1.0)
+
+def cmd_ticket_list(a):
+    if a.state and a.state not in TICKET_STATES:
+        die(f"unknown state: {a.state} (合法: {', '.join(TICKET_STATES)})")
+    cutoff = None
+    if a.since is not None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=parse_since(a.since))).isoformat(timespec='seconds')
+    rows = ticket_rows(state=a.state, since_cutoff=cutoff)
+    if a.json:
+        print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)); return
+    for r in rows:
+        line = f"  {r['state']:<12} {r['ticket_id']:<14} {r['title']}"
+        deps = json.loads(r['deps'])
+        if deps: line += f"  deps:{','.join(deps)}"
+        if r['lease_owner']: line += f"  lease:{r['lease_owner']}"
+        print(line)
+    if not rows: print('  (无匹配票据)')
+
+def atomic_write(path, data):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.tickets-render-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+
+def cmd_ticket_render(a):
+    rows = ticket_rows()
+    states = {r['ticket_id']: r['state'] for r in rows}
+    hand = ''
+    if os.path.exists(a.out):
+        old = open(a.out, encoding='utf-8').read()
+        m = re.search(re.escape(HAND_OPEN) + r'\n(.*?)' + re.escape(HAND_CLOSE), old, re.S)
+        hand = m.group(1) if m else old  # 首次渲染:既有全文整体包进 hand 保留区
+    L = ['# maestro 票板(v4 渲染视图,autogenerated)', '',
+         f'> ⚠ **AUTOGENERATED** by `ledger ticket render` — 区外内容每次渲染覆写;手写内容只保留于文末 `{HAND_OPEN}` 保留区。',
+         '> 状态符号:☐ dispatched · ◐ running/blocked · ☑ done/merged/rejected/rolled-back。'
+         '数据源:`ledger.db` 表 `tickets`(OF-005;渲染幂等,重跑 `ledger ticket render`)。', '',
+         f'## 票据(数据面,{len(rows)} 张)', '']
+    if not rows: L.append('_(暂无票据)_')
+    for r in rows:
+        deps = json.loads(r['deps'])
+        refs = json.loads(r['refs'] or '{}')
+        dep_txt = ', '.join(f'{d}({states.get(d, "?")})' for d in deps) if deps else '无'
+        path_txt = ' · '.join(f'{k}={refs[k]}' for k in ('worktree', 'run', 'dispatch', 'session') if k in refs) or '—'
+        L.append(f"### {r['ticket_id']} {r['title']} {TICKET_SYMBOL[r['state']]}")
+        L.append('')
+        L.append(f"- **状态**: {r['state']}(updated {r['updated_at']}) · **依赖**: {dep_txt} · **lease**: {r['lease_owner'] or '—'}")
+        L.append(f'- **路径**: {path_txt}')
+        L.append(f"- **验证目标指针**: {refs.get('verify') or refs.get('report') or '—'}")
+        L.append(f"- **outcome**: {r['outcome'] or '—'}")
+        L.append('')
+    if hand and not hand.endswith('\n'): hand += '\n'
+    atomic_write(a.out, '\n'.join(L) + '\n' + HAND_OPEN + '\n' + hand + HAND_CLOSE + '\n')
+    print(f'render {len(rows)} tickets -> {a.out}')
+
 def main():
     ap = argparse.ArgumentParser(add_help=True, description='maestro ledger helper')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -84,6 +421,18 @@ def main():
     p = sub.add_parser('event'); p.add_argument('project'); p.add_argument('node_id'); p.add_argument('type'); p.add_argument('detail'); p.add_argument('--source', default='orch1'); p.set_defaults(f=cmd_event)
     p = sub.add_parser('review'); p.add_argument('project'); p.add_argument('node_id'); p.add_argument('verdict', choices=['pass','fail','rework']); p.add_argument('note'); p.set_defaults(f=cmd_review)
     p = sub.add_parser('status'); p.add_argument('project', nargs='?'); p.set_defaults(f=cmd_status)
+    p = sub.add_parser('ticket'); tsub = p.add_subparsers(dest='tcmd', required=True)
+    t = tsub.add_parser('add'); t.add_argument('ticket_id'); t.add_argument('title')
+    t.add_argument('--deps', default='[]'); t.add_argument('--refs', default='{}'); t.add_argument('--outcome')
+    t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_add)
+    t = tsub.add_parser('state'); t.add_argument('ticket_id'); t.add_argument('state', choices=TICKET_STATES)
+    t.add_argument('--force', action='store_true'); t.add_argument('--note'); t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_state)
+    t = tsub.add_parser('dep'); t.add_argument('ticket_id'); t.add_argument('dep_id')
+    t.add_argument('--rm', action='store_true'); t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_dep)
+    t = tsub.add_parser('lease'); t.add_argument('ticket_id'); t.add_argument('owner', nargs='?')
+    t.add_argument('--release', action='store_true'); t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_lease)
+    t = tsub.add_parser('list'); t.add_argument('--state'); t.add_argument('--since'); t.add_argument('--json', action='store_true'); t.set_defaults(f=cmd_ticket_list)
+    t = tsub.add_parser('render'); t.add_argument('-o', '--out', dest='out', default=DEFAULT_TICKETS_MD); t.set_defaults(f=cmd_ticket_render)
     a = ap.parse_args()
     if getattr(a, 'refs', None):
         try: json.loads(a.refs)
