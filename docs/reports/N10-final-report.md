@@ -19,6 +19,8 @@
 
 ## 2. live E2E 证据（本机 loopback，低负载窗口）
 
+> **完整证据链（含 grill 真实问答原文、session id、assistant 应答实录、roster JSON）：`docs/reports/assets/n10-live-evidence.md`**（parent 终验清单①的物化）。
+
 | 验收点 | 证据 |
 |---|---|
 | ① queen 派生真跑 | wizard `--derive`：18 维清单打印、**5/18 维用户作答**（≥3）、GLM 投影 1468 chars、三门 PASS、入池 `queen-smoke-coder@v1`（dry 回执） |
@@ -38,14 +40,19 @@ queen 场景投影对**场景措辞敏感**：v1 措辞（"逐维…档案"）�
 
 ## 4. 部署终态
 
-- 插件已部署 `~/.dsh/plugins/a2a-profile-server/`（= HEAD 2192930），守护 **运行中**（run-plugin.mjs 激活，端口 8790，agent-card 六 skills：dispatch/query/incubate/pool-spawn/pool-export/profiles-revalidate；PID 见 /tmp/n10/plugin-daemon.pid）。重启法：`nohup node /tmp/n10/run-plugin.mjs &`（或任意 `activate({})` 载体）。
+- 插件已部署 `~/.dsh/plugins/a2a-profile-server/`（= master HEAD），守护 **运行中**（端口 8790，agent-card 六 skills：dispatch/query/incubate/pool-spawn/pool-export/profiles-revalidate）。
+- **daemon 存活口径（parent 终验清单③）**：
+  - 启动：`nohup node ~/.dsh/plugins/a2a-profile-server/daemon.mjs >/dev/null 2>&1 &`（插件自带常驻入口，状态行打印至 stdout；env 覆写：`A2A_PROFILE_PORT`/`A2A_PROFILE_ROOT`）
+  - 停止：`kill $(pgrep -f 'a2a-profile-server/daemon.mjs')`
+  - 探活：`curl -sS http://127.0.0.1:8790/.well-known/agent-card.json`（六 skills 应答即健康）
+  - 日志：`~/.dsh/plugins/a2a-profile-server/state/plugin.log`
 - 池新增：queen-smoke-coder@v1（worker·queen 派生）、queen-persona-smoke@v2（queen·守卫验证）、n10-newface-smoke@v1（`*new*` 回归）——留作证据与复用素材。
 - GUI preset roster 新增：`queen-smoke-coder`（导出产物，即刻可见）。
 - 临时会话全清（e2/fanout×3/queen a82a；a82a 若 409 busy 已在收口前重试清除，见 ledger）。
 
 ## 5. 回流备料（parent 域）
 
-`docs/reports/assets/n10-pipecat-backflow.md` + 三 patch（rt_projector/wizard/SKILL vs pipecat-poc 部署副本，基线同源起步）。pipecat-poc 仓全程零写入。
+`docs/reports/assets/n10-pipecat-backflow.md` + **四 patch**（rt_projector/wizard/SKILL/tests vs pipecat-poc 部署副本；tests 为新文件 diff，路径已适配 pipecat-poc 布局并在模拟回流态 18/18 ×2 验证自洽）。pipecat-poc 仓全程零写入；commit 由 parent 做。
 
 ## 6. 遗留
 
