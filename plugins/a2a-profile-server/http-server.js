@@ -16,6 +16,10 @@
 //                   projection?(*new* 必填：agents_md/profile_json/description/template)}
 //                   ← N10-T1 池选型 spawn（OF-012；docs/10 §1）：具名复用版本钉死不 save；
 //                     queen 只派生不 spawn（-32000）；三策略分派见 incubators/real.js
+//     pool/export  {name, force?}                       ← N10-T3 dsh 预设导出（OF-013；docs/10 §2）：
+//                   profiles.get → exportDshPreset（preset.yml+agent.cordis.yml persona 内嵌
+//                   + maestro 资产软链，目录级原子 tmp+rename）→ recordRun op:'pool-export'
+//     profiles/revalidate {name}                        ← 库内 AGENTS.md 重跑三门（gatesFn 未配置 -32000）
 //     profiles/list {}
 //     profiles/get  {name}
 //     agents/registry {}                          ← W5.2 router 三 RPC（N6§2.4；需注入 router）
@@ -30,6 +34,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fanoutDsh, bindProfile } from './incubators/real.js'
+import { exportDshPreset } from './exporters/dsh-preset.js'
 
 const runBin = promisify(execFile)
 const HOME = homedir()
@@ -306,7 +311,11 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
       if (params.project !== undefined && (typeof params.project !== 'string' || !params.project.trim())) {
         return rpcError(id, -32602, `invalid project: ${params.project}`)
       }
-      // role 孵化目标（N6§1.4）：dsh-liaison/dsh-manager 复用 dsh 孵化器，目标本身蕴含 role
+      // N10-T3 queen 派生血缘（docs/10 §2 验收②）：lineage 键与缺省 template 合并落 meta.lineage，
+      // 多余键透传保存（derived-by/parent 等）
+      if (params.lineage !== undefined && (typeof params.lineage !== 'object' || Array.isArray(params.lineage))) {
+        return rpcError(id, -32602, `invalid lineage: ${JSON.stringify(params.lineage)}`)
+      }
       const targets = params.targets ?? []
       for (const target of targets) {
         const implied = ROLE_TARGETS[target]
@@ -330,7 +339,10 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
           description: params.projection.description ?? (params.projection.profile_json ?? {}).description ?? '',
         },
         targets,
-        lineage: { template: params.projection.template ?? 'spawnAgentPrompt@v0.1' },
+        lineage: {
+          template: params.projection.template ?? 'spawnAgentPrompt@v0.1',
+          ...(params.lineage ?? {}),
+        },
       })
       const receipts = []
       for (const target of targets) {
@@ -502,6 +514,34 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
       return { jsonrpc: '2.0', id, result: { profile: p } }
     }
 
+    // ---- N10-T3 pool/export + profiles/revalidate（OF-013；docs/10 §2 导出/复验）----
+
+    if (method === 'pool/export') {
+      if (typeof params.name !== 'string' || !params.name.trim()) {
+        return rpcError(id, -32602, 'name required')
+      }
+      const record = await profiles.get(params.name)
+      if (!record) return rpcError(id, -32602, `unknown profile: ${params.name}`)
+      // 导出四硬规则违例（slug/{{/模板缺块/目录已存在）一律 fail-loud → -32000
+      try {
+        const receipt = await exportDshPreset({ profile: record, force: params.force === true })
+        await profiles.recordRun(record.name, { op: 'pool-export', version: record.version, dir: receipt.dir })
+        return { jsonrpc: '2.0', id, result: { export: receipt } }
+      } catch (e) {
+        return rpcError(id, -32000, String(e?.message ?? e))
+      }
+    }
+
+    if (method === 'profiles/revalidate') {
+      if (!gatesFn) return rpcError(id, -32000, 'gates not configured')
+      if (typeof params.name !== 'string' || !params.name.trim()) {
+        return rpcError(id, -32602, 'name required')
+      }
+      const record = await profiles.get(params.name)
+      if (!record) return rpcError(id, -32602, `unknown profile: ${params.name}`)
+      return { jsonrpc: '2.0', id, result: await profiles.revalidate(params.name, gatesFn) }
+    }
+
     // ---- W5.2 router 三 RPC（VO-004；与六 RPC 同形制，router 未装配时显式报状态）----
 
     if (method === 'agents/registry') {
@@ -544,6 +584,8 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
             { id: 'query', description: 'task status' },
             { id: 'incubate', description: 'project & incubate a base profile' },
             { id: 'pool-spawn', description: 'select profile from pool & spawn with strategy' },
+            { id: 'pool-export', description: 'export a pool profile as a dsh preset directory' },
+            { id: 'profiles-revalidate', description: 're-run quality gates on a stored profile' },
           ],
           url: 'http://127.0.0.1:8790/',
           version: INTERNAL_VERSION,

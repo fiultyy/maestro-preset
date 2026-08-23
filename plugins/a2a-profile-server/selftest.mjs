@@ -14,14 +14,21 @@
 //   T17 具名复用（字节一致+版本钉死） T20 缺省 default/非法 strategy/unknown
 //   T18 fanout-sub count=3（回执/mailbox/fleet/注入） T21 queen 守卫 -32000
 //
+//   T22 export 基本面（目录/preset 仅显式键/persona 内嵌逐字节还原/!!js+group 保真）
+//   T23 slug+存在性守卫（非法名抛错/重复抛错/force 覆盖）   T24 '{{' 断言（抛错不落盘）
+//   T25 原子落位（终态两文件齐备+无 tmp 残留）              T26 软链资产指向 assetsFrom
+//   T27 incubate lineage 透传（derived-by/parent 落 meta）  T28 profiles/revalidate（pass/fail/未配置）
+//
 // 用法: node selftest.mjs [--verbose]   退出码 0=全绿 1=有失败。
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, readdirSync, readlinkSync, lstatSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { activate } from './index.js'
 import { createTaskStore } from './task-store.js'
+import { createProfileStore } from './profile-store.js'
+import { exportDshPreset } from './exporters/dsh-preset.js'
 
 const VERBOSE = process.argv.includes('--verbose')
 let passed = 0
@@ -91,6 +98,55 @@ const strictGates = (md) => ({
   passed: !/D\d+|19\s*维|泛化算法/.test(md) && /MUST NOT/.test(md),
   violations: /D\d+|19\s*维/.test(md) ? { gate1: ['framework leak'] } : {},
 })
+
+/**
+ * 合成模板 fixture（N10-T3 用例）：persona 行块（text: |- + 6 空格缩进正文）+ 一行
+ * disabled: !!js 平台条件行（bash/pwsh 各一）+ 一个 cordis:group isolate 块。
+ * 导出后块外一切行必须与该模板逐字节相同（硬规则③）。
+ */
+const SYNTHETIC_TEMPLATE = [
+  '# synthetic template fixture (selftest T22): persona row + !!js platform lines + cordis:group isolate.',
+  '# every line outside the persona text block must survive export byte-identical.',
+  '- id: persona',
+  "  name: '@deepseek-ai/dsh-persona'",
+  '  config:',
+  '    text: |-',
+  '      You are an orchestration supervisor placeholder. {{model}} and {{cwd}} stay (registered variables).',
+  '',
+  '      TEMPLATE-ONLY BODY that export must replace wholesale.',
+  '',
+  '- id: agent-instructions',
+  "  name: '@deepseek-ai/dsh-agent-instructions'",
+  '  config:',
+  '    maxBytes: 65536',
+  '',
+  '- id: tool-bash',
+  "  name: '@deepseek-ai/dsh-tool-bash'",
+  "  disabled: !!js process.platform === 'win32'",
+  '',
+  '- id: tool-pwsh',
+  "  name: '@deepseek-ai/dsh-tool-pwsh'",
+  "  disabled: !!js process.platform !== 'win32'",
+  '',
+  '- id: planning',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    planMode: true',
+  '',
+].join('\n')
+
+/** 从生成的 agent.cordis.yml 提取 persona text 块内容：去同宽缩进+去尾部空行（|- strip 语义）。 */
+function recoverPersonaText(cordisText) {
+  const lines = cordisText.split('\n')
+  const textIdx = lines.findIndex((l) => /^\s+text: \|-$/.test(l))
+  if (textIdx < 0) return null
+  const end = lines.findIndex((l, i) => i > textIdx && /^- id: /.test(l))
+  const content = lines.slice(textIdx + 1, end < 0 ? lines.length : end)
+  while (content.length && content[content.length - 1] === '') content.pop()
+  const indent = (content.find((l) => l.trim()) ?? '').match(/^\s*/)[0]
+  return content.map((l) => (l === '' ? '' : l.slice(indent.length))).join('\n')
+}
 
 /**
  * mock dsh 宿主（VO-002 扩参用例）：mock session-spawn（真写 fleet.json，不真开会话）
@@ -423,6 +479,129 @@ async function main() {
         else process.env[k] = v
       }
       await mock.stop()
+    }
+
+    // ---- T22–T28 · N10-T3 pool/export + lineage + revalidate（OF-013；env 注入临时目录，零 ~/.dsh 写）----
+
+    const presetsDir = join(dir, 'presets-out')
+    const maestroAssets = join(dir, 'maestro-assets')
+    for (const sub of ['skills', 'bin', 'plugins']) mkdirSync(join(maestroAssets, sub), { recursive: true })
+    const templatePath = join(maestroAssets, 'agent.cordis.yml')
+    writeFileSync(templatePath, SYNTHETIC_TEMPLATE)
+    const ENV3_KEYS = ['A2A_PRESETS_DIR', 'A2A_PRESET_TEMPLATE']
+    const savedEnv3 = Object.fromEntries(ENV3_KEYS.map((k) => [k, process.env[k]]))
+    process.env.A2A_PRESETS_DIR = presetsDir
+    process.env.A2A_PRESET_TEMPLATE = templatePath
+    try {
+      // 存底 + 首次导出（RPC 面：profiles.get → exportDshPreset → recordRun op:pool-export）
+      await rpc(base, 'incubate', {
+        name: 'export-probe', targets: ['dry'],
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '导出' }, description: '探索型 MVP 助手。第二句不取。' },
+      })
+      const ex22 = await rpc(base, 'pool/export', { name: 'export-probe' })
+      const r22 = ex22.body.result?.export
+      const expDir = join(presetsDir, 'export-probe')
+      ok('T22a export 基本面（目录+两文件+回执五键）',
+        r22?.target === 'dsh-preset' && r22?.name === 'export-probe' && r22?.version === 1
+          && r22?.dir === expDir && existsSync(r22?.presetYml) && existsSync(r22?.cordisYml)
+          && existsSync(join(expDir, 'preset.yml')) && existsSync(join(expDir, 'agent.cordis.yml')))
+
+      const storedMd22 = readFileSync(join(profileRoot, 'export-probe', 'AGENTS.md'), 'utf8')
+      const generated22 = readFileSync(join(expDir, 'agent.cordis.yml'), 'utf8')
+      const presetRaw22 = readFileSync(join(expDir, 'preset.yml'), 'utf8')
+      const presetKeys = presetRaw22.trim().split('\n').map((l) => l.match(/^([a-z]+): /)?.[1])
+      const jsLines = SYNTHETIC_TEMPLATE.split('\n').filter((l) => l.includes('!!js'))
+      ok('T22b preset.yml 仅显式键 + 一句话派生显示名',
+        JSON.stringify(presetKeys) === JSON.stringify(['name', 'description'])
+          && /^name: 探索型 MVP 助手。$/m.test(presetRaw22)
+          && /^description: 探索型 MVP 助手。$/m.test(presetRaw22))
+      ok('T22c persona 内嵌 AGENTS.md 全文（缩进后逐字节可还原）+ 模板正文被替换',
+        recoverPersonaText(generated22) === storedMd22.replace(/\n$/, '')
+          && !generated22.includes('TEMPLATE-ONLY BODY'))
+      ok('T22d !!js 平台条件行与 group/isolate 块逐字节保真（硬规则③）',
+        jsLines.every((l) => generated22.split('\n').includes(l))
+          && ['- id: planning', '  name: cordis:group', '  group: true', '  isolate:', '    planMode: true']
+            .every((l) => generated22.split('\n').includes(l)))
+      const hist22 = readFileSync(join(profileRoot, 'export-probe', 'history.jsonl'), 'utf8')
+        .trim().split('\n').map((l) => JSON.parse(l))
+      ok('T22e recordRun op:pool-export',
+        hist22.some((h) => h.op === 'pool-export' && h.version === 1 && typeof h.dir === 'string'))
+
+      // T23 slug/存在性守卫：非法名（store 不可能产出 → 直测模块）；重复导出抛错；force 覆盖
+      let slugErr = null
+      try {
+        await exportDshPreset({ profile: { name: 'Bad_Name', version: 1, agentsMd: GOOD_MD }, presetsDir, templatePath })
+      } catch (e) { slugErr = e }
+      const dup23 = await rpc(base, 'pool/export', { name: 'export-probe' })
+      const force23 = await rpc(base, 'pool/export', { name: 'export-probe', force: true })
+      const oldDirs23 = readdirSync(presetsDir).filter((e) => e.startsWith('export-probe.old-'))
+      ok('T23 slug/存在性守卫（非法名抛错/重复 -32000/force 覆盖+旧目录归档）',
+        /invalid preset id/.test(String(slugErr?.message))
+          && dup23.body.error?.code === -32000 && /already exists/.test(dup23.body.error?.message)
+          && force23.body.result?.export?.dir === expDir
+          && existsSync(join(expDir, 'preset.yml')) && existsSync(join(expDir, 'agent.cordis.yml'))
+          && oldDirs23.length === 1 && existsSync(join(presetsDir, oldDirs23[0], 'preset.yml')))
+
+      // T24 '{{' 消毒断言：抛错且不落盘（fail-loud，先于一切写动作）
+      let poisonErr = null
+      try {
+        await exportDshPreset({
+          profile: { name: 'poison-probe', version: 1, agentsMd: GOOD_MD + '\n Poison: {{evil}}\n' },
+          presetsDir, templatePath,
+        })
+      } catch (e) { poisonErr = e }
+      ok("T24 '{{' 断言（抛错不落盘）",
+        /hard rule #2/.test(String(poisonErr?.message))
+          && !existsSync(join(presetsDir, 'poison-probe'))
+          && !readdirSync(presetsDir).some((e) => e.includes('.tmp-')))
+
+      // T25 原子落位：终态两文件齐备 + 无 <name>.tmp-<pid> 残留（目录级 tmp+rename）
+      ok('T25 原子落位（两文件齐备+无 tmp 残留）',
+        existsSync(join(expDir, 'preset.yml')) && existsSync(join(expDir, 'agent.cordis.yml'))
+          && !readdirSync(presetsDir).some((e) => e.includes('.tmp-')))
+
+      // T26 软链资产：skills/bin/plugins 指向 assetsFrom（= dirname(templatePath)）
+      const linked = ['skills', 'bin', 'plugins'].map((a) => join(expDir, a))
+      ok('T26 软链资产（skills/bin/plugins 软链存在且指向 assetsFrom）',
+        linked.every((p) => existsSync(p) && lstatSync(p).isSymbolicLink())
+          && linked.every((p, i) => readlinkSync(p) === join(maestroAssets, ['skills', 'bin', 'plugins'][i]))
+          && !existsSync(join(expDir, 'README.md')))
+
+      // T27 incubate lineage 透传：与缺省 template 合并落 meta.lineage，多余键透传
+      await rpc(base, 'incubate', {
+        name: 'queen-derived', targets: ['dry'],
+        lineage: { 'derived-by': 'queen', parent: 'x' },
+        projection: { agents_md: GOOD_MD, profile_json: { scenario: '派生' }, description: '派生物' },
+      })
+      const got27 = await rpc(base, 'profiles/get', { name: 'queen-derived' })
+      const lin27 = got27.body.result?.profile?.meta?.lineage
+      ok('T27 lineage 透传（derived-by/parent 落 meta.lineage + 缺省 template 合并）',
+        lin27?.['derived-by'] === 'queen' && lin27?.parent === 'x'
+          && lin27?.template === 'spawnAgentPrompt@v0.1')
+
+      // T28 profiles/revalidate：好文 pass、坏文 fail（strictGates）、gatesFn 未配置 -32000
+      const rawStore = createProfileStore(profileRoot)
+      await rawStore.save({ name: 'drifty-doc', agentsMd: '# bad\nD7 泄漏。\n', profile: {}, targets: ['dry'] })
+      const good28 = await rpc(base, 'profiles/revalidate', { name: 'queen-derived' })
+      const bad28 = await rpc(base, 'profiles/revalidate', { name: 'drifty-doc' })
+      const hist28 = readFileSync(join(profileRoot, 'drifty-doc', 'history.jsonl'), 'utf8')
+        .trim().split('\n').map((l) => JSON.parse(l))
+      ok('T28a profiles/revalidate（好文 pass/坏文 fail+violations+history 落账）',
+        good28.body.result?.drift === 'pass'
+          && bad28.body.result?.drift === 'fail' && bad28.body.result?.violations?.gate1
+          && hist28.some((h) => h.op === 'revalidate' && h.drift === 'fail'))
+      const nogates = await activate({ port: 0, profileRoot: join(dir, 'p3'), stateDir: join(dir, 's3') })
+      try {
+        const ng28 = await rpc(`http://127.0.0.1:${nogates.port}`, 'profiles/revalidate', { name: 'any' })
+        ok('T28b gatesFn 未配置 → -32000', ng28.body.error?.code === -32000 && /gates not configured/.test(ng28.body.error?.message))
+      } finally {
+        nogates.stop()
+      }
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv3)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
     }
   } finally {
     app.stop()
