@@ -89,9 +89,24 @@ user preset 等同 shell 权限(preset 是组合,插件代码无额外沙箱)。
 
 ## 10. 校验清单(每次发布前)
 
-- [ ] 所有插件 `node --check` 通过
+- [ ] 所有插件 `node --check` 通过(host/ 与 agent-presets/ 一并)
 - [ ] 无 `/home/<user>` 硬编码路径(grep 验证)
-- [ ] 插件 import 仅 `node:*` + 相对路径
+- [ ] 插件 import 仅 `node:*` + 相对路径(host/packages 构建产物豁免——它是 tsdown 打包输出)
 - [ ] 行名写到精确 .js;无 root-realm 服务
 - [ ] README/USAGE/PACKAGING 三件套与代码同步
+- [ ] `host/install.sh --dry-run` 与沙箱 `DSH_HOME=$(mktemp -d)` 实跑通过
 - [ ] `git push` 后远端 HEAD 与本地一致
+
+## 11. 分发面: host/ 与 agent-presets/(2026-08-24)
+
+仓内除 maestro preset 本体(仓库根)外,还有两个**独立分发面**,装点不在
+`.agent-presets/maestro/`,因此被 `bin/dev-sync.sh` 显式排除,由 `host/install.sh`
+统一安装(`--dry-run` 预演,`DSH_HOME` 重定向):
+
+| 面 | 内容 | 装点 |
+|---|---|---|
+| `host/packages/` | 4 个 `@deepseek-ai/dsh-long-task*` 构建包(v0.1.0-rc.8) | `~/.dsh/profiles/<profile>/node_modules/@deepseek-ai/` |
+| `host/plugins/` | random-uuid-polyfill / workspace-unarchive / ui-agent-pool | `~/.dsh/plugins/`(polyfill.patch.yml 引用) |
+| `host/polyfill.patch.yml` | host 补丁组合模板(run-web.sh `--patch`) | 引用,不安装 |
+| `agent-presets/<id>/` | long-task / queen-v1 / liangshen 三个自研 preset | `~/.dsh/.agent-presets/<id>/` |
+

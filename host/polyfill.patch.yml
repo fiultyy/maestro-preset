@@ -1,0 +1,26 @@
+# host 补丁组合模板(分发版)。行内绝对路径按目标机 ${DSH_HOME:-~/.dsh} 适配;
+# 凭据一律环境变量引用,无明文。由 run-web.sh 的 --patch 挂载。
+- insert:
+    - id: random-uuid-polyfill
+      name: !!js '`${process.env.DSH_HOME || (process.env.HOME || process.env.USERPROFILE) + "/.dsh"}/plugins/random-uuid-polyfill.js`'
+    - id: workspace-unarchive-hotfix
+      # 目录形态 = 仓内 canonical 版(install.sh 安装);旧装点为单文件 workspace-unarchive.js
+      name: !!js '`${process.env.DSH_HOME || (process.env.HOME || process.env.USERPROFILE) + "/.dsh"}/plugins/workspace-unarchive/index.js`'
+# force hmr reload 2
+# force hmr reload 3
+    - id: host-callback-bridge
+      name: !!js '`${process.env.DSH_HOME || (process.env.HOME || process.env.USERPROFILE) + "/.dsh"}/plugins/host-callback-bridge/index.js`'
+    # N10-GUI: browser-side agent-pool picker (settings 分区 + 新会话输入行入口),
+    # pool/export → dsh preset → 设为默认组合。浏览器 roster 由 dsh-client-modules
+    # 扫描 Loader entries 发现（package.json dsh.client 声明 + exports["./client"]）。
+    - id: ui-agent-pool
+      name: 'ui-agent-pool'
+    - id: mcp-zhipu-search
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: zhipu
+        transport: streamable-http
+        url: https://open.bigmodel.cn/api/mcp/web_search_prime/mcp
+        headers:
+          Authorization: !!js '`Bearer ${process.env.ZHIPU_CODING_PLAN_API_KEY}`'
+        toolCallTimeoutMs: 60000

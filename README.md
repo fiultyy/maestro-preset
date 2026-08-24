@@ -109,7 +109,12 @@ maestro/
 │   ├── maestro-bridge/   #   冷执行回调手册(身份自查/cb-send/消息语义/红线/排查)
 │   └── skills/dais-orchestration/  # dais 平面 v2 命令面 + 别名透明代理契约
 ├── tests/                # 自测(cb-send 降级链 + OF-001..010 加固波自测)
-└── docs/                 # 设计文档(DESIGN / callback-bridge 抽象 / orch-loop / fleet 约定 / PACKAGING)
+├── docs/                 # 设计文档(DESIGN / callback-bridge 抽象 / orch-loop / fleet 约定 / PACKAGING)
+├── host/                 # 独立分发面①: 装点自研插件(host/install.sh 统一安装,dev-sync 不碰)
+│   ├── packages/         #   4 个 @deepseek-ai/dsh-long-task* 构建包 → profile node_modules
+│   ├── plugins/          #   random-uuid-polyfill / workspace-unarchive / ui-agent-pool → ~/.dsh/plugins
+│   └── polyfill.patch.yml#   host 补丁组合模板(run-web.sh --patch 挂载,路径 DSH_HOME 感知)
+└── agent-presets/        # 独立分发面②: long-task / queen-v1 / liangshen 三个自研 preset(→ ~/.dsh/.agent-presets/<id>)
 ```
 
 ## 运行时状态(不在包内,自动生成)
