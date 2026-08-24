@@ -115,7 +115,17 @@ function embedPersona(templateText, agentsMd) {
 
   const core = agentsMd.endsWith('\n') ? agentsMd.slice(0, -1) : agentsMd
   const embedded = core.split('\n').map((l) => (l === '' ? '' : contentIndent + l))
-  return [...lines.slice(0, textIdx + 1), ...embedded, ...lines.slice(lastContentIdx + 1)].join('\n')
+  // Identity-face replacement policy: a pool profile OWNS the identity, so the
+  // persona takes over the whole prompt (complete:true collapses every other
+  // section, harness:identity included). Tool rows are untouched — a pool export
+  // keeps the template's full tool superset.
+  return [
+    ...lines.slice(0, textIdx),
+    '    complete: true',
+    ...lines.slice(textIdx, textIdx + 1),
+    ...embedded,
+    ...lines.slice(lastContentIdx + 1),
+  ].join('\n')
 }
 
 /**
