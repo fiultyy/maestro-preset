@@ -61,8 +61,8 @@ function yamlScalar(value) {
 }
 
 /**
- * slug 改写建议（parent 指令③）：queen 命名策略 queen-<scenario>-<slug>。
- * 小写化、非 [a-z0-9-] 连串折叠为单 '-'、去首尾 '-'、截 64；产物必匹配 SLUG_RE。
+ * slug 改写建议（硬规则①配套）：小写化、非 [a-z0-9-] 连串折叠为单 '-'、去首尾 '-'、截 64；
+ * 产物必匹配 SLUG_RE。queen 派生命名（queen-v<N> 池内自动递增）由 wizard 在入口把关。
  */
 function slugify(text) {
   return String(text ?? '')
@@ -75,10 +75,7 @@ function slugify(text) {
 }
 
 function suggestSlug(profile) {
-  const scenario = slugify(profile?.profile?.scenario)
-  const base = slugify(profile?.name)
-  const parts = ['queen', scenario, base].filter(Boolean)
-  return parts.join('-').replace(/^-+|-+$/g, '') || 'queen-derived'
+  return slugify(profile?.name) || 'queen-v1'
 }
 
 /**
@@ -142,7 +139,7 @@ export async function exportDshPreset({ profile, presetsDir, templatePath, asset
   if (!profile || typeof profile !== 'object') throw new Error('profile required (profiles.get result)')
   const name = profile.name
   if (typeof name !== 'string' || !SLUG_RE.test(name)) {
-    // N10-T3 补遗（parent 指令③）：生成前拒绝 + 改写建议（queen 命名策略 queen-<scenario>-<slug>）
+    // 生成前拒绝 + 改写建议（硬规则① slug；queen-v<N> 命名由 wizard 入口把关）
     throw new Error(`invalid preset id (hard rule #1 slug ^[a-z0-9][a-z0-9-]*$): ${JSON.stringify(name)} (suggested: ${suggestSlug(profile)})`)
   }
   const version = profile.version

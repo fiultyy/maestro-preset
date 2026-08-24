@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -91,6 +92,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             answers[str(k)] = str(v)
     if args.derive and not args.answers_file:
         ap.error("--derive 必填 --answers-file（{维度key: 答案} JSON 映射；缺维将取 grill 建议值）")
+    if args.derive and not re.fullmatch(r"queen-v[1-9]\d*", args.name):
+        ap.error(
+            f"queen 派生命名即 queen-v<版本号>（池内自动递增）："
+            f"--name '{args.name}' 不合规；建议 '{suggest_queen_name()}'"
+        )
     args.answers = answers
 
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
@@ -103,6 +109,31 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             ap.error(f"role {args.role} 与目标 {t} 冲突（{t} 蕴含 role={implied}）")
     args.targets = targets
     return args
+
+
+def suggest_queen_name() -> str:
+    """queen-v<N>：读池 profiles/list 取最大 N 后 +1；daemon 不可达回退 queen-v1。"""
+    port = os.environ.get("A2A_PROFILE_PORT", "8790")
+    token = os.environ.get("A2A_PROFILE_TOKEN", "")
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": "profiles/list", "params": {}}
+    ).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/", data=body,
+        headers={"Content-Type": "application/json"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            profiles = (json.loads(resp.read().decode())
+                        .get("result", {}).get("profiles", []))
+    except (urllib.error.URLError, OSError, ValueError):
+        return "queen-v1"
+    versions = [
+        int(m.group(1)) for p in profiles
+        if (m := re.fullmatch(r"queen-v(\d+)", str(p.get("name", ""))))
+    ]
+    return f"queen-v{max(versions, default=0) + 1}"
 
 
 def echo_gates(report) -> bool:

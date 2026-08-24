@@ -193,7 +193,7 @@ class WizardArgsTests(unittest.TestCase):
             path = fh.name
         try:
             args = self.w.parse_args([
-                "--scenario", "s", "--name", "n",
+                "--scenario", "s", "--name", "queen-v2",
                 "--derive", "--answers-file", path, "--parent", "p1",
             ])
         finally:
@@ -201,6 +201,32 @@ class WizardArgsTests(unittest.TestCase):
         self.assertTrue(args.derive)
         self.assertEqual(args.answers, payload)
         self.assertEqual(args.parent, "p1")
+
+    def test_derive_queen_name_pattern(self):
+        # queen 命名即 queen-v<版本号>：合法名直过，其余（旧 scenario-slug/前导零）拒绝
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump({}, fh)
+            path = fh.name
+        try:
+            args = self.w.parse_args([
+                "--scenario", "s", "--name", "queen-v3",
+                "--derive", "--answers-file", path,
+            ])
+            self.assertEqual(args.name, "queen-v3")
+            for bad in ("n", "queen", "queen-v01", "queen-diff-review", "queen-v2x"):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.w.parse_args([
+                            "--scenario", "s", "--name", bad,
+                            "--derive", "--answers-file", path,
+                        ])
+                self.assertEqual(ctx.exception.code, 2, bad)
+                self.assertIn("queen-v<版本号>", err.getvalue(), bad)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     def test_classic_arg_surface_unchanged(self):
         args = self.w.parse_args([

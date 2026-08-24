@@ -59,7 +59,7 @@ description: >-
 ```bash
 python3 ~/.agents/skills/incubation-wizard/wizard.py \
   --scenario "<自包含场景句>" \
-  --name queen-<scenario>-<slug> \
+  --name queen-v<N> \
   --derive \
   --answers-file /tmp/answers.json \
   [--parent <亲本profile名>] \
@@ -76,7 +76,8 @@ python3 ~/.agents/skills/incubation-wizard/wizard.py \
    未知变量首用即崩）；projector 对产物做断言，违者升温重试。
 4. **血缘**：incubate params 携带 `lineage: {derived-by: queen, parent:
    <args.parent 或空>}`（插件侧消费面由 N10-T3 落地，当前多余参数被
-   无害忽略）；命名建议 `queen-<scenario>-<slug>` 全小写连字符 slug。
+   无害忽略）；命名即 `queen-v<版本号>`——wizard 校验该形式，并在不合规时
+   读池 `profiles/list` 取最大 N 后建议 N+1（daemon 不可达回退 queen-v1）。
 5. **铁条款**：人在环（不做全自动派生）、不直接孵化会话（spawn 走池选型
    面）、血缘如实——三条由 queen doctrine 模板注入产物并由三门把关。
 
