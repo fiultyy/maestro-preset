@@ -227,6 +227,28 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
+// Loopback-origin CORS (N10-GUI): the dsh web GUI (127.0.0.1:3080) reads the
+// pool roster and triggers pool/export from the browser. Only loopback origins
+// are reflected; every other origin gets no CORS headers and the response
+// stays unreadable cross-origin.
+const LOOPBACK_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/
+
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  if (typeof origin === 'string' && LOOPBACK_ORIGIN.test(origin)) {
+    res.setHeader('access-control-allow-origin', origin)
+    res.setHeader('vary', 'origin')
+  }
+}
+
+function isCorsPreflight(req) {
+  return (
+    req.method === 'OPTIONS' &&
+    typeof req.headers.origin === 'string' &&
+    LOOPBACK_ORIGIN.test(req.headers.origin)
+  )
+}
+
 function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } }
 }
@@ -591,6 +613,16 @@ export function createHttpServer({ tasks, profiles, token, executor, gatesFn, in
 
   const server = createServer(async (req, res) => {
     try {
+      applyCors(req, res)
+      if (isCorsPreflight(req)) {
+        res.writeHead(204, {
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'content-type, authorization',
+          'access-control-max-age': '600',
+        })
+        res.end()
+        return
+      }
       if (!isLoopback(req.socket.remoteAddress ?? '')) {
         sendJson(res, 403, { error: 'loopback only' })
         return
