@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-long-task-context-policy",
   "description": "Context-budget handoff policy that resets a long task's surface at an effective-window threshold",
-  "version": "0.1.0-rc.8",
+  "version": "0.1.1-rc.2+local.1",
   "publishConfig": {
     "access": "public"
   },

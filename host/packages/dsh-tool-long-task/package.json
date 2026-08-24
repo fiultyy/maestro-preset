@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-long-task",
   "description": "Model-facing same-session long-task tools with execution-time authority checks",
-  "version": "0.1.0-rc.8",
+  "version": "0.1.1-rc.2+local.1",
   "publishConfig": {
     "access": "public"
   },

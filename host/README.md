@@ -34,8 +34,8 @@ host/install.sh             # 执行
 
 ## 版本注记
 
-- 4 个 dsh 包是 **v0.1.0-rc.8 构建(2026-08-22 tarball 安装)**,源码在 `~/tools/deepseek-harness/packages/long-task/`。
-- 该源码已新增 `update_long_task action=clear`(2026-08-24),**本目录构建未含**;重新分发前需从 harness repo 重建(`pnpm build` 后按包 `npm pack`,替换 packages/ 下对应目录)。
+- 4 个 dsh 包是 **v0.1.1-rc.2+local.1 构建(2026-08-24,基于 upstream 0.1.1-rc.2 + 本地 clear action + 投影新接口迁移)**,源码在 `~/tools/deepseek-harness/packages/long-task/`(分支 local-dev)。
+- `update_long_task action=clear` 已含在本构建中(装点 :3080 运行验证过);重新分发前从 local-dev 分支 `pnpm build` 后替换 packages/ 下对应目录并 bump 版本号。
 
 ## 关联 preset
 

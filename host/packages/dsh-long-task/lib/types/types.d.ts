@@ -129,6 +129,16 @@ export interface LongTaskProjection {
     readonly updatedAt: number;
 }
 declare module '@deepseek-ai/dsh-session-projection/types' {
+    /**
+     * The host fold state for the session's long task: the latest
+     * `long-task/change` whole value, or `null` before the first create and
+     * after a clear tombstone. Whole-value rule: every change carries the
+     * complete post-change state, so the fold is last-wins. Identical in shape
+     * to the wire value — the read-side view is the identity.
+     */
+    interface SessionProjectionStateMap {
+        longTask: LongTaskProjection | null;
+    }
     interface SessionProjectionMap {
         /**
          * The session's current long task (the latest `long-task/change` whole

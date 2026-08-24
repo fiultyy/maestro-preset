@@ -591,10 +591,13 @@ var LongTaskService = class extends Service {
 		ctx.inject(["sessionProjections"], (projectionCtx) => {
 			projectionCtx.sessionProjections.register({
 				key: "longTask",
-				schema: longTaskProjectionSchema,
+				stateSchema: longTaskProjectionSchema,
 				init: () => null,
 				apply: applyLongTaskProjection,
-				view: (state) => state,
+				wire: {
+					viewSchema: longTaskProjectionSchema,
+					view: (state) => state
+				},
 				stateVersion: 1
 			});
 		});
