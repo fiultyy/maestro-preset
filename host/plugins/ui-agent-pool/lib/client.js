@@ -1,24 +1,25 @@
 // ui-agent-pool — browser half (hand-bundled, no build step).
 //
 // Surfaces over the local a2a profile pool (a2a-profile-server, :8790):
-//   1. a settings section "Agent 池": the FULL incubation roster, each row can
-//      be exported as a dsh preset and made the default composition;
+//   1. a settings section "Agent 池": the FULL incubation roster + the GLOBAL
+//      default ("导出并设为默认" writes the agent-presets default);
 //   2. a composer seat (conversation.input.left): queen-family profiles plus
-//      「不加载（默认）」 — the pool's injection switch.
+//      「不加载（默认）」 — a strictly PER-SESSION persona switch.
 //
-// Relationship model (v3): the pool is the SOURCE; an exported preset is a
-// TRANSIENT deployment artifact.
-//   - Picking a pool profile: pool/export → write the agent-presets default →
-//     ONE-SHOT recompose of the current blank session, at click time only.
-//     There is deliberately NO persistent stage: a stage that outlives the
-//     click hijacks blank sessions later and fights the official preset chip
-//     (v2 did that; the session log proved it). Future sessions are covered by
-//     the default at creation time.
-//   - 「不加载（默认）」 first re-selects every blank session that runs a
-//     pool-exported preset onto a safe official preset (current default, else
-//     "standard"), and only then reclaims the exported preset directories
-//     (agentPresets.remove). No session is left pointing at a preset that no
-//     longer exists; official presets and defaults are never touched.
+// Relationship model (v4): the pool is the SOURCE; an exported preset is a
+// TRANSIENT deployment artifact; the SEAT NEVER writes the global default.
+// The session log proved the v2/v3 default-writing seat cross-contaminated
+// sessions (a pick in one conversation re-defaulted every future session, and
+// blank sessions re-selected under each other's picks).
+//   - Seat pick: pool/export → agentPresets.select on the CURRENT blank
+//     session, nothing else. No current blank yet (rare, fresh workspace):
+//     a ONE-SHOT stage delivers the pick to the next blank session and dies
+//     on delivery, on any competing agent-preset/selected event, or as soon
+//     as the current session turns non-blank — it cannot hijack (v2 did).
+//   - 「不加载」: revert the current blank session to an official preset,
+//     then reclaim pool-exported directories that NO session references.
+//     The global default is never touched from the seat (agentPresets.remove
+//     clears it server-side only when it pointed at a reclaimed preset).
 (function () {
   var ID = "ui-agent-pool";
   var NS = "agentPool";
@@ -37,50 +38,50 @@
       var zh = {
         nav: "Agent 池",
         title: "Agent 池（profile pool）",
-        subtitle: "池 = 孵化源，导出 = 临时部署。选中即：导出 → 设为默认 → 立刻作用于当前空白会话；「恢复默认」先把空白会话切回官方预设，再回收全部池导出。",
+        subtitle: "池 = 孵化源，导出 = 临时部署。本页管理完整名册与全局默认；输入框旁的「池」座席是纯会话级切换，不写全局默认。",
         statusLoading: "读取池清单…",
         statusError: "池不可达",
         poolOnline: "池在线",
         profileUnit: "个 profile",
         empty: "池为空",
         exported: "已导出",
-        isDefault: "默认",
+        isDefault: "全局默认",
         useAsDefault: "导出并设为默认",
         busy: "处理中…",
         done: "已应用",
         poolShort: "池",
-        seatHint: "选择池中 queen：立即作用于当前空白会话，之后的新会话按默认值；运行中的会话保持不变。",
+        seatHint: "选择池中 queen：仅作用于当前空白会话（无空白会话时作用于下一个空白会话）；不影响其他会话，不改变全局默认。",
         seatEmpty: "池中没有 queen（或池不可达）",
         errExport: "操作失败",
-        setDefault: "设为默认",
+        setDefault: "设为全局默认",
         noInject: "不加载（默认）",
-        noInjectDesc: "空白会话切回官方预设后，回收全部池导出预设；官方预设与默认不受影响。",
+        noInjectDesc: "当前空白会话切回官方预设；无人引用的池导出将被回收；全局默认不变。",
         resetBtn: "恢复默认",
-        presetHint: "本节是完整孵化名册；输入框旁的「池」座席只提供 queen 与「不加载（默认）」。",
+        presetHint: "本节管理完整孵化名册与全局默认；输入框旁的「池」座席只做会话级切换（queen + 不加载）。",
       };
       var en = {
         nav: "Agent pool",
         title: "Agent pool (profile pool)",
-        subtitle: "Pool = incubation source, export = transient deployment. Picking: export → make default → apply to the current blank session once; Reset first moves blank sessions onto a safe official preset, then reclaims every pool export.",
+        subtitle: "Pool = incubation source, export = transient deployment. This page owns the full roster and the GLOBAL default; the composer Pool seat is a strictly per-session switch.",
         statusLoading: "Loading pool…",
         statusError: "Pool unreachable",
         poolOnline: "Pool online",
         profileUnit: "profiles",
         empty: "Pool is empty",
         exported: "exported",
-        isDefault: "default",
+        isDefault: "global default",
         useAsDefault: "Export & make default",
         busy: "Working…",
         done: "Applied",
         poolShort: "Pool",
-        seatHint: "Pick a pool queen: applies to the current blank session at once, future sessions via the default; running sessions keep theirs.",
+        seatHint: "Pick a pool queen: applies to the current blank session only (or the next blank one); other sessions and the global default are untouched.",
         seatEmpty: "No queen in the pool (or pool unreachable)",
         errExport: "Operation failed",
-        setDefault: "Make default",
+        setDefault: "Make global default",
         noInject: "No loading (default)",
-        noInjectDesc: "Move blank sessions onto an official preset, then reclaim every pool-exported preset; official presets and defaults are untouched.",
+        noInjectDesc: "Revert the current blank session to an official preset; reclaim pool exports no session references; the global default stays.",
         resetBtn: "Reset to default",
-        presetHint: "This section is the full incubation roster; the composer Pool seat offers queens and “No loading (default)” only.",
+        presetHint: "This section owns the full roster and the global default; the composer Pool seat is per-session only (queens + no loading).",
       };
 
       var INITIAL = {
@@ -91,6 +92,7 @@
         presets: [], // roster side: {id, name, trust, broken, isDefault}
         busyName: null,
         lastApplied: null,
+        stage: null, // ONE-SHOT pending pick: {name} — see controller comments
       };
 
       function createPoolStore() {
@@ -110,9 +112,9 @@
         this.api = api;
         this.store = store;
         // Attached when the runtime exposes the sessions store (see apply()).
-        // Without it the seat degrades to default-only semantics.
-        this.currentSession = null;
-        this.blankSessions = null; // () => [{id, agentPreset}] for every blank session
+        // Without these the seat degrades gracefully (pick errors visibly).
+        this.currentSession = null; // () => {id, blank, agentPreset} | undefined
+        this.sessionPresets = null; // () => {sessionId: agentPreset|undefined}
       }
       PoolController.prototype.rpc = function (method, params) {
         return fetch(POOL_ORIGIN, {
@@ -163,24 +165,54 @@
           self.store.set({ fetching: false, status: "error", error: String((e && e.message) || e) });
         });
       };
-      // One-shot: switch the CURRENT blank session at click time. Never
-      // persists — v2's surviving stage hijacked blank sessions later and
-      // overrode explicit official-picker picks (proven in the session log).
-      // Future sessions are covered by the default at creation time.
-      PoolController.prototype.selectCurrentBlank = function (name) {
-        var self = this;
-        var cs = self.currentSession && self.currentSession();
-        if (cs === undefined || cs === null) return Promise.resolve();
-        if (!cs.blank || cs.agentPreset === name) return Promise.resolve();
-        return self.api.agentPresets.select({ sessionId: cs.id, agentPreset: name }).then(function (r) { return r.result; })
+      PoolController.prototype.selectSession = function (sessionId, name) {
+        return this.api.agentPresets.select({ sessionId: sessionId, agentPreset: name }).then(function (r) { return r.result; })
           .then(function (result) {
             if (!result.ok) throw new Error((result.error && result.error.message) || "select failed");
-            return undefined;
-          })
-          .catch(function (e) {
-            self.store.set({ error: String((e && e.message) || e) });
+            return result.value.agentPreset;
           });
       };
+      // ONE-SHOT stage: deliver a pick to the next blank session. It dies on
+      // delivery, on any competing agent-preset/selected event, or when the
+      // current session turns non-blank — the v2 hijack cannot recur.
+      PoolController.prototype.applyStage = function () {
+        var self = this;
+        var stage = self.store.getSnapshot().stage;
+        if (!stage) return;
+        var cs = self.currentSession && self.currentSession();
+        if (cs === undefined || cs === null) return; // still no session: keep waiting
+        if (!cs.blank) { self.store.set({ stage: null }); return; } // moot: user is conversing
+        if (cs.agentPreset === stage.name) { self.store.set({ stage: null }); return; }
+        self.selectSession(cs.id, stage.name)
+          .then(function () { self.store.set({ stage: null, lastApplied: stage.name }); })
+          .catch(function (e) { self.store.set({ stage: null, error: String((e && e.message) || e) }); });
+      };
+      // SEAT pick — strictly per-session, never writes the global default.
+      PoolController.prototype.pickForSession = function (name) {
+        var self = this;
+        var before = self.store.getSnapshot();
+        if (before.busyName) return Promise.resolve();
+        self.store.set({ busyName: name, error: null });
+        var cs = self.currentSession && self.currentSession();
+        var run = self.rpc("pool/export", { name: name, force: true }).then(function () {
+          if (cs !== undefined && cs !== null && cs.blank && cs.agentPreset !== name) {
+            return self.selectSession(cs.id, name).then(function () { return name; });
+          }
+          if (cs !== undefined && cs !== null) return name; // blank already on it, or running (immutable)
+          // no session at all: deliver to the NEXT blank session, once
+          self.store.set({ stage: { name: name } });
+          return name;
+        });
+        return run
+          .then(function (applied) {
+            self.store.set({ busyName: null, lastApplied: applied });
+            return self.load();
+          })
+          .catch(function (e) {
+            self.store.set({ busyName: null, error: String((e && e.message) || e) });
+          });
+      };
+      // SECTION actions — the ONLY places that write the global default.
       PoolController.prototype.setDefault = function (id) {
         var self = this;
         var before = self.store.getSnapshot();
@@ -190,23 +222,37 @@
           .then(function (result) {
             if (!result.ok) throw new Error((result.error && result.error.message) || "default write failed");
             self.store.set({ busyName: null, lastApplied: id });
-            return self.selectCurrentBlank(id).then(function () { return self.load(); });
+            return self.load();
           })
           .catch(function (e) {
             self.store.set({ busyName: null, error: String((e && e.message) || e) });
           });
       };
+      PoolController.prototype.exportAndDefault = function (name) {
+        var self = this;
+        var before = self.store.getSnapshot();
+        if (before.busyName) return Promise.resolve();
+        self.store.set({ busyName: name, error: null });
+        return self.rpc("pool/export", { name: name, force: true }).then(function () {
+          return self.api.settings.update({ ns: "agent-presets", patch: { default: name } }).then(function (r) { return r.result; });
+        }).then(function (result) {
+          if (!result.ok) throw new Error((result.error && result.error.message) || "default write failed");
+          self.store.set({ busyName: null, lastApplied: name });
+          return self.load();
+        }).catch(function (e) {
+          self.store.set({ busyName: null, error: String((e && e.message) || e) });
+        });
+      };
+      // 「不加载」 — per-session revert + reclaim what nothing references.
       PoolController.prototype.resetDefault = function () {
         var self = this;
         var before = self.store.getSnapshot();
         if (before.busyName) return Promise.resolve();
-        self.store.set({ busyName: "__reset__", error: null });
-        // Reclaim exactly what the pool exported — never an official preset.
+        self.store.set({ busyName: "__reset__", error: null, stage: null });
         var doomed = {};
         before.profiles.forEach(function (p) { if (p.exported) doomed[p.name] = true; });
-        // Safe landing preset for blank sessions running a doomed one: the
-        // current default when it survives, else "standard", else the first
-        // non-doomed system preset.
+        // Official landing preset: the surviving default, else standard,
+        // else the first non-doomed system preset.
         var currentDefault = null;
         before.presets.forEach(function (p) { if (p.isDefault) currentDefault = p.id; });
         var safe = currentDefault !== null && !doomed[currentDefault] ? currentDefault : null;
@@ -217,24 +263,22 @@
           }
         }
         var chain = Promise.resolve();
-        // 1) move every blank session off the doomed presets (a select against
-        //    a non-current blank may be refused; that is survivable, the host
-        //    refuses rather than corrupting — the current one matters most).
-        if (safe !== null && self.blankSessions) {
-          self.blankSessions().forEach(function (s) {
-            if (!s.agentPreset || !doomed[s.agentPreset]) return;
-            chain = chain.then(function () {
-              return self.api.agentPresets.select({ sessionId: s.id, agentPreset: safe }).then(function (r) {
-                if (r.result && r.result.ok === false) return undefined; // non-current blank refused: tolerable
-              }).catch(function () { return undefined; });
-            });
+        // 1) revert the CURRENT blank session off a doomed preset.
+        var cs = self.currentSession && self.currentSession();
+        if (safe !== null && cs && cs.blank && cs.agentPreset !== undefined && doomed[cs.agentPreset]) {
+          chain = chain.then(function () {
+            return self.selectSession(cs.id, safe).catch(function () { return undefined; });
           });
         }
-        // 2) reclaim the exported directories; agentPresets.remove itself
-        //    clears a user default that pointed at a removed preset, so an
-        //    official default set through the official UI can never be culled.
+        // 2) reclaim only directories NO session references (blank or not) —
+        //    stranding a session on a deleted preset is the ghost-value bug.
+        var inUse = {};
+        if (self.sessionPresets) {
+          var map = self.sessionPresets();
+          Object.keys(map).forEach(function (sid) { if (map[sid]) inUse[map[sid]] = true; });
+        }
         before.profiles.forEach(function (p) {
-          if (!p.exported) return;
+          if (!p.exported || inUse[p.name]) return;
           chain = chain.then(function () {
             return self.api.agentPresets.remove({ agentPreset: p.name }).then(function (r) {
               if (r.result && r.result.ok === false) throw new Error((r.result.error && r.result.error.message) || ("remove " + p.name + " failed"));
@@ -249,21 +293,6 @@
           .catch(function (e) {
             self.store.set({ busyName: null, error: String((e && e.message) || e) });
           });
-      };
-      PoolController.prototype.applyDefault = function (name) {
-        var self = this;
-        var before = self.store.getSnapshot();
-        if (before.busyName) return Promise.resolve();
-        self.store.set({ busyName: name, error: null });
-        return self.rpc("pool/export", { name: name, force: true }).then(function () {
-          return self.api.settings.update({ ns: "agent-presets", patch: { default: name } }).then(function (r) { return r.result; });
-        }).then(function (result) {
-          if (!result.ok) throw new Error((result.error && result.error.message) || "default write failed");
-          self.store.set({ busyName: null, lastApplied: name });
-          return self.selectCurrentBlank(name).then(function () { return self.load(); });
-        }).catch(function (e) {
-          self.store.set({ busyName: null, error: String((e && e.message) || e) });
-        });
       };
 
       var style = {
@@ -301,7 +330,7 @@
       function PoolSection(props) {
         var t = props.t;
         var load = props.load;
-        var applyDefault = props.applyDefault;
+        var exportAndDefault = props.exportAndDefault;
         var setDefault = props.setDefault;
         var resetDefault = props.resetDefault;
         var store = props.poolStore;
@@ -347,7 +376,7 @@
                   type: "button",
                   disabled: !!state.busyName,
                   onClick: function () {
-                    if (!p.exported) { applyDefault && applyDefault(p.name); return; }
+                    if (!p.exported) { exportAndDefault && exportAndDefault(p.name); return; }
                     setDefault && setDefault(p.name);
                   },
                 }, busy ? t("busy") : (p.exported ? t("setDefault") : t("useAsDefault")))
@@ -362,8 +391,9 @@
       function PoolSeat(props) {
         var t = props.t;
         var load = props.load;
-        var applyDefault = props.applyDefault;
+        var pickForSession = props.pickForSession;
         var resetDefault = props.resetDefault;
+        var currentSession = props.currentSession;
         var store = props.poolStore;
         var state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
         var open = React.useState(false);
@@ -389,6 +419,11 @@
           state.busyName ? "…" : ""
         );
         if (!ready) return anchor;
+        // Selection is THIS SESSION's preset (per-session semantics): a
+        // queen-family agentPreset checks its row, anything else 不加载.
+        var cs = currentSession && currentSession();
+        var selectedId = "__none__";
+        if (cs && cs.agentPreset && SEAT_FAMILY.test(cs.agentPreset)) selectedId = "pool:" + cs.agentPreset;
         if (seatProfiles.length === 0) {
           return h(primitives.Menu, {
             open: open[0],
@@ -416,25 +451,18 @@
             return {
               id: "pool:" + p.name,
               label: h("span", { style: style.badges },
-                h("span", { style: style.name }, p.name + " v" + p.version),
-                p.isDefault && h("span", { style: Object.assign({}, style.badge, style.badgeDefault) }, t("isDefault"))
+                h("span", { style: style.name }, p.name + " v" + p.version)
               ),
             };
           })),
-          selectedId: (function () {
-            var pd = state.profiles.find(function (p) { return p.isDefault; });
-            if (!pd) return "__none__";
-            return SEAT_FAMILY.test(pd.name) ? "pool:" + pd.name : undefined;
-          })(),
+          selectedId: selectedId,
           onSelect: function (id) {
             setOpen(false);
             if (id === "__none__") { resetDefault && resetDefault(); return; }
             if (id.indexOf("pool:") !== 0) return;
-            var name = id.slice(5);
-            // Always run the full pipeline: force re-export keeps the preset
-            // fresh with the pool copy, then default + one-shot blank-session
-            // switch. Nothing persists beyond the click.
-            applyDefault && applyDefault(name);
+            // Per-session: export fresh, switch THIS blank session, nothing
+            // global. No blank session yet → one-shot stage (next blank).
+            pickForSession && pickForSession(id.slice(5));
           },
           align: "start",
           portal: true,
@@ -451,41 +479,60 @@
         ctx.effect(function () {
           return ctx.locale.register(NS, { zh: zh, en: en });
         }, "ui-agent-pool: dictionaries");
-        // Session awareness (optional): the click-time one-shot needs the
-        // current session, and the reset needs every blank session. Wrapped so
-        // an unavailable service degrades to default-only, never breaks the
-        // seat. There is deliberately NO subscription applying anything on
-        // session changes — v2's subscriber is what hijacked blank sessions.
+        // Session awareness (optional but expected): current session for the
+        // one-shot switch, the full session→preset map for safe reclamation,
+        // and the two listeners that keep the ONE-SHOT stage honest:
+        //   - sessions.list change → try delivering the stage once;
+        //   - agent-preset/selected → the stage is consumed or cancelled by
+        //     ANY preset selection anywhere (mine confirms delivery, anyone
+        //     else's cancels it). This is the guard the v2 hijack lacked.
         try {
           ctx.inject(["sessions"], function (scope) {
             controller.currentSession = function () {
               var state = scope.sessions.list.getSnapshot();
               var summary = state.current === undefined ? undefined : state.byId[state.current];
               if (summary === undefined || summary === null) return undefined;
-              return {
-                id: summary.id,
-                blank: summary.blank,
-                agentPreset: summary.agentPreset,
-              };
+              return { id: summary.id, blank: summary.blank, agentPreset: summary.agentPreset };
             };
-            controller.blankSessions = function () {
+            controller.sessionPresets = function () {
               var state = scope.sessions.list.getSnapshot();
-              var out = [];
+              var out = {};
               (state.ids || []).forEach(function (id) {
                 var s = state.byId[id];
-                if (s && s.blank && s.agentPreset !== undefined) out.push({ id: s.id, agentPreset: s.agentPreset });
+                if (s) out[id] = s.agentPreset;
               });
               return out;
             };
+            scope.effect(function () {
+              var stop1 = scope.sessions.list.subscribe(function () { controller.applyStage(); });
+              var stop2 = null;
+              if (scope.remote && scope.remote.$on) {
+                stop2 = scope.remote.$on("agent-preset/selected", function (sessionId, agentPreset) {
+                  var stage = store.getSnapshot().stage;
+                  if (!stage) return;
+                  // The event echoes every select, including this plugin's own
+                  // delivery: matching name = delivered; anything else = a
+                  // pick elsewhere superseded it. Either way the stage dies —
+                  // it never survives to hijack a later blank session.
+                  store.set({ stage: null });
+                });
+              }
+              return function () {
+                if (stop1) stop1();
+                if (stop2) stop2();
+              };
+            }, "ui-agent-pool: session watch");
           });
-        } catch (e) { /* sessions service unavailable: default-only semantics */ }
+        } catch (e) { /* sessions service unavailable: picks error visibly */ }
         var face = function () {
           return {
             poolStore: store,
             load: function () { return controller.load(); },
-            applyDefault: function (name) { return controller.applyDefault(name); },
+            pickForSession: function (name) { return controller.pickForSession(name); },
+            exportAndDefault: function (name) { return controller.exportAndDefault(name); },
             setDefault: function (id) { return controller.setDefault(id); },
             resetDefault: function () { return controller.resetDefault(); },
+            currentSession: function () { return controller.currentSession ? controller.currentSession() : undefined; },
           };
         };
         ctx.slots.inject("settings.section", function () {
