@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>三平面通信拓扑 — 结构化精排</title>
+<style>
+  :root {
+    --bg:#0b0f14; --panel:#141a22; --border:#2a3441; --text:#dbe4ee; --dim:#7d8b9d;
+    --orca:#5eb1ff; --dsh:#4cd07d; --dais:#e8b339; --waist:#ff7ab8; --hot:#ff5c5c;
+    --grid:#1a2230;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:"JetBrains Mono","Cascadia Code",Consolas,"Noto Sans SC",monospace;padding:20px}
+  header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  h1{font-size:18px;font-weight:600;letter-spacing:.5px}
+  h1 small{color:var(--dim);font-weight:400;font-size:12px;margin-left:10px}
+  .hud{font-size:11px;color:var(--dim)}
+  #wrap{display:flex;gap:14px;height:calc(100vh - 64px);min-height:640px}
+  #side{width:250px;flex:none;display:flex;flex-direction:column;gap:8px;overflow-y:auto}
+  .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:11px;line-height:1.65}
+  .box h3{font-size:11px;letter-spacing:1px;margin-bottom:6px;text-transform:uppercase;color:var(--dim)}
+  .box .k{color:var(--waist)}
+  .box .o{color:var(--orca)} .box .d{color:var(--dsh)} .box .a{color:var(--dais)}
+  .btns{display:flex;gap:6px;flex-wrap:wrap}
+  .btns button{flex:1;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 4px;font:inherit;font-size:11px;cursor:pointer;min-width:70px}
+  .btns button.active{border-color:var(--waist);color:var(--waist)}
+  .btns button:hover{border-color:var(--dim)}
+  #stage{flex:1;position:relative;background:
+    linear-gradient(var(--grid) 1px,transparent 1px),
+    linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:40px 40px;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  #stage svg{position:absolute;inset:0;width:100%;height:100%}
+  .plane{stroke-width:1.5;stroke-dasharray:7 5;fill-opacity:.035;rx:14}
+  .plabel{font-size:12px;font-weight:700;letter-spacing:3px}
+  .pcard{cursor:pointer}
+  .pcard:hover rect.body{stroke-width:2.4}
+  rect.body{fill:var(--panel);rx:9}
+  .nt{font-size:12px;font-weight:600}
+  .ns{font-size:9.5px;fill:var(--dim)}
+  .badge{font-size:8.5px;font-weight:700;letter-spacing:.5px}
+  .elbl{font-size:9.5px;paint-order:stroke;stroke:var(--bg);stroke-width:3.5px}
+  .edge{fill:none;stroke-width:1.7}
+  .edge.dash{stroke-dasharray:5 5}
+  .edge.hot{stroke-width:2.6}
+  .q{stroke:var(--hot);stroke-width:1.4;stroke-dasharray:3 4;fill:none;opacity:.7}
+  #tip{position:fixed;display:none;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 15px;font-size:11.5px;max-width:420px;line-height:1.7;pointer-events:none;z-index:99;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+  #tip b{color:var(--waist)}
+  #tip .m{color:var(--dim);font-size:10.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>三平面通信拓扑<small>网格实态 · 空间结构化</small></h1>
+  <div class="hud" id="hud">hover 节点/边看详情 · 点击平面聚焦</div>
+</header>
+<div id="wrap">
+  <aside id="side">
+    <div class="box btns">
+      <button data-v="grid" class="active">网格实态</button>
+      <button data-v="hops">逐跳路径</button>
+      <button data-v="waist">窄腰升格</button>
+      <button id="flow">▶ 动画</button>
+    </div>
+    <div class="box" id="info">
+      <h3>图例</h3>
+      <span class="o">■ Orca</span> · <span class="d">■ DSH</span> · <span class="a">■ dais</span><br>
+      实线 = 原生封装 · 虚线 = CLI 直达<br>
+      <span style="color:var(--hot)">━</span> 生产实测流量<br>
+      灰宽线 = 同进程内聚(不跨平面)
+    </div>
+    <div class="box" id="facts">
+      <h3>读图三步</h3>
+      1. 顶栏 = 发起点(谁都能发)<br>
+      2. 中层 = 三平面端点(左中右)<br>
+      3. 底层 = 寻址面(怎么找到人)<br>
+      边上标签 = 协议/信封
+    </div>
+  </aside>
+  <div id="stage"><svg id="graph" viewBox="0 0 1160 760" preserveAspectRatio="xMidYMid meet"></svg></div>
+</div>
+<div id="tip"></div>
+
+<script>
+const NS='http://www.w3.org/2000/svg';
+const C={orca:'#5eb1ff',dsh:'#4cd07d',dais:'#e8b339',waist:'#ff7ab8',dim:'#7d8b9d',hot:'#ff5c5c',none:'#9aa7b6'};
+const svg=document.getElementById('graph'),tip=document.getElementById('tip');
+function el(t,a,p){const n=document.createElementNS(NS,t);for(const k in a)n.setAttribute(k,a[k]);if(p)p.appendChild(n);return n}
+function txt(p,x,y,s,cls,fill,anchor){const t=el('text',{x,y,class:cls,'text-anchor':anchor||'middle'},p);if(fill)t.setAttribute('fill',fill);t.textContent=s;return t}
+
+// ============ 布局:严格三泳道,层间语义分组 ============
+// 顶栏 y=40..110 发起层; 中层 y=150..330 端点层; 底层 y=560..700 寻址层
+const LANE={orca:{x:60,w:320},dsh:{x:450,w:300},dais:{x:840,w:290}};
+
+const N={
+  // —— 发起层(任何 agent 站在这层发消息) ——
+  agOrca:{lane:'top',x:95,y:48,w:190,h:54,plane:'orca',t:'Orca pane agent',s:'cc/codex/omp',tip:'<b>Orca pane 里的 agent</b><br>原生: terminal send / orchestration<br>直达: dais CLI、cb-send(经skill)'},
+  agDsh:{lane:'top',x:470,y:48,w:190,h:54,plane:'dsh',t:'DSH 会话 agent',s:'maestro preset',tip:'<b>DSH 会话内 agent</b><br>原生: session.prompt / followup<br>直达: orca-ide CLI、dais CLI'},
+  cron:{lane:'top',x:680,y:48,w:160,h:54,plane:'none',t:'cron / 脚本',s:'headless · cb-send',tip:'<b>无终端进程</b><br>只能走 HTTP/文件: cb-send<br>或 a2a :8790'},
+  agDais:{lane:'top',x:865,y:48,w:190,h:54,plane:'dais',t:'dais pane agent',s:'任意 harness',tip:'<b>dais pane 里的 agent</b><br>原生: send-message / inject-prompt<br>直达: orca-ide CLI、cb-send'},
+
+  // —— Orca 端点层 ——
+  orcaRT:{lane:'orca',x:90,y:190,w:250,h:64,plane:'orca',t:'Run mailbox',s:'orchestration send/check/ask<br>FIFO+ack · pull-based',tip:'<b>Orca 运行时存储</b>(Electron主进程)<br>Run = namespace+home inbox<br>worker_done/heartbeat/escalation<br>coordinator 用 check --wait 拉'},
+  orcaPTY:{lane:'orca',x:90,y:290,w:250,h:64,plane:'orca',t:'terminal PTY',s:'terminal send/read<br>裸字节 fire-forget',tip:'<b>PTY stdin 直注</b><br>无信封无确认,agent TUI 消费<br>bypass: orca-com<br>(ELECTRON_RUN_AS_NODE,历史路径)'},
+
+  // —— DSH 端点层 ——
+  dshRPC:{lane:'dsh',x:470,y:190,w:260,h:64,plane:'dsh',t:'宿主 RPC :3080',s:'/api/session.prompt<br>queue/steer → Agent.Inbox',tip:'<b>DSH 唯一持久载体入口</b><br>mode:queue→followup, steer→steer<br>5条进程内通道全收敛 Agent.Inbox'},
+  dshBr:{lane:'dsh',x:470,y:290,w:260,h:64,plane:'dsh',t:'host-callback-bridge',s:'HTTP:46855 + inbox.log<br>fs.watch → RPC (ORCA-CB])',tip:'<b>宿主 boot 承载(SI-003)</b><br>双入口: HTTP /callback 同步 append<br>+ 文件 fs.watch<br>60s 去重 · dead.log · 轮转'},
+  dshA2A:{lane:'dsh',x:470,y:390,w:260,h:56,plane:'dsh',t:'a2a server :8790',s:'agents/send 轻载→session-send<br>重载→dais mailbox',tip:'<b>a2a-profile-server</b><br>http-server.js:171-175<br>DSHMSG] 信封塞进 dais 消息体<br>= 信封进 payload(分层缺失信号)'},
+
+  // —— dais 端点层 ——
+  daisMB:{lane:'dais',x:850,y:190,w:250,h:64,plane:'dais',t:'SQLite mailbox',s:'send-message / check-messages<br>push指针+pull消费',tip:'<b>~/.local/state/dais/warp.sqlite</b><br>messages 表 to_handle 寻址<br>770条 · DSH身份286条<br>43条含DSH信封'},
+  daisRT:{lane:'dais',x:850,y:290,w:250,h:64,plane:'dais',t:'router 线程',s:'drain→route→push<br>inject-prompt(仅idle)',tip:'<b>dais 后台线程</b><br>9种 MessageType<br>block-settle: 块完成自动settle'},
+
+  // —— 寻址层(底部横排,全部是"查表"不是"通道") ——
+  fFleet:{lane:'addr',x:90,y:600,w:190,h:56,plane:'dsh',t:'fleet.json',s:'shortcode→sessionId',tip:'<b>DSH 会话登记</b><br>spawn建/touch租约/purge删<br>与桥投递正交'},
+  fReg:{lane:'addr',x:300,y:600,w:190,h:56,plane:'dsh',t:'registry.json',s:'sid→alias/pid',tip:'<b>桥消费者路由表</b><br>host-callback-bridge 用'},
+  fRun:{lane:'addr',x:510,y:600,w:190,h:56,plane:'orca',t:'Run:id',s:'run:xx / dispatch:xx',tip:'<b>Orca 寻址</b><br>Run namespace + dispatch id'},
+  fHandle:{lane:'addr',x:720,y:600,w:190,h:56,plane:'dais',t:'to_handle',s:'session_N / dispatch_id',tip:'<b>dais 寻址</b><br>SQLite to_handle 列'},
+  fCard:{lane:'addr',x:930,y:600,w:190,h:56,plane:'none',t:'Agent Card',s:'(目标态)自描述',tip:'<b>窄腰目标</b><br>机读地址+能力声明<br>治接线断链'},
+};
+// 边: [from,to,标签,类型(native|cli|hot|intra),tip]
+const E=[
+  // 发起层→端点(原生)
+  ['agOrca','orcaRT','orch send','native','<b>原生</b> orchestration send<br>结构化,FIFO+ack'],
+  ['agOrca','orcaPTY','terminal send','native','<b>原生</b> PTY 裸注'],
+  ['agDsh','dshRPC','followup/inject','intra','<b>进程内</b> 5通道收敛 Inbox'],
+  ['agDais','daisMB','send-message','native','<b>原生</b> SQLite 写入'],
+  // 发起层→端点(CLI 直达)
+  ['agOrca','daisMB','dais CLI','cli','<b>CLI直达·未通电</b><br>可达零围栏,skill断链(zap-direct-send改名)<br>生产 from_handle 无 Orca 身份'],
+  ['agDsh','daisMB','dais send-msg','cli','<b>CLI直达</b> persona:41,87 内联支撑<br>装点缺 skill 分发(断链B)'],
+  ['agDsh','orcaPTY','orca-ide CLI','cli','<b>CLI直达</b> ~/.local/bin 可执行'],
+  ['agDais','dshBr','cb-send','cli','<b>CLI直达</b> dais pane 内执行<br>HTTP优先→文件兜底'],
+  ['agDais','orcaPTY','orca-ide CLI','cli','<b>CLI直达</b>'],
+  // 端点间(DSH 内聚)
+  ['dshBr','dshRPC','ORCA-CB] → prompt','hot','<b>生产实测</b> 桥→loopback RPC<br>ORCA-CB] 信封, mode:queue'],
+  ['dshA2A','dshRPC','轻载','intra','轻载→session-send'],
+  ['dshA2A','daisMB','DSHMSG] 进 body','hot','<b>生产实测</b> 43条<br>网络层信封进了链路层payload<br>= 分层缺失信号'],
+  ['dshRPC','fFleet','短码解析','addr','session-send 寻址'],
+  ['dshBr','fReg','consumer 查表','addr','桥寻址'],
+  ['orcaRT','fRun','Run 绑定','addr',''],
+  ['daisMB','fHandle','to_handle','addr',''],
+  ['dshRPC','fCard','升格','addr','窄腰目标: 逻辑寻址'],
+  ['cron','dshBr','cb-send','hot','<b>生产实测</b> headless 主路径',{a:'bottom',b:'right'}],
+  ['cron','dshA2A','HTTP','cli','',null,{a:'bottom',b:'right'}],
+  ['orcaRT','orcaPTY','dispatch --inject','native','任务注入 preamble'],
+  ['daisRT','daisMB','push 指针','intra','router→mailbox'],
+  ['orcaPTY','dshBr','cat>>inbox.log','cli','桥pane: PTY→文件spool'],
+];
+
+const addrLane=['fFleet','fReg','fRun','fHandle','fCard'];
+
+function anchor(a,b,force){
+  const A=N[a],B=N[b];
+  const acx=A.x+A.w/2,acy=A.y+A.h/2,bcx=B.x+B.w/2,bcy=B.y+B.h/2;
+  const dx=bcx-acx,dy=bcy-acy;
+  let ax,ay,bx,by;
+  const fa=force&&force.a, fb=force&&force.b;
+  if(fa==='bottom'){ax=acx;ay=A.y+A.h} else if(fa==='top'){ax=acx;ay=A.y}
+  else if(fa==='right'){ax=A.x+A.w;ay=acy} else if(fa==='left'){ax=A.x;ay=acy}
+  if(fb==='right'){bx=B.x+B.w;by=bcy} else if(fb==='left'){bx=B.x;by=bcy}
+  else if(fb==='top'){bx=bcx;by=B.y} else if(fb==='bottom'){bx=bcx;by=B.y+B.h}
+  if(fa||fb){ if(!fa){ax=dx>0?A.x+A.w:A.x;ay=acy} if(!fb){bx=dx>0?B.x:B.x+B.w;by=bcy} return{ax,ay,bx,by}; }
+  if(Math.abs(dx)>Math.abs(dy)){ // 水平主导
+    ax=dx>0?A.x+A.w:A.x; ay=acy;
+    bx=dx>0?B.x:B.x+B.w; by=bcy;
+  }else{ // 垂直主导
+    ax=acx; ay=dy>0?A.y+A.h:A.y;
+    bx=bcx; by=dy>0?B.y:B.y+B.h;
+  }
+  return{ax,ay,bx,by};
+}
+function edgeD(a,b,force){
+  const{ax,ay,bx,by}=anchor(a,b,force);
+  const mx=(ax+bx)/2,my=(ay+by)/2;
+  const dy=(by-ay),dx=(bx-ax);
+  const cx=mx-(dy*0.12),cy=my+(dx*0.06); // 轻微弧度避正交死板
+  return `M${ax},${ay} Q${cx},${cy} ${bx},${by}`;
+}
+
+let edgeEls=[];
+function drawGrid(){
+  svg.innerHTML='';edgeEls=[];
+  // 层背景带
+  const bands=[
+    {y:26,h:150,label:'发起层 — 任何 agent 都能站在这发消息',c:'#9aa7b6'},
+    {y:186,h:330,label:'端点层 — 三平面 IPC 端点(左:Orca 中:DSH 右:dais)',c:'#3d4a5c'},
+    {y:570,h:110,label:'寻址层 — 查表面(不是通道) · 底部横排',c:'#5c4a3d'},
+  ];
+  bands.forEach(B=>{
+    el('rect',{x:14,y:B.y,width:1132,height:B.h,fill:B.c,'fill-opacity':.03,stroke:B.c,'stroke-opacity':.18,'stroke-dasharray':'2 6',rx:12},svg);
+    txt(svg,24,B.y+16,B.label,'ns',B.c,'start');
+  });
+  // 泳道竖带(端点层)
+  for(const k in LANE){const L=LANE[k];
+    el('rect',{x:L.x-20,y:186,width:L.w+40,height:330,fill:C[k],'fill-opacity':.04,stroke:C[k],'stroke-opacity':.3,'stroke-dasharray':'7 5',rx:14,class:'plane'},svg);
+    txt(svg,L.x+L.w/2,206,k.toUpperCase()+' 平面','plabel',C[k]);
+  }
+
+  // 边
+  // 障碍集 = 全部节点卡片几何(来自 N,不依赖绘制顺序) + 已放边标签
+  const placedLbls = Object.values(N).map(n=>({x:n.x,y:n.y,w:n.w,h:n.h}));
+  E.forEach(e=>{
+    const[f,t,lb,ty,tp,force]=e;
+    const stroke= ty==='hot'?C.hot: ty==='native'?C[N[f].plane]: ty==='intra'?'#55637a': ty==='addr'?'#4a5568':C.dim;
+    const g=el('g',{},svg);
+    const path=el('path',{d:edgeD(f,t,force),class:'edge'+(ty==='cli'?' dash':'')+(ty==='hot'?' hot':''),stroke,opacity:ty==='addr'?.5:(ty==='cli'?.55:.85)},g);
+    if(lb){
+      // 碰撞回避: 卡片几何来自 N(不依赖 DOM 绘制顺序),已放标签也纳入碰撞集
+      const total=path.getTotalLength();
+      const w=lb.length*5.8+6, h=13;
+      const hits=(x,y)=> placedLbls.some(b=> x-w/2<b.x+b.w && x+w/2>b.x && y-10<b.y+b.h && y>b.y);
+      let placed=false;
+      for(const t of [0.42,0.3,0.55,0.22,0.68,0.14,0.78,0.86]){
+        const p1=path.getPointAtLength(total*t);
+        const p2=path.getPointAtLength(Math.min(total*t+2,total));
+        const dx=p2.x-p1.x, dy=p2.y-p1.y, len=Math.hypot(dx,dy)||1;
+        for(const off of [13,-13,22,-22,32,-32]){
+          const lx=p1.x+(-dy/len)*off, ly=p1.y+(dx/len)*off+3;
+          if(!hits(lx,ly)){ txt(g,lx,ly,lb,'elbl',ty==='hot'?C.hot:'#93a2b4'); placedLbls.push({x:lx-w/2,y:ly-10,w,h}); placed=true; break; }
+        }
+        if(placed) break;
+      }
+      if(!placed){ const p=path.getPointAtLength(total*0.5); txt(g,p.x,p.y-9,lb,'elbl',ty==='hot'?C.hot:'#93a2b4'); placedLbls.push({x:p.x-w/2,y:p.y-19,w,h}); }
+    }
+    path.addEventListener('mousemove',ev=>showTip(ev,tp||lb));
+    path.addEventListener('mouseleave',hideTip);
+    edgeEls.push({path,e});
+  });
+  // 节点
+  for(const id in N){
+    const n=N[id];const col=C[n.plane];
+    const g=el('g',{class:'pcard'},svg);
+    el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,class:'body',stroke:col,'stroke-width':1.4},g);
+    // 顶层发起节点加描边强化
+    if(n.lane==='top')el('rect',{x:n.x-3,y:n.y-3,width:n.w+6,height:n.h+6,fill:'none',stroke:col,'stroke-opacity':.25,rx:11},g);
+    txt(g,n.x+n.w/2,n.y+(n.h>50?24:20),n.t,'nt',col);
+    const lines=n.s.split('<br>');
+    lines.forEach((ln,i)=>txt(g,n.x+n.w/2,n.y+(n.h>50?42:36)+i*13,ln,'ns'));
+    // 寻址层角标
+    if(n.lane==='addr')txt(g,n.x+n.w-14,n.y+16,'🗄','badge');
+    g.addEventListener('mousemove',ev=>showTip(ev,n.tip));
+    g.addEventListener('mouseleave',hideTip);
+  }
+}
+
+function showTip(ev,html){tip.innerHTML=html||'';tip.style.display='block';
+  let x=ev.clientX+16,y=ev.clientY+14;
+  if(x+430>innerWidth)x=ev.clientX-436;if(y+150>innerHeight)y=ev.clientY-160;
+  tip.style.left=x+'px';tip.style.top=y+'px'}
+function hideTip(){tip.style.display='none'}
+
+// —— 动画 ——
+let flowOn=false,ft=null;
+function toggleFlow(){
+  flowOn=!flowOn;document.getElementById('flow').textContent=flowOn?'■ 停':'▶ 动画';
+  if(!flowOn){clearInterval(ft);document.querySelectorAll('.fdot').forEach(d=>d.remove());return}
+  ft=setInterval(()=>{
+    const it=edgeEls[Math.floor(Math.random()*edgeEls.length)];if(!it)return;
+    const ty=it.e[3];if(ty==='addr')return;
+    const dot=el('circle',{r:3.6,fill:ty==='hot'?C.hot:C.waist,class:'fdot'},svg);
+    const len=it.path.getTotalLength();let t=0;
+    const a=setInterval(()=>{t+=.024;if(t>=1){clearInterval(a);dot.remove();return}
+      const p=it.path.getPointAtLength(len*t);dot.setAttribute('cx',p.x);dot.setAttribute('cy',p.y);
+      dot.setAttribute('opacity',t<.12?t/.12:t>.85?(1-t)/.15:1)},22);
+  },380);
+}
+// —— 箭头 marker ——
+function arrowDefs(){
+  const defs=el('defs',{},svg);
+  const m=el('marker',{id:'arw',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6.5,markerHeight:6.5,orient:'auto-start-reverse'},defs);
+  el('path',{d:'M0,0 L10,5 L0,10 z',fill:'#7d8b9d'},m);
+}
+
+// —— 视图2: 逐跳路径 ——
+function drawHops(){
+  svg.innerHTML='';edgeEls=[];
+  arrowDefs();
+  txt(svg,580,26,'逐跳路径 — 一条消息实际经过的每一跳','plabel','#9aa7b6');
+  const P=[
+    {tag:'外部→DSH 回调',col:C.dsh,note:['cb-send 主路径','生产实测'],
+      hops:[
+      ['none','发起方','cron/agent','任意进程: cron / Orca pane / dais pane 里的 agent'],
+      ['dsh','cb-send','HTTP 优先','POST /callback 优先;失败降级直接 append inbox.log'],
+      ['dsh','bridge :46855','受理+去重','SHA256(from\\0body) 60s 滑窗,跨通道共享单实例'],
+      ['dsh','inbox.log','append 持久','持久证据;1MB/1000行轮转;malformed→dead.log'],
+      ['dsh','file-router','watch+寻址','fs.watch → registry.json 解析 to(alias@sid/短码/*)'],
+      ['dsh','RPC :3080','mode:queue','/api/session.prompt → Agent.Inbox 唯一持久载体'],
+      ['dsh','DSH 回合','ORCA-CB] 注入','回合首行信封;idle→followup 忙→inject'],
+    ],
+      up:[
+      ['none','发起方','任意进程','agent://to 直接写在信封头,不关心对面是什么平面'],
+      ['waist','adapter 入口','任一 CLI','cb-send/session-send/a2a 收到的都是同一信封 v3(from,to,via,ttl)'],
+      ['waist','窄腰寻址','agent://','Agent Card+解析层(DNS角色)解析到 (dsh, sessionId);不再背平面句柄'],
+      ['waist','信封 v3','via/ttl/ver','via 记路径防套娃;ttl 防环路;msgid 去重沿用'],
+      ['dsh','dsh adapter','→RPC/inbox','适配层把信封原样投到本面载体;ORCA-CB] 降级为兼容旧格式'],
+      ['dsh','DSH 回合','信封原样','回合收到的就是 v3 信封,无需桥内翻译'],
+    ]},
+    {tag:'DSH→DSH 直发',col:C.dsh,note:['session-send','唯一实证通道'],
+      hops:[
+      ['dsh','DSH agent','maestro','任意 DSH 会话内 agent'],
+      ['dsh','session-send','CLI','bin/session-send'],
+      ['dsh','fleet.json','短码解析','4-hex → sessionId'],
+      ['dsh','steer 闸','OF-002','type=steer 查租约;他人有效租约→拒(exit 4)'],
+      ['dsh','RPC :3080','DSHMSG] v2','信封 {from,to,type,ref,body,msgid,ts}'],
+      ['dsh','目标回合','queue 唤醒','首动作 msg-dedup 60s (from,msgid) 去重'],
+    ],
+      up:[
+      ['dsh','DSH agent','任意会话','to 直接写 agent://orch-1,不查短码'],
+      ['waist','dsh adapter','信封 v3','DSHMSG] v2 升格为 v3(+via/ttl/ver);字段向后兼容'],
+      ['waist','窄腰寻址','agent://','解析层查 fleet+registry(合为 DNS 角色);租约闸留在应用层'],
+      ['dsh','载体','RPC/inbox','载体不变:session.prompt → Agent.Inbox'],
+      ['dsh','目标回合','v3 信封','msg-dedup 沿用;msg-id 全平面唯一'],
+    ]},
+    {tag:'DSH→dais 重载',col:C.dais,note:['a2a :8790','信封进 payload'],
+      hops:[
+      ['dsh','DSH agent','任意','经 a2a HTTP :8790 agents/send'],
+      ['dsh','a2a :8790','scope 校验','同 project 全通;跨 project 需 grant'],
+      ['dsh','构造行','DSHMSG] body','http-server.js:171 信封串塞消息体 — 分层缺失信号'],
+      ['dais','SQLite','to_handle','warp.sqlite messages 表;770条/DSH身份286'],
+      ['dais','push 指针','PTY 注入','指针注入+空闲边沿检测'],
+      ['dais','dais pane','pull 消费','check-messages 标记 read'],
+    ],
+      up:[
+      ['dsh','DSH agent','任意会话','to = agent://peer-x,scope 校验留在应用层'],
+      ['waist','dsh adapter','信封 v3','不再手拼 DSHMSG] 字符串塞 body — 信封由腰部统一定义'],
+      ['waist','窄腰寻址','agent://','解析到 (dais, session_N / dispatch_id)'],
+      ['dais','dais adapter','→SQLite','信封作为消息头字段落库,message_type 映射词汇表'],
+      ['dais','载体','push/pull','载体机制不变:指针注入+pull 消费'],
+      ['dais','dais pane','信封原样','收方看到的是 v3 头,不是裸信封串'],
+    ]},
+    {tag:'Orca→DSH 桥pane',col:C.orca,note:['terminal send','纯 PTY 路径'],
+      hops:[
+      ['orca','Orca agent','pane 内','有 terminal handle 时'],
+      ['orca','terminal send','PTY','写桥 pane stdin'],
+      ['dsh','桥 pane','cat>>inbox','PTY 落文件 spool'],
+      ['dsh','file-router','watch','与回调桥尾段同构'],
+      ['dsh','RPC :3080','queue',''],
+      ['dsh','DSH 回合','ORCA-CB]',''],
+    ],
+      up:[
+      ['orca','Orca agent','pane 内','不再需要专用桥 pane 与 cat>>inbox hack'],
+      ['waist','orca adapter','orch send','orchestration send 升格为 adapter:产 v3 信封'],
+      ['waist','窄腰寻址','agent://','解析到 (dsh, sessionId),平面句柄由解析层持有'],
+      ['dsh','dsh adapter','→RPC/inbox','PTY 裸字节只做本面 L1;跨平面走信封,不再借文件桥'],
+      ['dsh','DSH 回合','信封原样','有 msgid 可回执,补上 PTY 路径缺失的确认语义'],
+    ]},
+    {tag:'DSH→Orca 直发',col:C.orca,note:['orca-ide CLI','L1 无信封'],
+      hops:[
+      ['dsh','DSH agent','CLI 直达','orca-ide 在 ~/.local/bin 零围栏'],
+      ['orca','orca-ide','terminal send','handle 解析(或 orca-com name→handle)'],
+      ['orca','PTY stdin','裸字节','无信封无确认 fire-forget'],
+      ['orca','Orca pane','agent 回合','TUI 消费,无 provenance'],
+    ],
+      up:[
+      ['dsh','DSH agent','任意会话','to = agent://orca-worker-2'],
+      ['waist','dsh adapter','信封 v3','不再手写 PTY 文本;CLI 直达保留为 L1 逃生门'],
+      ['waist','窄腰寻址','agent://','解析到 (orca, run:id / dispatch:id)'],
+      ['orca','orca adapter','→Run mailbox','优先投结构化 inbox;PTY 仅本面兜底'],
+      ['orca','Orca 回合','worker_done','生命周期信号进词汇表,回调闭环补齐'],
+    ]},
+  ];
+  const x0=152,w=112,gap=13,hh=46;
+  P.forEach((p,i)=>{
+    const y=48+i*134;
+    const g0=el('g',{},svg);
+    el('rect',{x:16,y:y+6,width:126,height:112,class:'body',stroke:p.col,'stroke-width':1.4},g0);
+    txt(g0,79,y+26,p.tag,'nt',p.col);
+    txt(g0,79,y+46,p.note[0],'ns');
+    txt(g0,79,y+60,p.note[1],'ns');
+    txt(g0,79,y+108,'hover 看详情','ns');
+    // 行标题
+    txt(svg,x0,y+16,'现状','ns','#7d8b9d','start');
+    txt(svg,x0,y+70,'升级后(窄腰)','ns',C.waist,'start');
+    el('line',{x1:x0+52,y1:y+12,x2:1144,y2:y+12,stroke:'#1c2530','stroke-width':1},svg);
+    el('line',{x1:x0+96,y1:y+66,x2:1144,y2:y+66,stroke:C.waist,'stroke-opacity':.25,'stroke-dasharray':'3 4'},svg);
+    // 两行共用的跳卡渲染
+    const row=(hops,yTop,dim)=>{
+      hops.forEach((hp,k)=>{
+        const x=x0+k*(w+gap);
+        const col=C[hp[0]];
+        const g=el('g',{},svg);
+        el('rect',{x,y:yTop,width:w,height:hh,class:'body',stroke:col,'stroke-width':dim?1.1:1.4,'stroke-opacity':dim?.7:1},g);
+        txt(g,x+w/2,yTop+19,hp[1],'nt',col);
+        if(hp[2])txt(g,x+w/2,yTop+35,hp[2],'ns');
+        txt(g,x+6,yTop+13,String(k+1),'badge',col,'start');
+        if(k>0)el('line',{x1:x-gap,y1:yTop+hh/2,x2:x-2,y2:yTop+hh/2,stroke:'#7d8b9d','stroke-width':1.5,'marker-end':'url(#arw)'},svg);
+        g.addEventListener('mousemove',ev=>showTip(ev,`<b>${k+1}. ${hp[1]}</b><br><span class="m">${hp[2]||''}</span><br>${hp[3]||''}`));
+        g.addEventListener('mouseleave',hideTip);
+      });
+    };
+    row(p.hops,y+20,false);
+    row(p.up,y+74,true);
+    if(i<P.length-1)el('line',{x1:16,y1:y+128,x2:1144,y2:y+128,stroke:'#1c2530','stroke-width':1},svg);
+  });
+}
+
+
+// —— 视图3: 窄腰升格 ——
+function drawWaist(){
+  svg.innerHTML='';edgeEls=[];
+  arrowDefs();
+  txt(svg,580,26,'窄腰升格 — 统一信封,不统一载体','plabel',C.waist);
+  const bands=[
+    {y:44,h:86,name:'应用层(自由) — 各编排器自选,腰部不管',c:'#7d8b9d'},
+    {y:146,h:112,name:'窄腰(统一·极小) — IP 沙漏之腰 + Email 纪律',c:C.waist,hot:1},
+    {y:274,h:92,name:'适配层 — 每平面一个;统一信封 ↔ 本面载体',c:'#a371f7'},
+    {y:382,h:92,name:'载体层(多样·不动) — 载体是各平面的命,动它就死',c:'#4a5568'},
+  ];
+  bands.forEach(B=>{
+    el('rect',{x:16,y:B.y,width:1128,height:B.h,fill:B.c,'fill-opacity':B.hot?.07:.035,stroke:B.c,'stroke-opacity':.45,'stroke-dasharray':B.hot?'none':'7 5',rx:12},svg);
+    txt(svg,28,B.y+18,B.name,'ns',B.c,'start');
+  });
+  // 应用层
+  [['steer 契约','OF-003 两段式'],['decision gate','任务阻塞'],['DAG 编排','wave-checkpoint'],['fleet 租约','OF-002'],['watchdog','event-watchd'],['a2a scope','同project/grant']].forEach((it,i)=>{
+    const x=52+i*182;
+    const g=el('g',{},svg);
+    el('rect',{x,y:70,width:168,height:42,class:'body',stroke:'#7d8b9d','stroke-width':1.2},g);
+    txt(g,x+84,88,it[0],'nt','#9aa7b6');
+    txt(g,x+84,104,it[1],'ns');
+  });
+  // 窄腰(强化)
+  [['agent://<agent-id>','逻辑寻址·平面无关'],['信封 v3','DSHMSG]升格 +via/ttl/ver'],['信号词汇表','done/beat/esc/ack 映射'],['at-least-once','msgid 去重(已有)']].forEach((it,i)=>{
+    const x=48+i*282;
+    const g=el('g',{},svg);
+    el('rect',{x,y:172,width:266,height:56,class:'body',stroke:C.waist,'stroke-width':2.2},g);
+    txt(g,x+133,196,it[0],'nt',C.waist);
+    txt(g,x+133,214,it[1],'ns');
+  });
+  // 泳道对齐线(适配层+载体层)
+  [{c:C.orca,x:246},{c:C.dsh,x:580},{c:C.dais,x:914}].forEach(L=>{
+    el('line',{x1:L.x,y1:274,x2:L.x,y2:474,stroke:L.c,'stroke-opacity':.4,'stroke-dasharray':'4 4'},svg);
+  });
+  // 适配层(按泳道)
+  [[C.orca,246,'orca adapter','orch send / terminal send'],[C.dsh,580,'dsh adapter','session-send / cb-send'],[C.dais,914,'dais adapter','send-message / inject']].forEach((it)=>{
+    const[col,x,t,s]=it;
+    const g=el('g',{},svg);
+    el('rect',{x:x-125,y:296,width:250,height:46,class:'body',stroke:col,'stroke-width':1.4},g);
+    txt(g,x,315,t,'nt',col);
+    txt(g,x,332,s,'ns');
+  });
+  // 载体层(按泳道)
+  [[C.orca,246,'PTY + 运行时存储','进程死即丢'],[C.dsh,580,'事件流 + inbox.log','天然审计'],[C.dais,914,'SQLite warp.sqlite','跨进程共享']].forEach((it)=>{
+    const[col,x,t,s]=it;
+    const g=el('g',{},svg);
+    el('rect',{x:x-125,y:404,width:250,height:46,class:'body',stroke:col,'stroke-width':1.2,'stroke-dasharray':'4 3'},g);
+    txt(g,x,423,t,'nt',col);
+    txt(g,x,440,s,'ns');
+  });
+  // 升格映射
+  txt(svg,580,510,'升格映射 — 零推倒,全是升格(现有资产 → 窄腰组件)','plabel',C.waist);
+  [['DSHMSG] v2 — msgid 已有','信封 v3 规范'],
+   ['fleet.json + registry.json','寻址解析层(DNS 角色)'],
+   ['cb-send/session-send/dais/orch send','四个 adapter 统一接口'],
+   ['三套 worker_done 方言','信号词汇表统一映射'],
+   ['shared/skills/* 人读手册','Agent Card 机读自描述']].forEach((m,i)=>{
+    const y=528+i*42;
+    el('rect',{x:180,y,width:330,height:32,class:'body',stroke:'#4a5568','stroke-width':1.1},svg);
+    txt(svg,345,y+20,m[0],'ns','#9aa7b6');
+    el('line',{x1:516,y1:y+16,x2:612,y2:y+16,stroke:C.waist,'stroke-width':1.6,'marker-end':'url(#arw)'},svg);
+    el('rect',{x:616,y,width:330,height:32,class:'body',stroke:C.waist,'stroke-width':1.4},svg);
+    txt(svg,781,y+20,m[1],'ns',C.waist);
+  });
+}
+
+// —— 视图切换 ——
+const FACTS={
+  grid:'<h3>读图三步</h3>1. 顶栏=发起层(谁都能发)<br>2. 中层=三平面端点<br>3. 底层=寻址面(查表非通道)<br>边标签=协议/信封',
+  hops:'<h3>读图</h3>每横条=一条投递路径<br><b style="color:#7d8b9d">上行=现状</b> / <b style="color:#ff7ab8">下行=升级后(窄腰)</b><br>跳卡色=所在平面(粉=窄腰组件)<br>hover 每跳看细节与证据',
+  waist:'<h3>读图</h3>上=应用层(自由)<br>中=窄腰(统一,粉色强化)<br>下=适配层→载体层(泳道对齐)<br>底部=零推倒升格映射'};
+let curView='grid';
+function switchView(v){
+  curView=v;
+  document.querySelectorAll('.btns button[data-v]').forEach(b=>b.classList.toggle('active',b.dataset.v===v));
+  if(flowOn)toggleFlow();
+  document.getElementById('facts').innerHTML=FACTS[v];
+  ({grid:drawGrid,hops:drawHops,waist:drawWaist})[v]();
+}
+document.querySelectorAll('.btns button[data-v]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.v)));
+document.getElementById('flow').addEventListener('click',()=>{if(curView!=='grid')switchView('grid');toggleFlow();});
+switchView('grid');
+</script>
+</body>
+</html>
