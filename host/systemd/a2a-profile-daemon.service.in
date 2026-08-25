@@ -1,0 +1,20 @@
+# host/systemd/a2a-profile-daemon.service.in — a2a profile pool daemon 的 systemd user unit 模板
+#
+# 由 host/install.sh --systemd 生成(占位符替换)到 ~/.config/systemd/user/。
+# 占位符(仅 Service 段生效): NODE_BIN=node 绝对路径 / DAEMON=daemon.mjs 绝对路径 / LOG=日志绝对路径
+# 语义对齐 v3 教训: 替代 nohup 裸跑(3081 退役连带清掉 daemon 的故障形态),
+# Restart=on-failure 自动拉起;WantedBy=default.target 用户登录即起。
+[Unit]
+Description=A2A profile pool daemon (incubated profiles, JSON-RPC :8790)
+After=network.target
+
+[Service]
+ExecStart=__NODE_BIN__ __DAEMON__
+Restart=on-failure
+RestartSec=2
+Environment=A2A_PROFILE_PORT=8790
+StandardOutput=append:__LOG__
+StandardError=append:__LOG__
+
+[Install]
+WantedBy=default.target

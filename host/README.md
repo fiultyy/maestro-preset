@@ -22,9 +22,19 @@
 ## 安装
 
 ```bash
-host/install.sh --dry-run   # 预览
-host/install.sh             # 执行
+host/install.sh --dry-run          # 预览
+host/install.sh                    # 执行
+host/install.sh --systemd          # 另: 生成 a2a-profile-daemon systemd unit
 ```
+
+## daemon 存活(systemd,推荐)
+
+`agent-presets` 池后端(a2a-profile-server)由 systemd user unit 托管:
+`host/install.sh --systemd` 生成 `~/.config/systemd/user/a2a-profile-daemon.service`
+(模板 `systemd/a2a-profile-daemon.service.in`,node 绝对路径装时探测)并 enable。
+重启策略 `Restart=on-failure`;在役 daemon 不打断,改代码后手动
+`systemctl --user restart a2a-profile-daemon`。替代旧 nohup 裸跑形态(v3 教训:
+3081 退役曾连带清掉 daemon)。
 
 ## 人工步骤(install 不碰)
 
@@ -33,6 +43,7 @@ host/install.sh             # 执行
 3. 凭据走环境变量:`FEISHU_APP_ID/FEISHU_APP_SECRET`(lark)、`ZHIPU_CODING_PLAN_API_KEY`(zhipu search)——polyfill.patch.yml 已全部 env 引用,无明文。
 
 ## 版本注记
+- 构建基线: local-dev @ `6f57282c39` (2026-08-25);重建入口本仓 bin/rebuild-host-packages.sh
 
 - 4 个 dsh 包是 **v0.1.1-rc.2+local.1 构建(2026-08-24,基于 upstream 0.1.1-rc.2 + 本地 clear action + 投影新接口迁移)**,源码在 `~/tools/deepseek-harness/packages/long-task/`(分支 local-dev)。
 - `update_long_task action=clear` 已含在本构建中(装点 :3080 运行验证过);重新分发前从 local-dev 分支 `pnpm build` 后替换 packages/ 下对应目录并 bump 版本号。
