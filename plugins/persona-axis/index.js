@@ -111,7 +111,10 @@ function apply (ctx) {
     const profiles = result?.profiles || []
     return {
       personas: profiles.map((p) => ({
-        name: p.name, version: p.version, updated: p.updated
+        name: p.name, version: p.version, updated: p.updated,
+        // 派生通道标记：lineage['derived-by'] 存在即为派生物（如 queen-vN），消费面据此加徽章。
+        derived: p.lineage?.['derived-by'] || null,
+        parent: p.lineage?.parent || null
       }))
     }
   }
