@@ -25,8 +25,12 @@
  * ~/.dsh/plugins/polyfill.patch.yml 插入行。红线：DSH 本体零改动。
  */
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+
 export const name = 'persona-axis'
-export const version = '1.0.0'
+export const version = '1.1.0'
 
 // 会话级事件与 agent 事件是宿主内置；webServer 提供同源 RPC 路由；
 // agents 是宿主 agent 注册表（agentFor 同源 API 的基础）。
@@ -39,10 +43,28 @@ const A2A_ORIGIN = process.env.A2A_PROFILE_ORIGIN || 'http://127.0.0.1:8790/'
 /** 与 dsh-persona / dsh-subagent 对齐：遮蔽 deployment 默认人格段。 */
 const PERSONA_SECTION = 'deployment:persona'
 const PERSONA_ORDER = 0
+/** 延迟生效意图（deferred intent）落盘位置：宿主重启会把磁盘上的空白会话
+ *  搁浅（新进程无 live agent，GUI 复用该空白会话时 select 报 session-not-found）。
+ *  意图先落盘，agent/created（该会话被恢复/续用时触发）消费：此刻会话仍
+ *  空白即装段+落事件，非空白则弃意图。 */
+const STATE_DIR = join(homedir(), '.dsh', 'plugins', 'persona-axis', 'state')
+const PENDING_PATH = join(STATE_DIR, 'pending.json')
 
 function apply (ctx) {
   /** sessionId → section disposer（换人格/卸载时释放，防 scoped 层同名冲突）。 */
   const installed = new Map()
+
+  const loadPending = () => {
+    try { return JSON.parse(readFileSync(PENDING_PATH, 'utf8')) || {} } catch { return {} }
+  }
+  const savePending = (map) => {
+    try {
+      mkdirSync(STATE_DIR, { recursive: true })
+      writeFileSync(PENDING_PATH, JSON.stringify(map, null, 2))
+    } catch (error) {
+      ctx.logger.warn(`persona-axis: persist pending failed: ${String(error)}`)
+    }
+  }
 
   const blank = (session) =>
     !session.events.some((e) => e?.type === 'turn/start')
@@ -79,13 +101,32 @@ function apply (ctx) {
     try { dispose() } catch { /* scope already gone */ }
   }
 
-  /** 冷恢复 + 新建：从事件 log 重建（agent/created 在创建与 resume 都发）。 */
+  /** 冷恢复 + 新建：从事件 log 重建（agent/created 在创建与 resume 都发）；
+   *  无事件轨迹时消费延迟生效意图（宿主重启搁浅的空白会话）。 */
   ctx.on('agent/created', ({ agent }) => {
     try {
       const pick = lastPersona(agent.session)
-      if (pick === undefined || pick.persona === null) return
+      if (pick !== undefined) {
+        if (pick.persona === null) return
+        uninstallSection(agent.id)
+        installed.set(agent.id, installSection(agent, pick.text))
+        return
+      }
+      const pending = loadPending()
+      const intent = pending[agent.id]
+      if (!intent) return
+      delete pending[agent.id]
+      savePending(pending)
+      if (!blank(agent.session)) {
+        ctx.logger.warn(`persona-axis: deferred intent for "${agent.id}" dropped (session not blank)`)
+        return
+      }
       uninstallSection(agent.id)
-      installed.set(agent.id, installSection(agent, pick.text))
+      installed.set(agent.id, installSection(agent, intent.text))
+      agent.session.append('persona/selected', {
+        persona: intent.persona, version: intent.version, text: intent.text
+      })
+      ctx.logger.info(`persona-axis: deferred intent applied for "${agent.id}" (${intent.persona} v${intent.version})`)
     } catch (error) {
       ctx.logger.warn(`persona-axis: restore for "${agent.id}" failed: ${String(error)}`)
     }
@@ -120,25 +161,22 @@ function apply (ctx) {
   }
 
   function currentPersona (sessionId) {
-    const agent = findAgent(sessionId)
+    let agent
+    try {
+      agent = findAgent(sessionId)
+    } catch {
+      const intent = loadPending()[sessionId]
+      if (intent) return { persona: { name: intent.persona, version: intent.version }, pending: true }
+      return { persona: null }
+    }
     const pick = lastPersona(agent.session)
     if (pick === undefined || pick.persona === null) return { persona: null }
     return { persona: { name: pick.persona, version: pick.version } }
   }
 
-  async function selectPersona (sessionId, personaName) {
-    const agent = findAgent(sessionId)
-    if (!blank(agent.session)) {
-      const err = new Error(`session "${sessionId}" has already started; its persona is fixed`)
-      err.code = 'persona-locked'
-      throw err
-    }
-    if (!personaName) {
-      uninstallSection(agent.id)
-      agent.session.append('persona/selected', { persona: null })
-      return { persona: null }
-    }
-    // 人格源唯一：A2A 池；text 全文进事件，版本钉死、重建零依赖。
+  /** 池取档 + 校验（live 安装与延迟意图共用）。 */
+  async function fetchPersona (personaName) {
+    // 人格源唯一：A2A 池；text 全文进事件/意图，版本钉死、重建零依赖。
     // profiles/get 返回 {profile:{name,version,agentsMd,...}}。
     const out = await a2a('profiles/get', { name: personaName })
     const record = out?.profile
@@ -153,12 +191,46 @@ function apply (ctx) {
       err.code = 'persona-empty'
       throw err
     }
-    const version = record.version ?? record.meta?.version ?? null
+    return { record, text, version: record.version ?? record.meta?.version ?? null }
+  }
+
+  async function selectPersona (sessionId, personaName) {
+    let agent
+    try {
+      agent = findAgent(sessionId)
+    } catch {
+      // 非 live（典型：宿主重启后 GUI 复用的搁浅空白会话）——落延迟意图。
+      if (!personaName) {
+        const pending = loadPending()
+        if (pending[sessionId]) { delete pending[sessionId]; savePending(pending) }
+        return { persona: null }
+      }
+      const { record, text, version } = await fetchPersona(personaName)
+      const pending = loadPending()
+      pending[sessionId] = { persona: record.name, version, text, ts: new Date().toISOString() }
+      savePending(pending)
+      return { persona: { name: record.name, version }, deferred: true }
+    }
+    if (!blank(agent.session)) {
+      const err = new Error(`session "${sessionId}" has already started; its persona is fixed`)
+      err.code = 'persona-locked'
+      throw err
+    }
+    if (!personaName) {
+      uninstallSection(agent.id)
+      agent.session.append('persona/selected', { persona: null })
+      const pending = loadPending()
+      if (pending[sessionId]) { delete pending[sessionId]; savePending(pending) }
+      return { persona: null }
+    }
+    const { record, text, version } = await fetchPersona(personaName)
     uninstallSection(agent.id)
     installed.set(agent.id, installSection(agent, text))
     agent.session.append('persona/selected', {
       persona: record.name, version, text
     })
+    const pending = loadPending()
+    if (pending[sessionId]) { delete pending[sessionId]; savePending(pending) }
     return { persona: { name: record.name, version } }
   }
 
