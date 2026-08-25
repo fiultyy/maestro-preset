@@ -135,7 +135,9 @@ function apply (ctx) {
       return { persona: null }
     }
     // 人格源唯一：A2A 池；text 全文进事件，版本钉死、重建零依赖。
-    const record = await a2a('profiles/get', { name: personaName })
+    // profiles/get 返回 {profile:{name,version,agentsMd,...}}。
+    const out = await a2a('profiles/get', { name: personaName })
+    const record = out?.profile
     if (!record || record.name !== personaName) {
       const err = new Error(`persona "${personaName}" not found in pool`)
       err.code = 'persona-not-found'
@@ -147,12 +149,13 @@ function apply (ctx) {
       err.code = 'persona-empty'
       throw err
     }
+    const version = record.version ?? record.meta?.version ?? null
     uninstallSection(agent.id)
     installed.set(agent.id, installSection(agent, text))
     agent.session.append('persona/selected', {
-      persona: record.name, version: record.meta?.version ?? record.version ?? null, text
+      persona: record.name, version, text
     })
-    return { persona: { name: record.name, version: record.meta?.version ?? record.version ?? null } }
+    return { persona: { name: record.name, version } }
   }
 
   async function handleRpc (body) {
