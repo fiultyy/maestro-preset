@@ -3,26 +3,31 @@
 让 Orca 侧任何 agent 用 **一条 orca-cli 命令**回调本 DSH 进程，且回调能**直接驱动
 session 新回合**——不只是消息落盘，而是"推送即唤醒"。
 
-## 架构（回调泵 · v3.3 原生插件版）
+## 架构（窄腰终态 · P4 后）
 
 ```
-Orca agent: terminal send --terminal <bridge_handle> --text "…" --enter
-   └─► 桥 pane (cat >> inbox.log)
-         └─► plugins/orca-callback/pump.js: fs.watch + 游标消费（回声过滤）
-               └─► Agent.followup()/inject()   ← DSH 原生回合驱动（同 tool-jobs 唤醒接缝）
-                     └─► 回合内: 处理消息 → ledger 落账 → (可选) reply.sh 回复
+Orca agent: cb-send（一条命令；裸 JSON 兜底 printf >> inbox.log）
+   ├─► HTTP: POST /callback @ bridge/http.port（200/208 皆成功）
+   └─► 文件桥: append inbox.log（HTTP 失配/不可达自动降级）
+        └─► plugins/host-callback-bridge（宿主 boot 回调桥,polyfill lane）
+              fs.watch 事件驱动盯 inbox（禁轮询）+ registry.json 路由
+              └─► 回环 /api/session.prompt 指针行（ORCA-CB] 信封,sessionId 持久路由键）
+                    └─► 目标 DSH 会话原生唤醒（重启后的驻留会话零手动动作）
+                          └─► 回合内: 处理消息 → ledger 落账 → (可选) reply.sh 回复
 ```
 
-**maestro 会话开场注册回调身份**——host-lane 部署(USAGE §3.4)不 arm,`POST /register` 到 `bridge/http.port` 端口;裸 preset 部署 `bridge_arm` 即武装（绑定发起 agent）。无 job、无 goal、
-无 bash watcher。bash 版 `watch.sh`（job 结算 + goal 续轮）保留为无插件环境的手工
-后备方案。
-
-**双模驱动**：maestro 正式路径 `fs.watch`/inotify **事件驱动**（毫秒延迟）；
-动态插件 POC 因沙箱无 `node:fs`，退化为 **1s interval 轮询**（≤1s 延迟）。
-投递协议两端一致、消息不丢；面向投递方的说明见共享 skill
+**链路载体在宿主进程,不在编排会话**——host boot 即接管。旧三件（orca-callback
+泵 pump.js / message-bridge / 会话内绑口）已于 P4 退役；HTTP /callback 与
+`bridge/http.port` 的唯一持有者是宿主 host-callback-bridge lane。新代际编排会话经
+`POST /register` 自注册身份;per-session 分槽（incident 0003 防线保留）;`bridge_status`
+查询健康（`bridge_http_status` 为 deprecated 别名,两个稳定周期后移除）。信封 v3
+七键（`msgid`/`ver:3`）可选——`--msgid <id>` 重发保号,受理面据此回 208 去重回执;
+`--ver 2` 可显式降级。共享内核已提炼为 `plugins/_narrow-waist/`（core 四文件原位
+re-export）。bash 版 `watch.sh`（job 结算 + goal 续轮）保留为无插件环境的手工
+后备方案。投递协议两端一致、消息不丢；面向投递方的说明见共享 skill
 `~/.agents/skills/maestro-bridge/SKILL.md`。
 
-## 落地步骤（maestro 会话开场即可复用）
+## 落地步骤（手工车道;宿主 lane 部署下链路零手动,以下仅裸 preset/无插件环境需要）
 
 ```bash
 B=~/.dsh/.agent-presets/maestro/skills/orca-bridge/scripts

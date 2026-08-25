@@ -57,7 +57,9 @@ as `dais orchestration <sub>`. Capability contract: see
   `session_<sid>` (any terminal), `orchestrator` (GUI router's own mailbox —
   single consumer; CLI pulls are REJECTED while the GUI lives; never route
   critical messages there from outside).
-- Push (pointer-only, GUI process): router polls dispatches every 500 ms; at
+- Push (pointer-only, GUI process): router wakes on enqueue arrival events
+  (P5 Condvar; the former sleep interval is kept only as wait-timeout
+  fallback, no polling-misalignment tail); at
   an idle edge (title/alt-screen/silence heuristics; never on Unknown) it
   writes one pointer line + a lone CR 500 ms later. Bodies are never pushed —
   `check-messages` pull is the only authoritative consumption.
