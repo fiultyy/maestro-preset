@@ -1,0 +1,183 @@
+#!/usr/bin/env node
+//
+// session-send-v3 — 跨 main 会话消息直发,窄腰 v3 信封版(P2 adapter,spec P2.2/P2.4)。
+//
+// 用法: session-send-v3 [--msgid <id>] [--via <id>]… <from> <to> <type> <ref> <body>
+//   位置参数与旧 bin/session-send 完全同序;--msgid 重发保号;--via 可重复,
+//   值禁空串、逗号拆分禁空段,依出现序追加,自身 id 恒追加链尾。
+//   P2 无 --ttl/--ver 旗标(ver=3/ttl=5 常量)。
+//
+// 出站 = DSHMSG] v3 十键行(七键序 + ver,via,ttl 尾追);stderr 前缀保留
+// `session-send:`(上层脚本 grep 依赖,R-S29 定性为依赖契约)。
+// 环境与端口序 = 旧 bin: DSH_PORT(默认 3080)→ fleet.port 覆盖;
+// MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)、MAESTRO_STATE(审计 journal)。
+//
+'use strict'
+const { realpathSync } = require('node:fs')
+const { join, dirname, resolve } = require('node:path')
+const { homedir } = require('node:os')
+const { pathToFileURL } = require('node:url')
+
+// ---- 库解析两级(防 R-B13 同族镜像 ENOENT) ----
+async function loadLib() {
+  const candidates = []
+  try {
+    candidates.push(join(dirname(realpathSync(process.argv[1])), '..', 'plugins', '_narrow-waist', 'index.js'))
+  } catch { /* argv[1] 不可 realpath 时走兜底 */ }
+  candidates.push(join(process.env.DSH_HOME ?? join(homedir(), '.dsh'),
+    '.agent-presets', 'maestro', 'plugins', '_narrow-waist', 'index.js'))
+  for (const cand of candidates) {
+    try {
+      return await import(pathToFileURL(cand).href)
+    } catch { /* 下一级 */ }
+  }
+  process.stderr.write('session-send: cannot locate _narrow-waist library (repo/install/mirror)\n')
+  process.exit(2)
+}
+
+// ---- steer 闸(OF-002,语义逐字复刻旧 bin steer_gate;查表梯 = 库 findFleetEntry prefix 模式) ----
+function parseTs(val) {
+  if (val === null || val === undefined || val === '') return null
+  let s = String(val)
+  if (!/(Z|[+-]\d\d:?\d\d)$/.test(s)) s += 'Z' // naive 视作 UTC(对齐 python parse_ts)
+  const t = Date.parse(s)
+  return Number.isNaN(t) ? null : t
+}
+
+function steerGate(lib, frm, to, fleet, fleetPath, msgid, ts) {
+  const entry = lib.findFleetEntry(fleet, to, { mode: 'prefix' })
+  const owner = entry ? (entry.owner ?? null) : null
+  const expires = entry ? parseTs(entry.leaseExpiresAt) : null
+  const alive = Boolean(owner && expires && expires > Date.now())
+  if (alive && owner !== frm) {
+    const conflicts = join(dirname(resolve(fleetPath)), 'fleet-conflicts.jsonl') // abspath 非 realpath(逐字)
+    lib.appendJsonl(conflicts, { msgid, from: frm, to, ts })
+    process.stderr.write(
+      `session-send: steer REFUSED — ${to} leased by ${owner} until `
+      + `${entry.leaseExpiresAt}; conflict journaled (${conflicts}) msgid=${msgid}\n`)
+    process.exit(4)
+  }
+  let reason
+  if (alive) reason = 'owner-self'
+  else if (entry === undefined || entry === null) reason = 'no-entry'
+  else if (owner) reason = 'lease-expired'
+  else reason = 'unowned'
+  const stateDir = process.env.MAESTRO_STATE ?? join(homedir(), '.dsh', 'maestro', 'state')
+  lib.appendJsonl(join(stateDir, 'steer-journal.jsonl'),
+    { msgid, from: frm, to, ts, reason })
+}
+
+// ---- 参数解析(scan-and-delete;--msgid 单次,--via 可重复) ----
+function parseArgv(argv) {
+  let msgid = null
+  const viaSegments = []
+  for (let i = 0; i < argv.length;) {
+    if (argv[i] === '--msgid') {
+      if (i + 1 >= argv.length) {
+        process.stderr.write('session-send: --msgid requires a value\n')
+        process.exit(2)
+      }
+      msgid = argv[i + 1]
+      argv.splice(i, 2)
+    } else if (argv[i] === '--via') {
+      if (i + 1 >= argv.length || argv[i + 1] === '') {
+        process.stderr.write('session-send: --via requires a value\n')
+        process.exit(2)
+      }
+      for (const seg of argv[i + 1].split(',')) {
+        if (seg === '') {
+          process.stderr.write('session-send: --via segments must be non-empty\n')
+          process.exit(2)
+        }
+        viaSegments.push(seg)
+      }
+      argv.splice(i, 2)
+    } else {
+      i += 1
+    }
+  }
+  return { msgid, viaSegments }
+}
+
+async function main() {
+  const lib = await loadLib()
+  const rest = process.argv.slice(2)
+  const { msgid, viaSegments } = parseArgv(rest)
+  if (rest.length !== 5) {
+    process.stderr.write('usage: session-send-v3 [--msgid <id>] [--via <id>]… <from> <to> <type> <ref> <body>\n')
+    process.exit(2)
+  }
+  const [frm, to, typ, ref, body] = rest
+
+  let port = process.env.DSH_PORT ?? '3080'
+  const fleetPath = process.env.MAESTRO_FLEET ?? join(homedir(), '.dsh', 'maestro', 'fleet.json')
+  let fleet
+  try {
+    fleet = JSON.parse(require('node:fs').readFileSync(fleetPath, 'utf8'))
+  } catch (error) {
+    process.stderr.write(`session-send: cannot read fleet file ${fleetPath}: ${error && error.message}\n`)
+    process.exit(1)
+  }
+  if (fleet && typeof fleet === 'object' && fleet.port !== undefined && fleet.port !== null) port = String(fleet.port)
+
+  // to 解析 P2 只启用 fleet 梯(registry/broadcast/agent:// 不启用;P3 接管原名时再开)
+  let toSid
+  if (to.startsWith('session-')) {
+    toSid = to
+  } else {
+    const entry = lib.findFleetEntry(fleet, to, { mode: 'prefix' })
+    if (entry !== undefined && typeof entry.sessionId === 'string' && entry.sessionId.length > 0) {
+      toSid = entry.sessionId
+    } else {
+      process.stderr.write(`session-send: unknown code '${to}' (not in fleet.json, not a sessionId prefix)\n`)
+      process.exit(1)
+    }
+  }
+
+  const finalMsgid = (msgid && msgid.length > 0) ? msgid : lib.forgeMsgid()
+  const ts = Date.now()
+
+  if (typ === 'steer') { // OF-002 控制面闸(仅 steer;其余类型零影响)
+    steerGate(lib, frm, to, fleet, fleetPath, finalMsgid, ts)
+  }
+
+  const via = [...viaSegments, 'session-send-v3'].join(',') // 自身 id 恒追加链尾
+  const env = lib.createEnvelope({ from: frm, to, type: typ, ref, body, msgid: finalMsgid, ts, via, ttl: 5 })
+  const line = lib.serializeLine(env)
+  const wire = {
+    type: 'client-request',
+    rpcId: lib.forgeMsgid(),
+    method: 'session.prompt',
+    payload: {
+      sessionId: toSid,
+      mode: 'queue',
+      content: [{ type: 'text', text: line }],
+    },
+  }
+
+  let json
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/api/session.prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(wire),
+      signal: AbortSignal.timeout(30_000),
+    })
+    json = await resp.json()
+  } catch (error) {
+    process.stderr.write(`session-send: RPC error: ${JSON.stringify({ message: String(error && error.message || error) })}\n`)
+    process.exit(1)
+  }
+  const result = json && json.result
+  if (!result || !result.ok) {
+    process.stderr.write(`session-send: RPC error: ${JSON.stringify(result ? result.error : json)}\n`)
+    process.exit(1)
+  }
+  const accepted = result.value && result.value.accepted === true ? 'True' : 'False'
+  process.stdout.write(`sent ${frm} -> ${to}(${toSid.slice(0, 14)}…) type=${typ} ref=${ref}: accepted=${accepted}\n`)
+}
+
+main().catch((error) => {
+  process.stderr.write(`session-send: RPC error: ${JSON.stringify({ message: String(error && error.message || error) })}\n`)
+  process.exit(1)
+})

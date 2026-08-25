@@ -7,6 +7,7 @@
 export {
   forgeMsgid, digestOf, dedupKeys, createDedupWindow, seenAny, markAll,
 } from './dedup.js'
+export { appendJsonl } from './jsonl.js'
 export {
   parseAddress, aliasIndex,
   resolveRouting, resolveRoutingUnified, resolveHostRouting, resolveAddress,
