@@ -35,6 +35,8 @@
         poolShort: "池",
         seatHint: "选择人格：只作用于当前会话，预设不变；首条消息后锁定。",
         seatEmpty: "池为空（或池不可达）",
+        deferredNote: "已记录：该会话恢复活动时自动装入所选人格（宿主重启后的空白会话）。",
+        seatErr: "人格选择失败",
         locked: "会话已开始，人格锁定",
         noInject: "不加载（默认）",
         noInjectDesc: "当前会话回到 dsh 默认人格（deployment persona）。",
@@ -54,6 +56,8 @@
         poolShort: "Pool",
         seatHint: "Pick a persona: current session only, presets unchanged; locked after the first message.",
         seatEmpty: "Pool is empty (or unreachable)",
+        deferredNote: "Recorded: the persona will be applied when this session becomes active again (blank session stranded by a host restart).",
+        seatErr: "Persona selection failed",
         locked: "Session started; persona locked",
         noInject: "No loading (default)",
         noInjectDesc: "The session returns to the default dsh persona.",
@@ -70,6 +74,7 @@
         locked: false, // current session already started
         busy: false,
         lastApplied: null,
+        deferred: false, // last select recorded as deferred intent (session not live)
       };
 
       function createStore() {
@@ -130,8 +135,8 @@
         if (cs === undefined || cs === null) return Promise.resolve();
         self.store.set({ busy: true, error: null });
         return axisCall("persona/select", { sessionId: cs.id, persona: personaName || "" }).then(function (out) {
-          if (!out.ok) throw new Error((out.code === "persona-locked" ? "" : "") + (out.error || "axis error"));
-          self.store.set({ busy: false, current: out.persona || null, lastApplied: out.persona ? out.persona.name : null });
+          if (!out.ok) throw new Error(out.error || "axis error");
+          self.store.set({ busy: false, current: out.persona || null, lastApplied: out.persona ? out.persona.name : null, deferred: !!out.deferred });
         }).catch(function (e) {
           self.store.set({ busy: false, error: String((e && e.message) || e) });
         });
@@ -154,6 +159,8 @@
         badgeDefault: { borderColor: "rgba(46,160,67,.7)", color: "rgba(46,160,67,1)" },
         badgeDerived: { borderColor: "rgba(156,107,253,.65)", color: "rgba(156,107,253,1)", whiteSpace: "nowrap" },
         seat: { display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", padding: "2px 8px", borderRadius: "999px", border: "1px solid rgba(128,128,128,.4)", background: "transparent", cursor: "pointer", whiteSpace: "nowrap" },
+        seatWrap: { display: "inline-flex", alignItems: "center", gap: "4px" },
+        seatErr: { color: "#e5484d", fontSize: "12px", cursor: "help", whiteSpace: "nowrap" },
         empty: { fontSize: "12px", opacity: 0.7, padding: "12px" },
         hint: { fontSize: "12px", opacity: 0.6, lineHeight: 1.5 },
       };
@@ -217,17 +224,20 @@
         }, [sessionKey]);
         var ready = state.status === "ready";
         var personas = ready ? state.personas : [];
-        var anchor = h("button", {
-          type: "button",
-          style: style.seat,
-          "aria-haspopup": "menu",
-          "aria-expanded": ready && undefined,
-          title: t("seatHint"),
-          disabled: !ready || state.busy,
-          onClick: function () { setOpen(function (v) { return !v; }); },
-        },
-          t("poolShort") + " · " + (state.current ? state.current.name : (ready ? "—" : "…")),
-          state.busy ? "…" : ""
+        var anchor = h("span", { style: style.seatWrap },
+          h("button", {
+            type: "button",
+            style: style.seat,
+            "aria-haspopup": "menu",
+            "aria-expanded": ready && undefined,
+            title: state.deferred ? t("deferredNote") : t("seatHint"),
+            disabled: !ready || state.busy,
+            onClick: function () { setOpen(function (v) { return !v; }); },
+          },
+            t("poolShort") + " · " + (state.current ? state.current.name : (ready ? "—" : "…")) + (state.deferred ? " ⏳" : ""),
+            state.busy ? "…" : ""
+          ),
+          state.error ? h("span", { style: style.seatErr, title: state.error, onClick: function () { pick && pick(""); } }, "⚠") : null
         );
         if (!ready) return anchor;
         var selectedId = state.current ? "persona:" + state.current.name : "__none__";
