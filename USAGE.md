@@ -252,9 +252,9 @@ fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004)
 开发循环 = 在本仓库编辑 → `bin/dev-sync.sh` 同步到安装点 → 新会话验证:
 
 ```bash
-bin/dev-sync.sh                 # 正向: 仓库→装点(rsync --delete) + bin/→镜像 ~/.dsh/maestro/bin + shared/→~/.agents/skills
+bin/dev-sync.sh                 # 正向: 仓库→装点(rsync --delete) + bin/→镜像 ~/.dsh/maestro/bin + shared/→~/.agents/skills + polyfill lane(~/.dsh/plugins: host-callback-bridge/_narrow-waist/a2a/persona-axis)
 bin/dev-sync.sh --reverse <f>   # 回流: 装点→仓库逐文件 patch → git apply -p1 + 当场 commit(护栏一见 §10.2)
-bin/dev-sync.sh --verify        # 三段漂移报告: 装点落后项 / 仓落后项 / 镜像漂移项
+bin/dev-sync.sh --verify        # 漂移报告: 装点正向/装点回流/镜像/polyfill lane(四组,含 a2a 与 persona-axis host 面)——pre-push 钩子强制清零
 ```
 
 ⚠️ 正向带 `--delete` 会覆盖装点——装点上的实验改动必须**先 `--reverse` 回流入仓**,再跑正向,否则被冲掉。

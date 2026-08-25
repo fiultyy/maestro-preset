@@ -10,7 +10,8 @@
 #   bin/dev-sync.sh               # 正向: 仓库 → 安装点(rsync --delete, 仓库为准)
 #   bin/dev-sync.sh --reverse     # 回流: 安装点 → 仓库, 只生成 patch 不直接覆盖
 #                                 #       (§10.2 护栏一: 禁手工 cp 覆盖回仓库)
-#   bin/dev-sync.sh --verify      # 双向 diff 报告(不同文件清单, 不改动任何文件;四段: 装点/回流/镜像/polyfill lane)
+#   bin/dev-sync.sh --verify      # 双向 diff 报告(不同文件清单, 不改动任何文件;
+#                                 #   段: 装点正向/装点回流/镜像/polyfill lane[host-cb+nw+a2a+persona-axis])
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 DST="${DSH_HOME:-$HOME/.dsh}/.agent-presets/maestro"
@@ -18,7 +19,7 @@ DST="${DSH_HOME:-$HOME/.dsh}/.agent-presets/maestro"
 # 排除集: .git / 运行时产物 / 镜像副本互不相干;host/ 与 agent-presets/ 是分发面
 # (装点在 ~/.dsh/plugins、profile node_modules、~/.dsh/.agent-presets/<id>,走
 # host/install.sh),不随 maestro preset 本体同步。
-EXCLUDES=(--exclude .git --exclude __pycache__ --exclude host --exclude agent-presets)
+EXCLUDES=(--exclude .git --exclude __pycache__ --exclude host --exclude agent-presets --exclude .pytest_cache)
 
 # 镜像兜底(maestro-bridge 技能的 [ -x 装点 ] || 镜像 回退路径, 0006 收编)
 MIRROR="${DSH_HOME:-$HOME/.dsh}/maestro/bin"
@@ -36,6 +37,7 @@ case "${1:-}" in
   diff -rq --exclude __pycache__ "$SRC/plugins/host-callback-bridge" "$PL/host-callback-bridge" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
   diff -rq --exclude __pycache__ "$SRC/plugins/_narrow-waist" "$PL/_narrow-waist" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
   diff -rq --exclude __pycache__ --exclude .git --exclude state "$SRC/plugins/a2a-profile-server" "$PL/a2a-profile-server" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
+  diff -rq --exclude __pycache__ --exclude .git --exclude state "$SRC/plugins/persona-axis" "$PL/persona-axis" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
   echo "== 五段清零 = 完全同步"
   exit 0
   ;;
@@ -59,7 +61,7 @@ esac
 
 mkdir -p "$DST"
 if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete --exclude '.git' "$SRC"/ "$DST"/
+  rsync -a --delete --exclude '.git' --exclude .pytest_cache "$SRC"/ "$DST"/
 else
   rm -rf "$DST"
   cp -a "$SRC" "$DST"
@@ -114,6 +116,22 @@ if [ -d "$SRC/plugins/a2a-profile-server" ]; then
   done
   rm -rf "$A2A_DIR/__pycache__"
   echo "a2a synced: $SRC/plugins/a2a-profile-server -> $A2A_DIR (daemon 需 restart 生效)"
+fi
+# persona-axis lane(2026-08-26 整理收编): host 面副本(polyfill.patch.yml 注册行指向
+# ~/.dsh/plugins/persona-axis/index.js)。v1.2.0 热修即漏此面——dev-sync 原不覆盖,
+# 装点可静默停旧版(事件写入版=resume 断)。仓是唯一源头;state/(sessions.json/
+# pending.json)是运行时落账,不同步。
+PA_DIR="${DSH_HOME:-$HOME/.dsh}/plugins/persona-axis"
+if [ -d "$SRC/plugins/persona-axis" ]; then
+  mkdir -p "$PA_DIR"
+  for f in "$SRC"/plugins/persona-axis/*; do
+    name="$(basename "$f")"
+    [ "$name" = ".git" ] || [ "$name" = "state" ] && continue
+    rm -rf "$PA_DIR/$name"
+    cp -a "$f" "$PA_DIR/$name"
+  done
+  rm -rf "$PA_DIR/__pycache__"
+  echo "persona-axis synced: $SRC/plugins/persona-axis -> $PA_DIR (重启 host 生效)"
 fi
 
 case "${1:-}" in
