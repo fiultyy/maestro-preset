@@ -224,15 +224,20 @@ P5(dais router 轮询→到达事件,独立部署轴,可与 P1-P4 任意并行,�
 
 ### P4 — 旧路径退役(唯一需重启 host 的阶段,选安静窗口)
 
-- 交付: cordis.yml 切行(删 orca-callback/message-bridge 行,增 callback-bridge v4 行);删 `plugins/orca-callback/`(pump.js 803 行)与 `plugins/message-bridge/`;`bridge_http_status` 退役(deprecated 别名过渡与 persona/文档同步清单入交付);callback-bridge/core/ 四文件 re-export `_narrow-waist`(§6E;v4 代差修复细则归 P4 节)
+**拓扑声明(P4.0)**: P4 完成后投递栈终态 = 一常驻 + 一兼容层——①host-callback-bridge(宿主 lane)= 常驻权威面,HTTP 口与 `http.port` 文件唯一持有者,部署面 = polyfill lane;②callback-bridge v4(cordis 行)= 会话内兼容层,仅 file-inbox 单 source(preset 自包含性),host-lane 部署按 USAGE §3.4 不 arm;③standby 探活互让保留;④polyfill.patch.yml 的 host-callback-bridge 行保留(常驻面正式通道,不退役)。
+
+**queen-v1: 显式冻结(P4.6)**: `agent-presets/queen-v1/**` 与其装点零接触(dev-sync `--exclude agent-presets`,host/install.sh 第 4 面独立)。已知残留: queen 会话 arm 自带 message-bridge 仍会覆写共享 `http.port`(与 host lane 端口互踩)——缓解为 pre-flight 检查(安静窗口判定时确认无 queen armed 会话;`registry.json` 条目 + `ss -tlnp` 对照持有进程)。
+
+- 交付: P4.1 v4 升级四件(分槽/file-only/http types 6 值/PORT-R1 退役+cb-send 同步)+ P4.2 core/ re-export;cordis 切行(P4.7 字面);删 `plugins/orca-callback/` 与 `plugins/message-bridge/`;`bridge_http_status` 别名(两稳定周期,计时起点=合入日)+ persona/文档同步清单(P4.5);dev-sync `_narrow-waist` 同步 + --verify 第四段(P4.4);queen 冻结记录 + pre-flight(P4.6);`tests/p4-smoke.sh`/`p4-watch.sh`(P4.9)。AGENT_CARD 降级不做(P4.8,可选附录,默认不实施)
 - 验证: 生产 :3080 重启后五条路径全链冒烟(外部→DSH 回调 / DSH→DSH 直发 / DSH→dais 重载 / Orca→DSH / DSH→Orca),每条信封可解析、msgid 唯一、去重窗生效;交付链含 dev-sync 全量重推(§0 约束 5(b))
+- 验证(正向部署链六步,P4.3): ①git 单提交合入 master(nw-P4 标记)→ ②bin/dev-sync.sh 全量重推(装点+bin 镜像+polyfill lane 含 _narrow-waist)→ ③--verify 四段清零 → ④删 http.port.sig → ⑤安静窗口重启 host → ⑥五路径冒烟+24h 观测。
 - 24h 可判定断言: (硬门)①~/.dsh/maestro/bridge/dead.log 行数与冒烟基线差 == 0;
   ②state.json hostBridge.http.counters.failed == 冒烟基线(==0);
   ③~/.dsh/plugins/a2a-profile-server/state/*/router-journal.jsonl 24h 无 "delivered":"failed" 行且 mailbox 投递 >0;
   (观测)④file-router counters(state.json hostBridge 镜像): deadCount 零增、deliveredLines 单调增、dedupCount 增幅 ≤ 冒烟期 ×2;
   ⑤五路径冒烟各 ≥1 条 delivered 且 msgid 唯一(inbox.log 采样 + jq 去重断言)。
-- 回滚: git revert(P4 变更收敛为单提交)+ `bin/dev-sync.sh` 全量重推 + `--verify` 三段清零 + 重启 host + 五路径冒烟(§0 约束 5(b);三段式细则归 P4 节)
-- 不动: fleet/registry 格式、ledger.db schema、dais/Orca 运行时
+- 回滚五步(P4.3): ①git revert nw-P4 单提交 → ②bin/dev-sync.sh 全量重推三部署面 → ③--verify 四段清零 → ④安静窗口重启 host → ⑤五路径冒烟复验(回滚后 sig 随旧 message-bridge 复活恢复语义,无需手工重建)
+- 不动: fleet/registry 格式、ledger.db schema、dais/Orca 运行时、`plugins/host-callback-bridge/` 逻辑(仅部署重推)、`plugins/callback-bridge/sources/file-inbox.js` 投递机制、`agent-presets/queen-v1/**` 与其装点、`~/.dsh/maestro/bridge/` 历史数据、polyfill.patch.yml 注册行
 - AGENT_CARD.json(可选附录,P4 后按需): 默认不做;若启动,路径 `shared/maestro-bridge/AGENT_CARD.json`(与 SKILL.md 同目录),且前置条件 = 先落地一个机读消费者(如 dais/orca adapter 启动时能力发现),否则不创建;可参照 a2a 标准端点 `/.well-known/agent-card.json`(http-server.js:630)。
 
 对拍基底 = OF-005-report.md(VO-005)模式: 全 temp 域、`[ ok ]/[FAIL]` 原子断言、幂等可重跑、零副作用、并发安全。
@@ -304,7 +309,7 @@ P5(dais router 轮询→到达事件,独立部署轴,可与 P1-P4 任意并行,�
 
 | 阶段 | 文件(锚,函数名为权威) | 现状 | 改造 |
 |---|---|---|---|
-| 过渡期零改动;P4 删除 | plugins/orca-callback/pump.js(803 行;digestOf@106-115;parseAddress/aliasIndex@142-159;resolveRouting@171-192;registry@194-239,register/unregister@375-410;store@287-373;flush 内 dedup@609-617/638-639) | 四组核心函数与 core/ 同源内联;27 项 pump 特有机制 | **过渡期零改动**——27 项 pump 特有机制(.nw-review-D-raw.md D-F8 清单)天然全保留,该清单转为 P4 callback-bridge 升格时的行为对拍基准;P4 删除 `plugins/orca-callback/`;单源化在 P4 经 callback-bridge/core/ 四文件 re-export `_narrow-waist` 兑现(§6E,内容归 P4 节) |
+| P4 已删除 | plugins/orca-callback/(pump.js 803 行;digestOf@106-115;resolveRouting@171-192;registry@194-239;store@287-373) | 四组核心函数与 core/ 同源内联;27 项 pump 特有机制 | **过渡期零改动**(全文原样活到 P4 删除);27 项机制清单(.nw-review-D-raw.md D-F8)转为 callback-bridge 升格的行为对拍基准;单源化经 callback-bridge/core/ 四文件 re-export `_narrow-waist` 兑现(§6E;P4 已执行) |
 | P3 | bin/fleet-touch(get_entry@137-141;LEASE_KEYS/fleet_lock@105-118) | get_entry() 与 session-send resolve() 各自内联 | 合并提炼进库 fleet-resolve(exact/prefix 参数化);claim/heartbeat/release/sweep/flock 零变化 |
 | P3 | shared/skills/dais-orchestration/SKILL.md(@49-55) | 9 MessageType 约定 | 增词汇表交叉引用与重载路径升格说明;映射必须与 C 实现 `denormalizeType` 逐条一致 |
 
@@ -312,7 +317,7 @@ P5(dais router 轮询→到达事件,独立部署轴,可与 P1-P4 任意并行,�
 
 | 阶段 | 文件(锚,函数名为权威) | 现状 | 改造 |
 |---|---|---|---|
-| P4 | plugins/callback-bridge/(version 4.0.0;core/ 四件与 host-callback-bridge/core/ 逐字同源) | 未注册死代码;第三份 core 副本 | 注册前 core/ 四文件改 re-export `_narrow-waist`;v4 代差修复(单消费者/sink 重绑/types 丢 ack/http.port.sig/端口覆写)与 cordis 行 config 形态、P4 后投递栈拓扑——内容裁决归 P4 节(R-B08/R-S26/R-S30) |
+| P4 已执行 | plugins/callback-bridge/(version 4.1.0;core/ 四文件 re-export `_narrow-waist`) | 会话内兼容层(file-inbox 单 source;per-session 分槽;bridge_http_status deprecated 别名) | core/ 四文件 re-export 完成(R-B09);v4 代差四件修复完成(分槽 P4.1.1/file-only P4.1.2/types 6 值 P4.1.3/PORT-R1 退役 P4.1.4);cordis 行 P4.7 字面与拓扑声明见 §4-P4 |
 
 ## 7. 不变量(全阶段)
 

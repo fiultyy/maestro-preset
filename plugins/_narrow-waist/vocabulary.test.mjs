@@ -4,8 +4,9 @@ import {
   SIGNALS, DAIS_TYPE_MAP, DSH_TYPE_MAP, ORCA_TYPE_MAP,
   normalizeType, denormalizeType, DSH_CALLBACK_TYPES, DSH_INTAKE_TYPES,
 } from './vocabulary.js'
-// 只读 oracle: 两插件现网 TYPES 常量
-import { TYPES as MSGBR_TYPES } from '../message-bridge/index.js'
+// 只读 oracle: http-intake TYPES(message-bridge 已随 P4 删除;其 TYPES 值
+// = DSH_CALLBACK_TYPES 冻结字面: ['ack','done','ping','status'],语义不变)
+const MSGBR_TYPES = ['ack', 'done', 'ping', 'status']
 import { TYPES as INTAKE_TYPES } from '../host-callback-bridge/http-intake.js'
 
 // §G.3 终表(fix-spec G 节)18 Signal 逐条清单

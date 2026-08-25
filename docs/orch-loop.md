@@ -6,7 +6,7 @@
 ## 全链(八步,2026-08-23 嵌 checkpoint)
 
 ```
-1 arm      bridge_arm{alias} + bridge_http_status;签名落笔 maestro/bridge/orch.signature
+1 arm      register 签名(host lane: POST /register;裸 preset: bridge_arm{alias});签名落笔 maestro/bridge/orch.signature
 2 probe    fleet-probe <termid>(自动读 orch.signature)→ 回调回合验证 from==termid → fleet verified + ledger p2p 节点
 3 ticket   docs/tickets.md v4 规范:目标/方案/路径/验证目标/验证形式/回报物(done body 模板);B 表票内预填
 4 dispatch bin/dispatch-ticket <LK-ID> --repo R --terminal T   # 读票+组契约+send+ledger 一体

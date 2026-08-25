@@ -34,7 +34,7 @@ ln -sfn ~/.agents/skills/maestro-bridge ~/.claude/skills/maestro-bridge   # clau
 
 ```
 bridge_arm { alias: "orch" }        # 文件桥: 绑定 + 签名 orch@session-xxxx
-bridge_http_status                  # HTTP 桥: 绑定 + 起监听(回执给 curl 端点)
+bridge_arm                          # 裸 preset: file 桥绑定;host lane 部署不 arm(§3.4)
 ```
 
 回执给出规范签名 `orch@session-xxxx`。记住它——这是别人把回调精准投给你的地址,
@@ -51,7 +51,7 @@ DSH host 重启后,编排者的 sessionId 会变(现场: 9a173a3d→1737c79e)。
 cb-send 兜底"最近 armer",多编排会话同场时**误投别人**(现场实投 session-313e6f7f,
 真正的编排者永远等不到 ACK/DONE)。重启后必做:
 
-1. **重新 `bridge_arm` + `bridge_http_status`**: 拿到新规范签名 `<alias>@<新sessionId>`;
+1. **重新注册**(host lane: `POST /register`;裸 preset: `bridge_arm`)+ 广播新签名: 拿到新规范签名 `<alias>@<新sessionId>`;
 2. **向所有在飞 worker 广播新签名**: 让它们后续回调(ack/done/ask)改投新地址——旧
    地址不会自动转发,不广播就持续丢票。
 
@@ -76,7 +76,7 @@ cb-send 兜底"最近 armer",多编排会话同场时**误投别人**(现场实�
 ### 3.3 回调路由三决策点(七/八坑; v1.3 已实施, 分支 feat/bridge-routing-v1.3)
 
 **第七坑 — 回调端口代际漂移(HTTP 200 假阳性)**: `bridge/http.port` 是单文件共享,
-每个会话 `bridge_http_status` 都会**覆写**它——文件永远指向**最新武装代际**的桥;
+PORT-R1 已于 P4 退役;现防线 = host lane 常驻口(boot 即绑,端口复用不漂移)+ 显式 to 失配 404 → 降级文件桥;
 cb-send 不校验持有者时, 跨代际定向回调先撞错桥再被兜底吸收(现场: 换代 done 两连
 投全假阳性)。**已修复(PORT-R1)**: arm 时旁挂写 `bridge/http.port.sig`
 (=持有者 sessionId, 每次 arm 覆写, 与 http.port 恒成对); cb-send 读端口后取
@@ -125,7 +125,7 @@ last-armer 兜底(单会话便利)。
 
 **编排会话的新纪律(链路已上移, 会话只保留"消费回合")**:
 
-1. **开场不再 `bridge_arm` / `bridge_http_status`**——host lane 已持有链路; 旧工具
+1. **开场不 arm**——host lane 已持有链路(POST /register 即可);orca-callback/message-bridge 已于 P4 删除,`bridge_http_status`= deprecated 别名; 旧工具
    仍在(preset 兼容), 但再 arm 会与 host lane 双消费(重复唤醒, 无丢失), 迁移期
    尽量不用;
 2. **sessionId 是持久路由键**: 会话在 `~/.dsh/sessions/` 驻留, host 重启后同一
@@ -198,7 +198,7 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 | 插件 | 作用 | 模型可见工具 |
 |---|---|---|
 | `orca-callback` | 文件桥泵: watch inbox.log,at-least-once 投递(多消费者寻址/去重/死信/轮转) | `bridge_arm {alias}` |
-| `message-bridge` | HTTP 直发: 127.0.0.1 随机端口 POST /callback | `bridge_http_status` |
+| `callback-bridge` | 会话内兼容层: file 桥(file-inbox 单 source,per-session 分槽) | `bridge_arm` / `bridge_status` |
 | `workspace-unarchive` | 归档会话恢复(读 maestro/unarchive.log 逐行恢复) | 无(自动) |
 | `session-purge` | 按需删会话(confirm="PURGE" 闸 + 自删拒 + 忙闸) | 经 `bin/session-purge` |
 

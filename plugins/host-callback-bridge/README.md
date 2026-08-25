@@ -33,7 +33,7 @@ HTTP 死口、inbox 积压 3 行——投递依赖"agent 记得重 arm"(记忆�
 
 | 面 | 旧(会话内插件) | 新(本插件) |
 |---|---|---|
-| HTTP 端口持有者 | 编排会话(bridge_http_status arm) | host 进程(boot 即绑) |
+| HTTP 端口持有者 | ~~编排会话(bridge_http_status arm)~~ 已于 P4 退役 | host 进程(boot 即绑) |
 | registry 写入 | bridge_arm(会话内工具) | POST /register(或编排者手写 registry.json) |
 | 文件消费 | 每会话一泵(游标分立) | host 单路由(全局游标) |
 | 会话角色 | 拥有链路+消费回合 | **只消费回合** |

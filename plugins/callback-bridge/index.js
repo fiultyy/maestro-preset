@@ -19,8 +19,8 @@ import { resolveRouting } from './core/addressing.js'
 import { createFileInboxSource } from './sources/file-inbox.js'
 import { createHttpSource } from './sources/http.js'
 
-/** 版本指纹: arm/status 回执与磁盘对账用(v4,drop-in v3.5)。 */
-export const version = '4.0.0'
+/** 版本指纹: arm/status 回执与磁盘对账用(v4.1: 分槽+file-only+别名,drop-in v3.5)。 */
+export const version = '4.1.0'
 
 export const inject = ['agents', 'tools']
 
@@ -87,26 +87,34 @@ export function apply(ctx, config) {
   const cfg = normalizeConfig(config)
   const bridgeDir = resolveBridgeDir(cfg.bridgeDir)
 
-  // 共享内核(单实例,所有 source 复用: store / dedup / router / sink)。
+  // 共享内核: store(bridgeDir 布局/state.json)进程内共享;dedup/sink per-slot 独立实例。
   const store = createBridgeStore({ bridgeDir })
-  const dedup = createDedupWindow({ windowMs: cfg.engine.dedupWindowMs })
   const router = { resolve: resolveRouting }
-  const sink = createAgentTurnSink(agents, cfg.sink)
 
-  const state = {
-    consumer: null, // { sessionId, alias, canonical, armedAt }
-    sources: new Map(), // id -> Source
+  // P4.1.1 sessionId 分槽(incident 0003 防线,语义对齐 pump.js v3.6 slots):
+  // 每会话独立 sources(独立 dedup 窗口 + 独立 sink 绑定);重复 arm 刷新本槽绑定与别名。
+  const slots = new Map() // sessionId -> { agent, alias, canonical, sources: Map }
+
+  function makeSlot(sessionId, agent) {
+    const slot = { agent, alias: null, canonical: sessionId, sources: new Map() }
+    slots.set(sessionId, slot)
+    return slot
   }
 
-  async function armAll() {
-    const consumer = state.consumer
+  async function armAll(slot) {
+    const consumer = { sessionId: slot.agent.id, alias: slot.alias }
     const started = []
     for (const sourceCfg of cfg.sources) {
       if (sourceCfg.kind === 'file-inbox') {
-        let src = state.sources.get('file-inbox')
+        let src = slot.sources.get('file-inbox')
         if (src === undefined) {
+          const slotSink = createAgentTurnSink(agents, cfg.sink)
+          slotSink.bind(slot.agent)
           src = createFileInboxSource({
-            store, consumer, router, dedup, sink, version,
+            store, consumer, router,
+            dedup: createDedupWindow({ windowMs: cfg.engine.dedupWindowMs }),
+            sink: slotSink,
+            version,
             echoPrefix: sourceCfg.echoPrefix,
             rotateMaxBytes: sourceCfg.rotateMaxBytes,
             rotateMaxLines: sourceCfg.rotateMaxLines,
@@ -114,23 +122,28 @@ export function apply(ctx, config) {
             maxWakeFailures: cfg.engine.maxWakeFailures,
             retryDelayMs: cfg.engine.retryDelayMs,
           })
-          state.sources.set('file-inbox', src)
+          slot.sources.set('file-inbox', src)
         }
         src.start()
         await src.flush()
         started.push('file-inbox')
       } else if (sourceCfg.kind === 'http') {
-        let src = state.sources.get('http')
+        let src = slot.sources.get('http')
         if (src === undefined) {
+          const slotSink = createAgentTurnSink(agents, cfg.sink)
+          slotSink.bind(slot.agent)
           src = createHttpSource({
-            store, consumer, router, dedup, sink, version,
+            store, consumer, router,
+            dedup: createDedupWindow({ windowMs: cfg.engine.dedupWindowMs }),
+            sink: slotSink,
+            version,
             basePath: sourceCfg.basePath,
             portFile: sourceCfg.portFile,
             bind: sourceCfg.bind,
             maxBodyBytes: sourceCfg.maxBodyBytes,
             dedupWindowMs: cfg.engine.dedupWindowMs,
           })
-          state.sources.set('http', src)
+          slot.sources.set('http', src)
         }
         await src.start()
         started.push('http')
@@ -176,17 +189,24 @@ export function apply(ctx, config) {
           ? process.env[cfg.aliasEnv]
           : null)
       const canonical = alias === null ? sessionId : `${alias}@${sessionId}`
-      if (state.consumer === null) {
-        state.consumer = { sessionId, alias, canonical }
+      // P4.1.1: 重复 arm 刷新本槽绑定与别名,绝不复用他人槽/泵。
+      let slot = slots.get(sessionId)
+      if (slot === undefined) slot = makeSlot(sessionId, agent)
+      slot.agent = agent
+      slot.alias = alias
+      slot.canonical = canonical
+      for (const src of slot.sources.values()) {
+        // 已有 source 沿用实例,但刷新 consumer 元数据与 sink 绑定(重复 arm 换绑定,P4.1.1)。
+        if (typeof src.refreshConsumer === 'function') src.refreshConsumer({ sessionId, alias })
+        if (typeof src.rebindSink === 'function') src.rebindSink(agent)
       }
-      sink.bind(agent)
       let started
       try {
-        started = await armAll()
+        started = await armAll(slot)
       } catch (error) {
         return `bridge armed (callback-bridge v${version}) as ${canonical} but source start failed: ${error?.message}`
       }
-      const statuses = [...state.sources.values()].map((src) => src.status())
+      const statuses = [...slot.sources.values()].map((src) => src.status())
       return `bridge armed (callback-bridge v${version}): consumer ${canonical} bound + registered in bridge/registry.json (pid ${process.pid}); `
         + `sources ${JSON.stringify(started)}; `
         + `config ${JSON.stringify({ bridgeDir, sink: cfg.sink, engine: cfg.engine })}`
@@ -203,15 +223,40 @@ export function apply(ctx, config) {
       render: (_args, value) => [{ type: 'text', text: String(value) }],
     },
     async execute() {
-      const statuses = [...state.sources.values()].map((src) => src.status())
-      return `callback-bridge v${version}: consumer=${state.consumer?.canonical ?? '(unarmed)'} bridgeDir=${bridgeDir} sources=${JSON.stringify(statuses)}`
+      const slotViews = [...slots.entries()].map(([sid, slot]) => ({
+        consumer: slot.canonical,
+        sources: [...slot.sources.values()].map((src) => src.status()),
+      }))
+      return `callback-bridge v${version}: slots=${JSON.stringify(slotViews)} bridgeDir=${bridgeDir}`
+    },
+  })
+
+  ctx.tools.register({
+    name: 'bridge_http_status',
+    description:
+      '[deprecated] use bridge_status; the HTTP /callback channel is owned by the resident host lane '
+      + '(USAGE §3.4). Identical to bridge_status (never starts any HTTP listener).',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value) }],
+    },
+    async execute() {
+      const slotViews = [...slots.entries()].map(([sid, slot]) => ({
+        consumer: slot.canonical,
+        sources: [...slot.sources.values()].map((src) => src.status()),
+      }))
+      return `[deprecated] use bridge_status; the HTTP /callback channel is owned by the resident host lane (USAGE §3.4)\n`
+        + `callback-bridge v${version}: slots=${JSON.stringify(slotViews)} bridgeDir=${bridgeDir}`
     },
   })
 
   ctx.effect(() => () => {
-    for (const source of state.sources.values()) {
-      source.stop()
-      if (typeof source.dispose === 'function') void source.dispose()
+    for (const slot of slots.values()) {
+      for (const source of slot.sources.values()) {
+        source.stop()
+        if (typeof source.dispose === 'function') void source.dispose()
+      }
     }
   })
 }

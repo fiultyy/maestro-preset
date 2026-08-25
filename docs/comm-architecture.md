@@ -12,7 +12,7 @@ flowchart TB
         LOOPRPC["/api/session.prompt<br/>(loopback RPC)"]
         subgraph 会话["编排/worker 会话们 (maestro preset)"]
             ORCA["orca-callback<br/>(会话内,bridge_arm)"]
-            MSG["message-bridge<br/>(会话内,bridge_http_status)"]
+            MSG["callback-bridge v4<br/>(会话内兼容层,bridge_arm)"]
         end
     end
 
@@ -84,7 +84,7 @@ flowchart TB
 | 维度 | 事实 |
 |---|---|
 | 挂载 | `agent.cordis.yml:369-370` |
-| 入口 | 回环 HTTP 口(bridge_http_status 工具 arm 时启动,写 http.port + http.port.sig)(index.js:390-413) |
+| 入口 | 回环 HTTP 口(host-callback-bridge 常驻 lane;P4 起唯一 HTTP 持有者=host 进程,会话内不绑口) |
 | 出口 | 会话内原生 followup/inject,前缀 `MSGB]`(index.js:355-370);同样 per-sessionId 分槽 |
 | 与 host 桥关系 | 并列的第二入向通道(message-bridge/index.js:4-5);host 桥 standby 探测的就是它的口——旧会话桥占着 http.port 时宿主版让位 |
 | 现状 | 宿主接管后,arm 流程对编排会话已非必需(USAGE.md:118-148) |

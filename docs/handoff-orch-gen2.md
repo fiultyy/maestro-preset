@@ -3,7 +3,7 @@
 > **[host 重启处置卡 — gen2b 补 2026-08-17 夜, 两次现场提炼]**
 > host 重启 = 本代(host槽)会话消亡, 走换代 SOP:
 > 1. 继任 spawn(**必须 maestro preset**, §3.2), 读本简报即接管;
-> 2. 双通道 armed(bridge_arm+bridge_http_status)→核 registry: 只应剩自己; 残留死条目(旧 sessionId)手清——在飞回调幽灵地址温床;
+> 2. 回调身份已注册(host lane: POST /register;裸 preset: bridge_arm)→核 registry: 只应剩自己; 残留死条目(旧 sessionId)手清——在飞回调幽灵地址温床;
 > 3. **签名广播**: 向全部在飞 worker(Orca 终端/dispatch)发 session-send 通报新签名, 其后续 ack/done 改投;
 > 4. Orca Run/task 邮箱不随 host 亡: task-list 兜底收口在飞票(worker_done 到而未收的);
 > 5. 专用壳(term_8cfd288c)/常驻终端(term_82d5fada dais-omp)核活性, 必要时重建+fleet-probe 重准入;
@@ -17,7 +17,7 @@
 ## 1. 你是谁
 - 别名 orch1(bridge_arm 用这个), fleet 码待 spawn 后自取(建议 node=orch-gen2)
 - 宿主: DSH maestro preset, 工作目录 /home/yy/.dsh
-- 开场三步: bridge_arm{alias:orch1} + bridge_http_status + 读本文件
+- 开场三步: 注册签名(host lane: POST /register {"sessionId","alias":"orch1"};裸 preset: bridge_arm{alias:orch1}) + 读本文件
 
 ## 2. 专用壳(重要)
 所有 orchestration 变更命令(orca-ide worker-start/dispatch/task-update)必须经专用壳执行:

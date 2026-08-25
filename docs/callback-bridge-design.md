@@ -171,7 +171,7 @@ interface ConsumerRef { sessionId:string; alias?:string }
 ### 3.4 工具面(对模型契约)
 
 - `bridge_arm { alias? }` — 签名与 v3.5 完全一致(向后兼容);回执升级为 v4 指纹 + 生效 config 摘要 + 各 source 状态;
-- `bridge_status` — 新增: registry 在册消费者 / 各 source 健康(HTTP 端口、file 游标)/ 计数器。迁移期保留 `bridge_http_status` 为 deprecated 别名,两个稳定周期后移除。
+- `bridge_status` — 新增: registry 在册消费者 / 各 source 健康(HTTP 端口、file 游标)/ 计数器。迁移期保留 `bridge_http_status` 为 deprecated 别名,两个稳定周期后移除。**P4 已执行**: 别名窗口计时起点 = P4 合入日。
 
 ### 3.5 明确不抽象的(边界)
 
@@ -192,7 +192,7 @@ interface ConsumerRef { sessionId:string; alias?:string }
 1. **P1 骨架+内核平移**: 建 `plugins/callback-bridge/`,addressing/registry/dedup/store 自 pump.js 平移(纯函数,行号对照表见 scaffold README);测试 = 移植 pump.test.mjs 12 例 + message-bridge 7 例 + 新增 config 归一/双 source 用例。**此阶段不注册行,生产两插件照跑。**
 2. **P2 双跑验证**: agent.cordis.yml 增 `callback-bridge` 行(file-inbox source 先行,http source 关闭),与旧泵**分消费者**实测: 同 bridgeDir 下新旧并册,验证 registry/state 并发写与轮转闸门互认。
 3. **P3 切换**: 移除旧行,开启 http source,注册 `bridge_status`。按 §2.5 代际规则,**切换需重启 host 进程**(同进程 ESM 缓存 + 运行中会话保持旧代际);选安静窗口,重启后旧会话代际自然消亡。
-4. **P4 清理**: 删 `plugins/orca-callback`、`plugins/message-bridge` 目录与 `bridge_http_status` 别名;skills/orca-bridge SKILL.md 回执措辞更新为 bridge_arm v4。
+4. **P4 清理**: 删 `plugins/orca-callback`、`plugins/message-bridge` 目录与 `bridge_http_status` 别名;skills/orca-bridge SKILL.md 回执措辞更新为 bridge_arm v4。**P4 已执行(2026-08)**: 双插件已删;别名按两个稳定周期承诺保留至窗口期满。
 
 ### 4.3 测试与验收
 

@@ -13,7 +13,7 @@ Orca agent: terminal send --terminal <bridge_handle> --text "…" --enter
                      └─► 回合内: 处理消息 → ledger 落账 → (可选) reply.sh 回复
 ```
 
-**maestro 会话开场调一次 `bridge_arm`** 即武装（绑定发起 agent）。无 job、无 goal、
+**maestro 会话开场注册回调身份**——host-lane 部署(USAGE §3.4)不 arm,`POST /register` 到 `bridge/http.port` 端口;裸 preset 部署 `bridge_arm` 即武装（绑定发起 agent）。无 job、无 goal、
 无 bash watcher。bash 版 `watch.sh`（job 结算 + goal 续轮）保留为无插件环境的手工
 后备方案。
 
@@ -63,8 +63,8 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 3) 上面契约行丢失/不完整时: load skill `maestro-bridge`（对端冷执行手册,~/.agents/skills）
 ```
 
-- `<orch签名>` = 编排者 `bridge_arm` 回执的 `<alias>@<sessionId>`（HTTP 面精确匹配
-  armed 槽, 失配即 404→cb-send 自动降级文件桥按 registry 路由；文件桥按它路由——
+- `<orch签名>` = 编排者注册/host-lane `POST /register` 回执的 `<alias>@<sessionId>`（HTTP 面(host lane 常驻口)精确匹配
+  在册条目, 失配即 404→cb-send 自动降级文件桥按 registry 路由；文件桥按它路由——
   务必带上，别用 `*` 广播吵醒所有在册会话）。
 - 对端视角：`cb-send` 一条命令（HTTP 优先、文件桥兜底），语义见共享 skill
   `~/.agents/skills/maestro-bridge/SKILL.md`。

@@ -2,12 +2,12 @@
 # test_cb_send.sh — bin/cb-send 降级链 + PORT-R1 持有者校验单测(ticket 0005)。
 #
 # 被测面: cb-send 的传输选路——
-#   ①PORT-R1 拦截: http.port.sig 在而目标 sessionId(取 to 的 @ 后段)≠持有者
-#     → 不 POST, 直落文件桥(请求计数为 0);
+#   ①PORT-R1 已退役(P4.1.4): http.port.sig 残留不再拦截,照常 POST
+#     (防线 = host lane 常驻口 + 显式 to 失配 404 → 降级);
 #   ②持有者匹配 + HTTP 200 → POST 成功, 不写 inbox.log;
 #   ③ADDR-R1 404(HTTP 面显式 to 失配拒收)→ 降级文件桥, inbox.log 落行;
 #   ④无 http.port → 直落文件桥;
-#   ⑤to=* 广播跳过 sig 拦截(后向兼容), 照常 POST;
+#   ⑤to=* 广播照常 POST;
 #   ⑥落行信封 = {"type","from","to","body"}, body 带 "[ref:<ref>] " 前缀。
 #
 # 运行: bash tests/test_cb_send.sh   (依赖: bash/curl/python3)
@@ -57,27 +57,26 @@ reqs() { wc -l < "$REQS" | tr -d ' '; }
 inbox_lines() { [ -f "$B/inbox.log" ] && wc -l < "$B/inbox.log" | tr -d ' ' || echo 0; }
 reset_case() { : > "$REQS"; rm -f "$B/inbox.log"; echo 200 > "$CODE"; }
 
-# ── ① PORT-R1: 持有者不符 → 不 POST 直落文件桥 ──────────────────────────
+# ── ① PORT-R1 已退役(P4.1.4): sig 文件残留不再拦截,照常 POST ──────────────
 reset_case
 echo "$PORT" > "$B/http.port"; echo "session-holder" > "$B/http.port.sig"
 out=$("$CB" done dev1 orch@session-other r1 "summary one" 2>&1); rc=$?
-check "① sig mismatch: POST 未发生" "0" "$(reqs)"
-check "① sig mismatch: 文件桥落行" "1" "$(inbox_lines)"
-check "① sig mismatch: exit 0" "0" "$rc"
-case "$out" in *"holder session-holder != target session-other"*) check "① sig mismatch: 拦截日志" ok ok ;;
-  *) check "① sig mismatch: 拦截日志" ok "missing in: $out" ;;
+check "① sig 残留不拦截: POST 发生" "1" "$(reqs)"
+check "① sig 残留不拦截: 不写 inbox" "0" "$(inbox_lines)"
+check "① sig 残留不拦截: exit 0" "0" "$rc"
+case "$out" in *"cb-send: http 200"*) check "① sig 残留不拦截: http 200" ok ok ;;
+  *) check "① sig 残留不拦截: http 200" ok "got: $out" ;;
 esac
-MISSED_LINE=$(sed -n '1p' "$B/inbox.log")   # ⑥ 稍后校验(后续 case 会 reset 掉文件)
 
-# ── ② 持有者匹配 + 200 → HTTP 成功, 不写 inbox ───────────────────────────
+# ── ② 正常 200 → HTTP 成功, 不写 inbox ────────────────────────────────────
 reset_case
-echo "session-mine" > "$B/http.port.sig"
+rm -f "$B/http.port.sig"
 out=$("$CB" ack dev1 orch@session-mine r2 "turn started" 2>&1); rc=$?
-check "② sig match: POST 成功" "1" "$(reqs)"
-check "② sig match: 不写 inbox" "0" "$(inbox_lines)"
-check "② sig match: exit 0" "0" "$rc"
-case "$out" in *"cb-send: http 200"*) check "② sig match: http 200 回显" ok ok ;;
-  *) check "② sig match: http 200 回显" ok "got: $out" ;;
+check "② http 200: POST 成功" "1" "$(reqs)"
+check "② http 200: 不写 inbox" "0" "$(inbox_lines)"
+check "② http 200: exit 0" "0" "$rc"
+case "$out" in *"cb-send: http 200"*) check "② http 200 回显" ok ok ;;
+  *) check "② http 200 回显" ok "got: $out" ;;
 esac
 
 # ── ③ 404(ADDR-R1 拒收)→ 降级文件桥 ─────────────────────────────────────
@@ -87,6 +86,7 @@ out=$("$CB" done dev1 orch@session-mine r3 "summary three" 2>&1); rc=$?
 check "③ 404: POST 发生" "1" "$(reqs)"
 check "③ 404: 降级文件桥落行" "1" "$(inbox_lines)"
 check "③ 404: exit 0" "0" "$rc"
+MISSED_LINE=$(sed -n '1p' "$B/inbox.log")   # ⑥ 稍后校验(后续 case 会 reset 掉文件)
 
 # ── ④ 无 http.port → 直落文件桥 ──────────────────────────────────────────
 reset_case
@@ -103,20 +103,23 @@ out=$("$CB" status dev1 '*' r5 "broadcast" 2>&1); rc=$?
 check "⑤ broadcast: POST 发生" "1" "$(reqs)"
 check "⑤ broadcast: 不写 inbox" "0" "$(inbox_lines)"
 
-# ── ⑥ 落行信封形状(①的 inbox 行): 字段与 ref 前缀 ────────────────────────
+# ── ⑥ 落行信封形状(③的 inbox 行): v3 七键 + ref 前缀 ──────────────────────
 shape=$(python3 - "$MISSED_LINE" <<'EOF'
 import json, sys
 try:
     o = json.loads(sys.argv[1])
-    ok = (o.get('type') == 'done' and o.get('from') == 'dev1'
-          and o.get('to') == 'orch@session-other'
-          and o.get('body') == '[ref:r1] summary one')
+    ok = (list(o.keys()) == ['type', 'from', 'to', 'body', 'ref', 'msgid', 'ver']
+          and o['type'] == 'done' and o['from'] == 'dev1'
+          and o['to'] == 'orch@session-mine'
+          and o['body'] == '[ref:r3] summary three'
+          and o['ref'] == 'r3' and o['ver'] == 3
+          and isinstance(o['msgid'], str) and len(o['msgid']) > 0)
     print('ok' if ok else f'bad:{o}')
 except Exception as e:
     print(f'unparsable:{e}')
 EOF
 )
-check "⑥ inbox 行信封 + ref 前缀" "ok" "$shape"
+check "⑥ inbox 行信封 v3 七键 + ref 前缀" "ok" "$shape"
 
 echo "----"
 echo "pass=$PASS fail=$FAIL"

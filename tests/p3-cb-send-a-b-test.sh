@@ -228,12 +228,14 @@ echo "$BOUT"
 BN_OK=$(grep -c '^\[ ok \]' <<< "$BOUT"); BN_BAD=$(grep -c '^\[FAIL\]' <<< "$BOUT")
 PASS=$((PASS+BN_OK)); [ "$BN_BAD" = 0 ] || FAIL=$((FAIL+BN_BAD))
 
-# ============ C1: message-bridge 静态断言 ============
-if grep -q 'canonical.ref = payload.ref' plugins/message-bridge/index.js \
-  && grep -q 'canonical.msgid = payload.msgid' plugins/message-bridge/index.js \
-  && grep -q 'payload.ver === 2 || payload.ver === 3' plugins/message-bridge/index.js; then
-  ok C1 "message-bridge canonical line 条件透传(静态)"
-else bad C1 "源形状断言未命中"; fi
+# ============ C1: message-bridge 过渡态断言(P4 后改判: 目录已删) ============
+if [ ! -d plugins/message-bridge ]; then
+  ok C1 "message-bridge 已随 P4 删除(过渡期三处一行级交付随 T5 归档)"
+else
+  grep -q 'canonical.ref = payload.ref' plugins/message-bridge/index.js \
+    && grep -q 'canonical.msgid = payload.msgid' plugins/message-bridge/index.js \
+    && ok C1 "canonical line 条件透传(静态)" || bad C1 "源形状断言未命中"
+fi
 
 # ============ 通道C: mock-orca ============
 MOCK="$WORK/mock-orca"

@@ -86,7 +86,7 @@ const mkPumpWithSink = (dir, consumer, sink, extra = {}) => {
 // ---------------------------------------------------------------- v4 指纹与寻址
 
 test('exports the v4 version fingerprint; parseAddress classifies all addressing forms', () => {
-  assert.equal(version, '4.0.0')
+  assert.equal(version, '4.1.0')
   assert.equal(ECHO_PREFIX, 'DSH-RE]')
   assert.equal(MAX_WAKE_FAILURES, 3)
   assert.equal(ROTATE_MAX_LINES, 1000)
@@ -128,7 +128,7 @@ test('delivers rows addressed to self in order; per-consumer cursor file, state 
   assert.equal(await cursorOf(dir, S_A), '2')
 
   const state = await readState(dir)
-  assert.equal(state.version, '4.0.0')
+  assert.equal(state.version, '4.1.0')
   assert.equal(state.consumers[S_A].deliveredCount, 2)
   assert.equal(state.consumers[S_A].alias, '编排1')
   assert.ok(state.consumers[S_A].lastDeliveredAt)

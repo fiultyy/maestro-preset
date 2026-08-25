@@ -84,7 +84,8 @@ export function createHttpSource(config) {
     portFile = 'http.port',
     bind = '127.0.0.1',
     maxBodyBytes = 256 * 1024,
-    types = ['done', 'ping', 'status'],
+    // P4.1.3: 6 值与 host-callback-bridge/http-intake.js TYPES 同集(潜伏面加固,生产不启用 http source)。
+    types = ['ack', 'done', 'ask', 'report', 'ping', 'status'],
     port = 0,
     now = () => Date.now(),
     dedupWindowMs = 60_000,

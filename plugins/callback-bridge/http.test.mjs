@@ -59,7 +59,7 @@ async function withService(fn, config = {}) {
 }
 
 test('exports v4 version fingerprint', () => {
-  assert.equal(version, '4.0.0')
+  assert.equal(version, '4.1.0')
   assert.equal(DEDUP_WINDOW_MS, 60_000)
 })
 
@@ -194,7 +194,7 @@ test('routing guard: wrong path → 404, non-POST → 405, oversized body → 41
 test('listener binds loopback only; status reports port/bind/counters', async () => {
   await withService(async ({ service, port }) => {
     const s = service.status()
-    assert.equal(s.version, '4.0.0')
+    assert.equal(s.version, '4.1.0')
     assert.equal(s.bind.host, '127.0.0.1')
     assert.equal(s.bind.port, port)
     assert.equal(s.endpoint, `http://127.0.0.1:${port}/callback`)

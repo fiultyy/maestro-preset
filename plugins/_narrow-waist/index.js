@@ -8,6 +8,7 @@ export {
   forgeMsgid, digestOf, dedupKeys, createDedupWindow, seenAny, markAll,
 } from './dedup.js'
 export { appendJsonl } from './jsonl.js'
+export { fileSafeSid, createBridgeStore } from './store.js'
 export {
   parseAddress, aliasIndex,
   resolveRouting, resolveRoutingUnified, resolveHostRouting, resolveAddress,

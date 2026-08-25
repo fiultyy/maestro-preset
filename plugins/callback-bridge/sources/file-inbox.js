@@ -437,5 +437,12 @@ export function createFileInboxSource(config) {
     return { kind: 'file-inbox', ...snapshot(), watching: watcher !== null }
   }
 
-  return { id: 'file-inbox', start, stop, status, flush, dispose, snapshot, paths }
+  // P4.1.1: 重复 arm 刷新本槽 consumer 元数据(别名变更 → registry 重写带新 canonical)。
+  function refreshConsumer(next) {
+    if (next === null || typeof next !== 'object') return
+    if (typeof next.alias === 'string' && next.alias.length > 0) consumer.alias = next.alias
+    else if (next.alias === null) consumer.alias = undefined
+  }
+
+  return { id: 'file-inbox', start, stop, status, flush, dispose, snapshot, paths, refreshConsumer }
 }

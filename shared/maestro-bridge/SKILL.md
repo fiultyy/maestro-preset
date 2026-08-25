@@ -38,8 +38,8 @@ CB=~/.dsh/.agent-presets/maestro/bin/cb-send    # 安装点
 - `<orch签名>` = 派发契约里编排者给的 `<alias>@<sessionId>`。**别填 `*`**(广播吵醒
   所有在册会话);实在没有就填 `orch1`。
 - `<ref>` = 派发消息 `[ref:…]` 里的任务号,没有填 `-`。
-- cb-send 自动选路: HTTP(有语义应答 200/208)优先;显式 to 失配(404)、端口持有者
-  不符(PORT-R1)或 HTTP 不可用时自动降级文件桥,皆不丢消息。
+- cb-send 自动选路: HTTP(有语义应答 200/208)优先;显式 to 失配(404)或 HTTP 不可
+  用时自动降级文件桥,皆不丢消息(PORT-R1 sig 机制已于 P4 退役;防线=host lane 常驻口)。
 - **v3 行形状(2026-08 起)**: 落行为七键 `{"type","from","to","body","ref","msgid","ver"}`——
   `--msgid <id>` 透传既有 msgid(重发保号,受理面据此回 208+回显)、`--ver 2|3` 缺省 3
   (2 = 旧四键格式);收方 ref 解析规则 = **字段优先**,`ref` 键缺失时回退 body `[ref:…]` 前缀。

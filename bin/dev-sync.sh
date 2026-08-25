@@ -10,7 +10,7 @@
 #   bin/dev-sync.sh               # 正向: 仓库 → 安装点(rsync --delete, 仓库为准)
 #   bin/dev-sync.sh --reverse     # 回流: 安装点 → 仓库, 只生成 patch 不直接覆盖
 #                                 #       (§10.2 护栏一: 禁手工 cp 覆盖回仓库)
-#   bin/dev-sync.sh --verify      # 双向 diff 报告(不同文件清单, 不改动任何文件)
+#   bin/dev-sync.sh --verify      # 双向 diff 报告(不同文件清单, 不改动任何文件;四段: 装点/回流/镜像/polyfill lane)
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 DST="${DSH_HOME:-$HOME/.dsh}/.agent-presets/maestro"
@@ -31,7 +31,11 @@ case "${1:-}" in
   diff -rq "${EXCLUDES[@]}" "$DST" "$SRC" | sed "s|$DST|<install>|g; s|$SRC|<repo>|g" || true
   echo "== mirror drift (镜像漂移项, 下次正向同步自动齐平):"
   diff -rq --exclude __pycache__ "$SRC/bin" "$MIRROR" 2>/dev/null | sed "s|$MIRROR|<mirror>|g; s|$SRC|<repo>|g" || true
-  echo "== 三段清零 = 完全同步"
+  echo "== polyfill lane drift (P4.4: host-callback-bridge + _narrow-waist → ~/.dsh/plugins):"
+  PL="${DSH_HOME:-$HOME/.dsh}/plugins"
+  diff -rq --exclude __pycache__ "$SRC/plugins/host-callback-bridge" "$PL/host-callback-bridge" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
+  diff -rq --exclude __pycache__ "$SRC/plugins/_narrow-waist" "$PL/_narrow-waist" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
+  echo "== 四段清零 = 完全同步"
   exit 0
   ;;
 --reverse)
@@ -82,6 +86,17 @@ if [ -d "$SRC/plugins/host-callback-bridge" ]; then
   cp -a "$SRC/plugins/host-callback-bridge" "$POLYFILL_DIR"
   rm -rf "$POLYFILL_DIR/__pycache__"
   echo "polyfill synced: $SRC/plugins/host-callback-bridge -> $POLYFILL_DIR"
+fi
+# P4.4(R-B13): _narrow-waist 同步——host-callback-bridge 的 import
+# '../_narrow-waist/…' 在装点解析为 ~/.dsh/plugins/_narrow-waist,不同步即 ENOENT、
+# 宿主回调链路静默全断。与 host-callback-bridge 同窗拷贝(原子性同现状)。
+NW_DIR="${DSH_HOME:-$HOME/.dsh}/plugins/_narrow-waist"
+if [ -d "$SRC/plugins/_narrow-waist" ]; then
+  mkdir -p "$(dirname "$NW_DIR")"
+  rm -rf "$NW_DIR"
+  cp -a "$SRC/plugins/_narrow-waist" "$NW_DIR"
+  rm -rf "$NW_DIR/__pycache__"
+  echo "narrow-waist synced: $SRC/plugins/_narrow-waist -> $NW_DIR"
 fi
 
 case "${1:-}" in

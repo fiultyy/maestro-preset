@@ -9,9 +9,9 @@ import {
   findFleetEntry, resolveFleetSessionId,
   sanitizeConsumers, readRegistry, registerConsumer, unregisterConsumer,
 } from './addressing.js'
-// 只读 oracle: 生产 core/addressing.js 与 pump.js
+// 只读 oracle: 生产 core/addressing.js(pump.js 已随 P4 删除;泵序语义经
+// callback-bridge core/addressing.js re-export 链保持,由其 file-inbox.test 锁定)
 import * as coreAddressing from '../host-callback-bridge/core/addressing.js'
-import { resolveRouting as pumpResolveRouting } from '../orca-callback/pump.js'
 
 const REG = (entries) => ({ version: 'v-test', consumers: Object.fromEntries(entries) })
 const SID_A = 'session-aaaa-1111'
@@ -71,7 +71,7 @@ test('dead reason 四条: 与 core/addressing.js、pump.js 两处 oracle 逐字�
   ]
   for (const addr of cases) {
     const host = resolveRoutingUnified(addr, reg, {})
-    const pump = pumpResolveRouting(addr, { sessionId: SELF }, reg)
+    const pump = resolveRouting(addr, { sessionId: SELF }, reg) // 底层=泵序(P4 起唯一定义点)
     const coreHost = coreAddressing.resolveHostRouting(addr, reg)
     assert.equal(host.action, 'dead')
     assert.equal(host.reason, coreHost.reason)
@@ -84,10 +84,12 @@ test('R-S28 参数序回归: 底层 resolveRouting(address, self, registry) 语�
   const addr = { kind: 'qualified', alias: 'a', sessionId: SID_A }
   const self = { sessionId: 'session-other-42' }
   const mine = resolveRouting(addr, self, reg)
-  const oracle = pumpResolveRouting(addr, self, reg)
-  assert.equal(mine.action, oracle.action)
-  assert.equal(mine.broadcast, oracle.broadcast)
-  if (mine.action === 'wake') assert.deepEqual(mine.sids, [self.sessionId])
+  // R-S28 参数序回归(P4 起泵序定义点即本库): 目标在册而 self 他人 → skip(他册越过)
+  assert.equal(mine.action, 'skip')
+  // 未册 sid → dead reason 2(参数错位时 registry 会被误传 self 位而全盘错向,此处锁死)
+  const miss = resolveRouting({ kind: 'qualified', alias: 'x', sessionId: 'session-zzz' }, self, reg)
+  assert.equal(miss.action, 'dead')
+  assert.equal(miss.reason, 'unknown-addressee: no registered consumer with sessionId session-zzz')
 })
 
 test('resolveHostRouting 兼容别名 = unified 宿主视角; 与 core oracle 逐行为一致', () => {

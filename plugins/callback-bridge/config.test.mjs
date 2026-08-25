@@ -159,7 +159,7 @@ test('apply smoke: idle→followup, busy→inject; ORCA-CB] prefix + plugin sour
     else process.env.MAESTRO_BRIDGE = old
   }
 
-  assert.equal(tools.map((t) => t.name).sort().join(','), 'bridge_arm,bridge_status')
+  assert.equal(tools.map((t) => t.name).sort().join(','), 'bridge_arm,bridge_http_status,bridge_status')
 
   // idle: 投一条 → watcher 驱动 flush → followup
   currentAgent = {
@@ -169,7 +169,7 @@ test('apply smoke: idle→followup, busy→inject; ORCA-CB] prefix + plugin sour
     inject: (m) => { injects.push(m) },
   }
   const receipt = await armExecute(tools, { alias: 'orch' })
-  assert.match(receipt, /callback-bridge v4\.0\.0/)
+  assert.match(receipt, /callback-bridge v4\.1\.0/)
   assert.match(receipt, /orch@session-apply-test/)
 
   await appendFile(join(dir, 'inbox.log'), '{"type":"ping","from":"a@x","to":"orch@session-apply-test","body":"hi"}\n')
@@ -204,3 +204,96 @@ async function armExecute(tools, args) {
   const arm = tools.find((t) => t.name === 'bridge_arm')
   return arm.execute(args)
 }
+
+// ---------------------------------------------------------------- P4 新增用例(T6)
+
+test('P4: v4.1.0 双 slot 隔离(incident 0003 防线)——A arm→B arm→投 A 签名,A 收 B 不收', async () => {
+  const dir = await makeBridge()
+  const followupsA = []
+  const followupsB = []
+  let agentA
+  let agentB
+  const tools = []
+  const effects = []
+  const ctx = {
+    agents: { requireInitiator: () => currentAgent },
+    tools: { register: (t) => { tools.push(t) } },
+    effect: (fn) => { effects.push(fn) },
+  }
+  let currentAgent
+  delete process.env.MAESTRO_BRIDGE
+  apply(ctx, { bridgeDir: dir, sources: [{ kind: 'file-inbox' }] })
+  agentA = { id: 'session-slot-a', status: 'idle', followup: (m) => { followupsA.push(m) }, inject: () => {} }
+  agentB = { id: 'session-slot-b', status: 'idle', followup: (m) => { followupsB.push(m) }, inject: () => {} }
+  currentAgent = agentA
+  const receiptA = await armExecute(tools, { alias: 'alpha' })
+  assert.match(receiptA, /alpha@session-slot-a/)
+  currentAgent = agentB
+  const receiptB = await armExecute(tools, { alias: 'beta' })
+  assert.match(receiptB, /beta@session-slot-b/)
+  // 投 A 签名
+  currentAgent = agentA
+  await appendFile(join(dir, 'inbox.log'), '{"type":"ping","from":"x","to":"alpha@session-slot-a","body":"for A only"}\n')
+  await waitFor(() => followupsA.length === 1, 4_000)
+  assert.equal(followupsA.length, 1, `A 未收到投递;status=${await tools.find((t) => t.name === 'bridge_status').execute()}`)
+  assert.equal(followupsB.length, 0, 'B 不收(分槽隔离)')
+  // A 重 arm 换别名: A 回执新别名,B 槽不动
+  currentAgent = agentA
+  const receiptA2 = await armExecute(tools, { alias: 'alpha2' })
+  assert.match(receiptA2, /alpha2@session-slot-a/)
+  const status = await tools.find((t) => t.name === 'bridge_status').execute()
+  assert.match(status, /alpha2@session-slot-a/)
+  assert.match(status, /beta@session-slot-b/)
+  const cleanup = effects[effects.length - 1]
+  cleanup()
+  await new Promise((r) => setTimeout(r, 50))
+})
+
+test('P4: P4.7 行 config 解析 sources 恰 1 条 file-inbox(显式 config 覆盖双 source 缺省)', () => {
+  const cfg = normalizeConfig({
+    bridgeDir: null,
+    aliasEnv: 'MAESTRO_BRIDGE_ALIAS',
+    sink: { messagePrefix: 'ORCA-CB]', pluginId: '@maestro/callback-bridge' },
+    engine: { dedupWindowMs: 60000, maxWakeFailures: 3, retryDelayMs: 2000 },
+    sources: [{ kind: 'file-inbox', file: 'inbox.log', echoPrefix: 'DSH-RE]', rotateMaxBytes: 1048576, rotateMaxLines: 1000 }],
+  })
+  assert.equal(cfg.sources.length, 1)
+  assert.equal(cfg.sources[0].kind, 'file-inbox')
+})
+
+test('P4: bridge_http_status deprecated 别名——回执含 [deprecated] 且不创建监听', async () => {
+  const tools = []
+  const ctx = {
+    agents: { requireInitiator: () => { throw new Error('n/a') } },
+    tools: { register: (t) => { tools.push(t) } },
+    effect: () => {},
+  }
+  delete process.env.MAESTRO_BRIDGE
+  apply(ctx, { bridgeDir: await makeBridge(), sources: [{ kind: 'file-inbox' }] })
+  const alias = tools.find((t) => t.name === 'bridge_http_status')
+  assert.ok(alias, '别名已注册')
+  const out = await alias.execute()
+  assert.match(out, /^\[deprecated\] use bridge_status/)
+  assert.match(out, /host lane/)
+})
+
+test('P4: core/ 四文件纯 re-export(单一物理源= _narrow-waist)', async () => {
+  const fs = await import('node:fs/promises')
+  for (const f of ['addressing.js', 'dedup.js', 'registry.js', 'store.js']) {
+    const src = await fs.readFile(join(import.meta.dirname, 'core', f), 'utf8')
+    assert.ok(src.includes("from '../../_narrow-waist/"), `${f} 非 re-export`)
+    assert.ok(!/function\s+\w+\s*\(/.test(src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^ \*.*$/gm, '')), `${f} 含本地实现体`)
+  }
+})
+
+test('P4: 双槽并发 registerSelf 压测(写链继承,20 轮交错不丢条目)', async () => {
+  const dir = await makeBridge()
+  const registryPath = join(dir, 'registry.json')
+  const { registerConsumer } = await import('./core/registry.js')
+  const results = await Promise.allSettled(Array.from({ length: 20 }, (_, i) =>
+    registerConsumer(registryPath, `gen-${i}`, { sessionId: `session-cc-${String(i).padStart(2, '0')}`, alias: `a${i}` }, { armedAt: 't', pid: 1 })))
+  assert.equal(results.filter((r) => r.status === 'rejected').length, 0)
+  const { readRegistry } = await import('./core/registry.js')
+  const reg = await readRegistry(registryPath)
+  assert.equal(Object.keys(reg.consumers).length, 20)
+})

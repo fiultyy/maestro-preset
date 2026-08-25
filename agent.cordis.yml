@@ -97,7 +97,7 @@
 
       Plain `terminal send` carries no delivery semantics — do not confirm receipt by polling terminal output. Embed a two-phase callback contract instead:
 
-      1. Session start: arm both callback channels (`bridge_arm { alias }`, then `bridge_http_status`) — the receipt signature `<alias>@<sessionId>` is your replyable address for every dispatch you send.
+      1. Session start: register your callback identity — on host-lane deployments (USAGE §3.4) do NOT arm in-session; `POST /register {"sessionId","alias"}` to the port in `bridge/http.port` (the host lane owns the HTTP channel). On bare-preset deployments arm once with `bridge_arm { alias }` (file bridge; `bridge_http_status` is a deprecated alias of `bridge_status`). The receipt signature `<alias>@<sessionId>` is your replyable address for every dispatch you send.
       2. Every supervised dispatch embeds the ACK/DONE contract (template in `skills/orca-bridge/SKILL.md`): the peer runs `bin/cb-send ack <self> <your-signature> <ref> "turn started"` as the FIRST action of its turn, and `bin/cb-send done <self> <your-signature> <ref> "<summary>"` (≤300 chars) when finished. Both arrive as native callback turns (MSGBR]/ORCA-CB] prefixed) and wake you.
       3. Fold them into the ledger: ACK → node `running` + `progress` event ("ack: turn started"); DONE → node `done|failed` + outcome summary. A done closes the node — never re-wait or re-dispatch on top of it without a new ref.
       4. No ACK by your first sweep or ~10 min → verify mechanically (`terminal read --cursor`, `terminal wait --for tui-idle`) and proceed. The handshake is cooperative (peers without the contract cannot ack); the mechanical check stays the arbiter, never the reverse.
@@ -352,22 +352,33 @@
         maxRounds: 64
 
 # ── orca callback pump ───────────────────────────────────────────────────────
+# ── callback-bridge(会话内回调兼容层,窄腰终态)─────────────────────────────
 #
-# 原生 Orca→DSH 回调泵（v3.3，替代 bash watcher+goal 方案）：preset 自带的本地
-# 插件，fs.watch 桥 inbox（游标顺序消费，DSH-RE] 回声跳过），经 Agent.followup/
-# inject —— 与 dsh-tool-jobs 唤醒同一条原生接缝 —— 直接驱动回合。仅消费宿主
-# `agents` 服务，不发布服务，无需 realm。桥 pane 的建立见 skills/orca-bridge。
-# 相对路径经组合 baseUrl 解析（EntryTree.import 的 '.' 分支）。
-- id: orca-callback
-  name: './plugins/orca-callback/pump.js'
-
-# ── message-bridge 直发回调端点 ──────────────────────────────────────────────
-#
-# 本地回环 HTTP 微服务(127.0.0.1 随机端口 → bridge/http.port,POST /callback,
-# 200/208 幂等/400 校验全语义)。与 orca-callback 同一条 followup/inject 接缝;
-# 外部进程一条 curl 即可驱动回合。作为主回调通道,文件桥降级为兜底。
-- id: message-bridge
-  name: './plugins/message-bridge/index.js'
+# orca-callback(pump v3.6)+ message-bridge(v1.3)的收敛终态: 共享内核已提炼为
+# plugins/_narrow-waist(core/ 四文件原位 re-export)。file-inbox 单 source——
+# HTTP /callback 与 bridge/http.port 的唯一持有者是宿主 host-callback-bridge
+# lane(polyfill 注册,见 USAGE §3.4),会话内不再绑口。per-session 分槽
+# (incident 0003 防线保留);bridge_status 查询;bridge_http_status 为
+# deprecated 别名(两个稳定周期后移除)。host lane 部署下按 USAGE §3.4 无需
+# arm(POST /register);本行服务裸 preset 自包含场景。
+- id: callback-bridge
+  name: './plugins/callback-bridge/index.js'
+  config:
+    bridgeDir: null                # 解析: env MAESTRO_BRIDGE > 此处 > ~/.dsh/maestro/bridge
+    aliasEnv: 'MAESTRO_BRIDGE_ALIAS'
+    sink:
+      messagePrefix: 'ORCA-CB]'
+      pluginId: '@maestro/callback-bridge'
+    engine:
+      dedupWindowMs: 60000
+      maxWakeFailures: 3
+      retryDelayMs: 2000
+    sources:
+      - kind: 'file-inbox'
+        file: 'inbox.log'
+        echoPrefix: 'DSH-RE]'
+        rotateMaxBytes: 1048576
+        rotateMaxLines: 1000
 
 # workspace-unarchive —— 补 RPC 面缺口: archiveSession 有动词, unarchive 没有
 # ("a future unarchive"), 归档即侧栏失联。本插件经活体 WorkspaceRegistry 走
