@@ -13,12 +13,13 @@
 #   - web profile cordis.patch.yml 的 long-task 两行 insert
 #   - lark/zhipu 凭据环境变量
 #
-# 用法: host/install.sh [--dry-run] [--profile web]
+# 用法: host/install.sh [--dry-run] [--profile web] [--systemd]
 set -euo pipefail
-DRY=0; PROFILE=web
+DRY=0; PROFILE=web; SYSTEMD=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
+    --systemd) SYSTEMD=1 ;;
     --profile) : ;; # 值在下一轮取
     *) [[ "${PREV:-}" == --profile ]] && PROFILE="$a" || { echo "unknown arg: $a" >&2; exit 2; } ;;
   esac
@@ -38,7 +39,10 @@ NM="${DSH}/profiles/${PROFILE}/node_modules/@deepseek-ai"
 for pkg in host/packages/*/; do
   name="$(python3 -c "import json;print(json.load(open('$pkg/package.json'))['name'])")"
   echo "   ${name}"
-  install_dir "$ROOT/$pkg" "${NM}/$(basename "$pkg")"
+  dst="${NM}/$(basename "$pkg")"
+  # 替换语义: 包目录整体换新(叠加 cp 会残留旧 .map/空壳 → release-check 漂移)
+  run rm -rf "$dst"
+  install_dir "$ROOT/$pkg" "$dst"
 done
 
 echo "== 2. host polyfill 插件 → ${DSH}/plugins/"
@@ -61,5 +65,26 @@ for d in "$ROOT"/agent-presets/*/; do
   install_dir "$d" "${DSH}/.agent-presets/$id"
   echo "   $id"
 done
+
+
+if [ "$SYSTEMD" = 1 ]; then
+  echo "== 5. systemd user unit → ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/"
+  NODE_BIN="$(command -v node)"
+  [ -n "$NODE_BIN" ] || { echo "node 不在 PATH,无法生成 unit" >&2; exit 1; }
+  UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  UNIT="$UNIT_DIR/a2a-profile-daemon.service"
+  run mkdir -p "$UNIT_DIR"
+  if [ "$DRY" = 1 ]; then
+    echo "dry: sed 模板渲染 → $UNIT"
+  else
+    sed -e "s|__NODE_BIN__|$NODE_BIN|g" \
+        -e "s|__DAEMON__|$DSH/plugins/a2a-profile-server/daemon.mjs|g" \
+        -e "s|__LOG__|$DSH/a2a-profile-daemon.log|g" \
+        "$ROOT/host/systemd/a2a-profile-daemon.service.in" > "$UNIT"
+  fi
+  run systemctl --user daemon-reload
+  run systemctl --user enable a2a-profile-daemon
+  echo "   已 enable。在役 daemon 不打断;改代码后手动: systemctl --user restart a2a-profile-daemon"
+fi
 
 echo "== 完成。剩余人工步骤(凭据/组合行): host/README.md"
