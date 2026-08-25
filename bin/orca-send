@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+//
+// orca-send — DSH→Orca 方向窄腰 adapter(P3b.5): orchestration send Run mailbox 优先,
+// PTY terminal send 降 L1 兜底;产出 ORCA-CB]/DSHMSG] 可 parseLine 载体。
+//
+// 用法: orca-send [--msgid <id>] [--via <id>] [--ttl <n>] [--terminal <handle>]
+//                 [--outcome <succeeded|failed>] [--task-id <id>] [--dispatch-id <id>] [--json]
+//                 <from> <to> <type> <ref> <body>
+//   位置参数序 = session-send 同款;to 三形态: run:<id>/dispatch:<id> 原样透传、
+//   term_ 前缀 = orca 终端句柄、裸短码/别名查 MAESTRO_FLEET(kind='orca-terminal');
+//   '*' 跨平面广播不等价 → exit 2。
+//   出站 type 翻译(adapter 级,仅 --type 参数): Orca 原生 10 型小写直通;
+//   ack/done/ping/report→'status';pong/nack/ask→exit 2;steer→exit 2(提示
+//   terminal send --interrupt)。信封 env.type 保留调用方原词。
+//
+'use strict'
+const { execFile } = require('node:child_process')
+const { readFileSync } = require('node:fs')
+const { join, dirname } = require('node:path')
+const { homedir } = require('node:os')
+const { pathToFileURL } = require('node:url')
+
+// ---- 库解析链: $NW_HOME > 脚本相对 > ${MAESTRO_PRESET:-~/.dsh/.agent-presets/maestro} ----
+function libCandidates() {
+  const out = []
+  if (process.env.NW_HOME) out.push(join(process.env.NW_HOME, 'index.js'))
+  try {
+    const self = require('node:fs').realpathSync(process.argv[1])
+    out.push(join(dirname(self), '..', 'plugins', '_narrow-waist', 'index.js'))
+  } catch { /* unrealizable */ }
+  out.push(join(process.env.MAESTRO_PRESET ?? join(homedir(), '.dsh', '.agent-presets', 'maestro'),
+    'plugins', '_narrow-waist', 'index.js'))
+  return out
+}
+async function loadLib() {
+  for (const cand of libCandidates()) {
+    try {
+      return await import(pathToFileURL(cand).href)
+    } catch { /* 下一级 */ }
+  }
+  process.stderr.write('orca-send: cannot locate _narrow-waist library (NW_HOME / repo / MAESTRO_PRESET)\n')
+  process.exit(1)
+}
+
+function usageExit() {
+  process.stderr.write('usage: orca-send [--msgid <id>] [--via <id>] [--ttl <n>] [--terminal <h>] [--outcome <succeeded|failed>] [--task-id <id>] [--dispatch-id <id>] [--json] <from> <to> <type> <ref> <body>\n')
+  process.exit(2)
+}
+
+// 出站 type 翻译(P3b.5-6): 信封原词不动,仅 --type 参数翻译
+function translateType(lib, rawType) {
+  const t = String(rawType ?? '').toLowerCase()
+  if (t === 'steer') {
+    process.stderr.write('orca-send: steer 不支持 Orca mailbox 面;打断运行中 turn 请用: orca-ide terminal send --terminal <h> --interrupt\n')
+    process.exit(2)
+  }
+  const native = lib.denormalizeType(t, 'orca')
+  if (native !== null) return native
+  if (t === 'ack' || t === 'done' || t === 'ping' || t === 'report') return 'status'
+  process.stderr.write(`orca-send: type 非法(Orca 面不可译): ${rawType}\n`)
+  process.exit(2)
+}
+
+function runOrca(args) {
+  const cmd = process.env.ORCA_CLI_COMMAND ?? 'orca-ide'
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: 15_000, encoding: 'utf8' }, (error, stdout, stderr) => {
+      resolve({ error, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') })
+    })
+  })
+}
+
+async function main() {
+  const lib = await loadLib()
+  // ---- 参数 scan-and-delete ----
+  const opts = { viaSegments: [], task: false, dispatch: false, json: false }
+  const rest = []
+  const argv = process.argv.slice(2)
+  for (let i = 0; i < argv.length;) {
+    const take = (name) => {
+      if (i + 1 >= argv.length) usageExit()
+      const v = argv[i + 1]
+      i += 2
+      return v
+    }
+    switch (argv[i]) {
+      case '--msgid': opts.msgid = take(); break
+      case '--via': {
+        const v = take()
+        for (const seg of v.split(',')) {
+          if (seg === '') { process.stderr.write('orca-send: --via segments must be non-empty\n'); process.exit(2) }
+          opts.viaSegments.push(seg)
+        }
+        break
+      }
+      case '--ttl': {
+        const v = Number(take())
+        if (!Number.isInteger(v) || v < 1) usageExit()
+        opts.ttl = v
+        break
+      }
+      case '--terminal': opts.terminal = take(); break
+      case '--outcome': opts.outcome = take(); break
+      case '--task-id': opts.taskId = take(); opts.task = true; break
+      case '--dispatch-id': opts.dispatchId = take(); opts.dispatch = true; break
+      case '--json': opts.json = true; i += 1; break
+      default: rest.push(argv[i]); i += 1
+    }
+  }
+  if (rest.length !== 5) usageExit()
+  const [frm, to, typ, ref, body] = rest
+  if (to === '*') {
+    process.stderr.write("orca-send: to='*' 跨平面广播不等价,拒发(逐平面显式发送)\n")
+    process.exit(2)
+  }
+  if (body.includes('\n') || Buffer.byteLength(body, 'utf8') > 4096) {
+    process.stderr.write('orca-send: body exceeds 4KB single-line budget; write long content to a file and pass the path (SKILL.md)\n')
+    process.exit(2)
+  }
+
+  // ---- to 解析(P3b.5-4) ----
+  let toArg = null
+  let handle = opts.terminal ?? null
+  if (to.startsWith('run:') || to.startsWith('dispatch:')) {
+    toArg = to // ① 原样透传,不读 fleet
+  } else if (to.startsWith('term_')) {
+    toArg = to // ② orca 终端句柄(legacy_handle 直投 + PTY 兜底)
+    if (handle === null) handle = to
+  } else {
+    // ③ 裸短码/别名 → fleet 梯
+    const fleetPath = process.env.MAESTRO_FLEET ?? join(homedir(), '.dsh', 'maestro', 'fleet.json')
+    let fleet = {}
+    try {
+      fleet = JSON.parse(readFileSync(fleetPath, 'utf8'))
+    } catch (error) {
+      process.stderr.write(`orca-send: cannot read fleet file ${fleetPath}: ${error && error.message}\n`)
+      process.exit(1)
+    }
+    const entry = lib.findFleetEntry(fleet, to, { mode: 'prefix' })
+    if (entry === undefined || entry.kind !== 'orca-terminal') {
+      process.stderr.write(`orca-send: to '${to}' 非 orca 平面(plane mismatch);DSH 会话请走 session-send,编排回调请走 cb-send\n`)
+      process.exit(1)
+    }
+    handle = typeof entry.handle === 'string' && entry.handle.length > 0 ? entry.handle : null
+    toArg = handle ?? to
+  }
+
+  const orcaType = translateType(lib, typ)
+  if (orcaType === 'worker_done' && (opts.outcome !== 'succeeded' && opts.outcome !== 'failed')) {
+    process.stderr.write('orca-send: worker_done requires --outcome succeeded|failed\n')
+    process.exit(2)
+  }
+
+  const env = lib.createEnvelope({
+    from: frm, to, type: typ, ref, body,
+    msgid: (opts.msgid && opts.msgid.length > 0) ? opts.msgid : lib.forgeMsgid(),
+    ts: Date.now(),
+    via: [...opts.viaSegments, 'orca-send'].join(','),
+    ttl: opts.ttl ?? 5,
+  })
+  const line = lib.serializeLine(env) // DSHMSG]{...} 主路径载体
+
+  // ---- 主路径 L2: Run mailbox ----
+  const sendArgs = ['orchestration', 'send', '--from', frm, '--to', toArg,
+    '--subject', ref, '--body', line, '--type', orcaType, '--json']
+  if (orcaType === 'worker_done') sendArgs.push('--outcome', opts.outcome)
+  if (opts.task) sendArgs.push('--task-id', opts.taskId)
+  if (opts.dispatch) sendArgs.push('--dispatch-id', opts.dispatchId)
+  const mainRun = await runOrca(sendArgs)
+  let mainOk = mainRun.error === null && mainRun.stdout.trim().length > 0
+  let mainParsed = null
+  if (mainOk) {
+    const s = mainRun.stdout.trim()
+    try {
+      mainParsed = JSON.parse(s)
+    } catch {
+      const a = s.indexOf('{')
+      const b = s.lastIndexOf('}')
+      try { mainParsed = a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null } catch { mainParsed = null }
+    }
+    mainOk = mainParsed !== null && mainParsed.ok === true
+  }
+
+  if (mainOk) {
+    const extra = mainParsed && typeof mainParsed === 'object' ? mainParsed : {}
+    if (opts.json) {
+      console.log(JSON.stringify({ ok: true, delivered: 'run-mailbox', msgid: env.msgid, runId: extra.runId ?? undefined, deliveryId: extra.deliveryId ?? extra.id ?? undefined }))
+    } else {
+      console.log(`orca-send: delivered run-mailbox to=${toArg} msgid=${env.msgid}`)
+    }
+    process.exit(0)
+  }
+
+  // ---- PTY 兜底 L1: 仅当终端句柄可得 ----
+  if (handle !== null && typeof handle === 'string' && handle.length > 0) {
+    const ptyText = `ORCA-CB] ${JSON.stringify(env)}` // 裸 JSON;严禁叠 DSHMSG] 双前缀
+    const ptyRun = await runOrca(['terminal', 'send', '--terminal', handle, '--text', ptyText, '--enter', '--json'])
+    let ptyOk = ptyRun.error === null && ptyRun.stdout.trim().length > 0
+    if (ptyOk) {
+      try { ptyOk = JSON.parse(ptyRun.stdout).ok === true } catch { ptyOk = false }
+    }
+    if (ptyOk) {
+      if (opts.json) console.log(JSON.stringify({ ok: true, delivered: 'pty', msgid: env.msgid }))
+      else console.log(`orca-send: delivered pty terminal=${handle} msgid=${env.msgid} (run-mailbox failed: ${mainRun.error ? mainRun.error.message : mainRun.stdout.slice(0, 120)})`)
+      process.exit(0)
+    }
+    process.stderr.write(`orca-send: both paths failed — run-mailbox: ${mainRun.error ? mainRun.error.message : mainRun.stdout.slice(0, 120)}; pty: ${ptyRun.error ? ptyRun.error.message : ptyRun.stdout.slice(0, 120)}\n`)
+    process.exit(1)
+  }
+  process.stderr.write(`orca-send: run-mailbox failed and no terminal handle for PTY fallback: ${mainRun.error ? mainRun.error.message : mainRun.stdout.slice(0, 200)}\n`)
+  process.exit(1)
+}
+
+main()

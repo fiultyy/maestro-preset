@@ -19,6 +19,31 @@ export function digestOf(line, parsed) {
 }
 
 /**
+ * 双键去重身份(P3b.2,R-B03+R-B16 联合):
+ *   parsed.msgid 为非空字符串 → primary=sha256(from\0msgid)、secondary=sha256(from\0body)
+ *   否则                        → primary=sha256(from\0body)、secondary=null
+ *   from 缺失/非对象            → primary=sha256(line)(现行退化分支逐字保留)、secondary=null
+ * 调用面: seen = primary 或 secondary 任一命中即重;mark = 两键同记(secondary 非 null 时)。
+ */
+export function digestKeys(line, parsed) {
+  const from = parsed !== null && typeof parsed === 'object' && typeof parsed.from === 'string'
+    ? parsed.from
+    : null
+  if (from === null) {
+    return { primary: createHash('sha256').update(line).digest('hex'), secondary: null }
+  }
+  const body = parsed !== null && typeof parsed === 'object' && parsed.body !== undefined
+    ? String(parsed.body)
+    : ''
+  const msgid = parsed !== null && typeof parsed === 'object' && typeof parsed.msgid === 'string' && parsed.msgid.length > 0
+    ? parsed.msgid
+    : null
+  const bodyKey = createHash('sha256').update(`${from}\u0000${body}`).digest('hex')
+  if (msgid === null) return { primary: bodyKey, secondary: null }
+  return { primary: createHash('sha256').update(`${from}\u0000${msgid}`).digest('hex'), secondary: bodyKey }
+}
+
+/**
  * 窗口化去重:
  *   seen(digest) → 窗口内命中返回 { deliveredAt, meta },否则 undefined
  *   mark(digest, meta) → 记一笔,顺带剪枝过期项

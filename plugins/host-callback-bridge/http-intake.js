@@ -22,7 +22,7 @@ import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { parseAddress, resolveHostRouting } from './core/addressing.js'
-import { digestOf } from './core/dedup.js'
+import { digestKeys, digestOf } from './core/dedup.js'
 import { readRegistry, registerConsumer, unregisterConsumer } from './core/registry.js'
 
 /** 请求体上限(v1.2 同值)。 */
@@ -262,9 +262,15 @@ export function createHttpIntake(config) {
     counters.lastFrom = payload.from
     counters.lastTo = to
 
-    const line = JSON.stringify({ type: payload.type, from: payload.from, to, body: payload.body })
-    const digest = digestOf(line, payload)
-    const prior = dedup.seen(digest)
+    // P3b.1-2: 头四键重组 + 尾部条件透传 ref/msgid/ver(类型合法才透传;legacy 四键行零幻影键)
+    const canonical = { type: payload.type, from: payload.from, to, body: payload.body }
+    if (typeof payload.ref === 'string' && payload.ref.length > 0) canonical.ref = payload.ref
+    if (typeof payload.msgid === 'string' && payload.msgid.length > 0) canonical.msgid = payload.msgid
+    if (payload.ver === 2 || payload.ver === 3) canonical.ver = payload.ver
+    const line = JSON.stringify(canonical)
+    // 双查(R-B03+R-B16): primary 或 secondary 任一命中即重
+    const keys = digestKeys(line, payload)
+    const prior = dedup.seen(keys.primary) ?? (keys.secondary !== null ? dedup.seen(keys.secondary) : undefined)
     if (prior !== undefined) {
       counters.duplicates += 1
       counters.lastDuplicateAt = new Date(now()).toISOString()
@@ -275,6 +281,7 @@ export function createHttpIntake(config) {
         deduplicated: true,
         deliveredAt: new Date(prior.deliveredAt).toISOString(),
         id: prior.meta ?? null,
+        msgid: prior.meta ?? null,
         windowMs: dedupWindowMs,
       })
       return
@@ -296,6 +303,7 @@ export function createHttpIntake(config) {
       ok: true,
       status: 'accepted',
       id: randomUUID(),
+      msgid: payload.msgid ?? null,
       to,
       queue: 'inbox.log',
       dedupWindowMs,

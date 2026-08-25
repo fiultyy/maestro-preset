@@ -3,7 +3,7 @@
 # 编排者派发 terminal send 时在消息里嵌入回调契约(见 skills/orca-bridge/SKILL.md),
 # 对端照抄本命令即可: ACK=回合已开始握手, DONE=完成+结果摘要。
 #
-# 用法: cb-send [--msgid <id>] [--ver <2|3>] <type> <from> <to> <ref> <body>
+# 用法: cb-send <type> <from> <to> <ref> <body>
 #   type: ack|done|ping|status
 #         ack  = 收到派发、回合已开始(握手,编排者据此把节点置 running)
 #         done = 完成,body 为 ≤300 字符结果摘要(编排者据此落账收口)
@@ -11,13 +11,9 @@
 #   to:   编排者桥签名 <alias>@<sessionId>(bridge_arm 回执给出);广播填 *
 #   ref:  派发消息里的任务 ref(无则 -)
 #   body: 单行正文
-#   --msgid: 可选,透传既有 msgid(重发保号);缺省 uuid4;与 --ver 2 互斥
-#   --ver:   2|3,缺省 3;--ver 2 输出与 cb-send.v2 逐字节一致
 #
-# 信封 v3(P3b.1,七键): {"type","from","to","body","ref","msgid","ver"}——头四键
-#       与 v2 逐字节不动;尾部追加 ref(权威,R-S03)/msgid/ver;body 恒带 "[ref:<ref>] "
-#       前缀(legacy 双写,P4 退役);HTTP 受理行同构透传(R-B17 裁决①);via/ttl 不入
-#       cb-send 面(DSHMSG] 信封专属)。收方 ref 解析: 字段优先,缺失回退 body 前缀。
+# 信封: 单行 JSON {"type","from","to","body"};ref 折进 body 前缀 "[ref:<ref>] "
+#       (HTTP 通道丢弃未知字段,两通道统一此格式;编排者从 body 前缀解析 ref)
 # 传输: HTTP 直发(bridge/http.port,200/208 皆成功)优先;
 #       PORT-R1(0005): 端口旁挂 http.port.sig 记录持有者 sessionId;目标签名(取 to
 #       的 @ 后段)与持有者不符 → 不 POST 直落文件桥(跨代际"撞错桥"整类现场消除;
@@ -26,47 +22,14 @@
 #       400、503)亦降级文件桥(append inbox.log,游标消费不丢)。
 # 依赖: curl + python3(与 session-send 同);二者皆无时按 SKILL.md 手拼 JSON。
 set -euo pipefail
-# 参数解析(P3b.4): --msgid/--ver 位置无关 scan-and-delete;删除后恰 5 位置参
-msgid=""; ver=3
-args=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --msgid)
-      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-        echo "cb-send: --msgid requires a value" >&2; exit 2
-      fi
-      msgid="$2"; shift 2 ;;
-    --ver)
-      if [ "$#" -lt 2 ]; then grep '^#' "$0" >&2; exit 2; fi
-      case "$2" in
-        2|3) ver="$2" ;;
-        *) grep '^#' "$0" >&2; exit 2 ;;
-      esac
-      shift 2 ;;
-    *) args+=("$1"); shift ;;
-  esac
-done
-if [ "${#args[@]}" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
-if [ "$ver" = 2 ] && [ -n "$msgid" ]; then
-  echo "cb-send: --ver 2 conflicts with --msgid (pick one)" >&2; exit 2
-fi
-typ="${args[0]}" frm="${args[1]}" to="${args[2]}" ref="${args[3]}" body="${args[4]}"
+if [ "$#" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
+typ="$1" frm="$2" to="$3" ref="$4" body="$5"
 B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
-if [ "$ver" = 2 ]; then
-  payload=$(python3 -c '
+payload=$(python3 -c '
 import json, sys
 print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
                   "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}"}, ensure_ascii=False))
 ' "$typ" "$frm" "$to" "$ref" "$body")
-else
-  m="${msgid:-$(python3 -c 'import uuid; print(uuid.uuid4())')}"
-  payload=$(python3 -c '
-import json, sys
-print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
-                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}",
-                  "ref": sys.argv[4], "msgid": sys.argv[6], "ver": 3}, ensure_ascii=False))
-' "$typ" "$frm" "$to" "$ref" "$body" "$m")
-fi
 
 # 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)
 skip_http=0

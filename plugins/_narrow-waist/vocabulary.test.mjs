@@ -78,7 +78,7 @@ test('两常量 Object.isFrozen', () => {
 test('映射表形状: 三平面 frozen; DSH 面 10 值; Orca 面 8 值', () => {
   assert.ok(Object.isFrozen(DAIS_TYPE_MAP) && Object.isFrozen(DSH_TYPE_MAP) && Object.isFrozen(ORCA_TYPE_MAP))
   assert.equal(Object.keys(DSH_TYPE_MAP).length, 10)
-  assert.equal(Object.keys(ORCA_TYPE_MAP).length, 8)
+  assert.equal(Object.keys(ORCA_TYPE_MAP).length, 10)
   assert.equal(denormalizeType('ping', 'orca'), null)
   assert.equal(denormalizeType('done', 'bogus-plane'), null)
 })

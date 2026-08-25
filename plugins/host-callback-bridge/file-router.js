@@ -15,7 +15,7 @@
 import { watch } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import { parseAddress, resolveHostRouting } from './core/addressing.js'
-import { digestOf } from './core/dedup.js'
+import { digestKeys, digestOf } from './core/dedup.js'
 import { readRegistry } from './core/registry.js'
 
 function errorMessage(error) {
@@ -254,7 +254,7 @@ export function createFileRouter(config) {
 
   /** 对 pending 剩余目标逐一投递;全部终态(送达/死信)返回 true。 */
   async function deliverPending() {
-    const { line, parsed, digest, broadcast } = rt.pending
+    const { line, parsed, keys, broadcast } = rt.pending
     const attempts = rt.pending.attempts
     let deadLettered = 0
     for (const sid of [...attempts.keys()]) {
@@ -272,7 +272,9 @@ export function createFileRouter(config) {
       }
     }
     if (attempts.size === 0) {
-      dedup.mark(digest)
+      // 双记(P3b.2): msgid 键 + body 键;meta = msgid(208 回放 id/msgid 数据源)
+      dedup.mark(keys.primary, parsed.msgid ?? null)
+      if (keys.secondary !== null) dedup.mark(keys.secondary, parsed.msgid ?? null)
       noteDelivery(parsed, rt.pending.targets - deadLettered)
       if (broadcast) counters.broadcastLines += 1
       rt.pending = null
@@ -350,8 +352,9 @@ export function createFileRouter(config) {
             continue
           }
 
-          const digest = digestOf(line, value)
-          if (dedup.seen(digest) !== undefined) {
+          const keys = digestKeys(line, value)
+          if (dedup.seen(keys.primary) !== undefined
+            || (keys.secondary !== null && dedup.seen(keys.secondary) !== undefined)) {
             counters.dedupCount += 1
             rt.cursor += 1
             await writeCursorFile(rt.cursor)
@@ -361,7 +364,7 @@ export function createFileRouter(config) {
           rt.pending = {
             line,
             parsed: value,
-            digest,
+            keys,
             broadcast: routing.broadcast ?? false,
             to: toValue,
             targets: routing.sids.length,

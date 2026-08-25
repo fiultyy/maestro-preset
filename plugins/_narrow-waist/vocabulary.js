@@ -48,9 +48,11 @@ export const DSH_TYPE_MAP = Object.freeze({
   steer: 'steer',
 })
 
-/** Orca --type 面。 */
+/** Orca --type 面(合法集 = V3_SIGNAL_TYPES 恰 10 值,P3b.5 CLI 探针;notify→notify 修正系原表误记)。 */
 export const ORCA_TYPE_MAP = Object.freeze({
   worker_done: 'worker_done',
+  notify: 'notify',
+  status: 'status',
   heartbeat: 'heartbeat',
   escalation: 'escalation',
   dispatch: 'dispatch',

@@ -283,8 +283,11 @@ export function createBridgeService(config) {
     counters.lastFrom = payload.from
     counters.lastTo = to
 
+    // P3b.2 过渡: digest 材料条件分流(msgid 非空 → from\0msgid;该面 P4 删,无跨版本双记义务)
     const digest = createHash('sha256')
-      .update(`${payload.from}\u0000${payload.body}`)
+      .update(typeof payload.msgid === 'string' && payload.msgid.length > 0
+        ? `${payload.from}\u0000${payload.msgid}`
+        : `${payload.from}\u0000${payload.body}`)
       .digest('hex')
     const prior = dedup.get(digest)
     if (prior !== undefined && now() - prior.deliveredAt < dedupWindowMs) {
@@ -296,13 +299,19 @@ export function createBridgeService(config) {
         deduplicated: true,
         deliveredAt: new Date(prior.deliveredAt).toISOString(),
         id: prior.id,
+        msgid: prior.msgid ?? null,
         windowMs: dedupWindowMs,
       })
       await persistState()
       return
     }
 
-    const line = JSON.stringify({ type: payload.type, from: payload.from, to, body: payload.body })
+    // P3b.1-3 过渡: canonical line 尾部条件透传 ref/msgid/ver(与宿主受理面同构;P4 本文件删除)
+    const canonical = { type: payload.type, from: payload.from, to, body: payload.body }
+    if (typeof payload.ref === 'string' && payload.ref.length > 0) canonical.ref = payload.ref
+    if (typeof payload.msgid === 'string' && payload.msgid.length > 0) canonical.msgid = payload.msgid
+    if (payload.ver === 2 || payload.ver === 3) canonical.ver = payload.ver
+    const line = JSON.stringify(canonical)
     try {
       // info.to = 请求原始 to（未混入 DEFAULT_TO 补全）: 缺省 → last-armer 兜底;
       // 显式非空 → 必须精确命中 armed 槽（v1.3 ADDR-R1）。canonical line 仍带
@@ -330,7 +339,7 @@ export function createBridgeService(config) {
     }
 
     const id = randomUUID()
-    dedup.set(digest, { deliveredAt: now(), id })
+    dedup.set(digest, { deliveredAt: now(), id, msgid: payload.msgid ?? null })
     pruneDedup()
     counters.delivered += 1
     counters.lastDeliveredAt = new Date(now()).toISOString()

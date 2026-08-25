@@ -40,6 +40,9 @@ CB=~/.dsh/.agent-presets/maestro/bin/cb-send    # 安装点
 - `<ref>` = 派发消息 `[ref:…]` 里的任务号,没有填 `-`。
 - cb-send 自动选路: HTTP(有语义应答 200/208)优先;显式 to 失配(404)、端口持有者
   不符(PORT-R1)或 HTTP 不可用时自动降级文件桥,皆不丢消息。
+- **v3 行形状(2026-08 起)**: 落行为七键 `{"type","from","to","body","ref","msgid","ver"}`——
+  `--msgid <id>` 透传既有 msgid(重发保号,受理面据此回 208+回显)、`--ver 2|3` 缺省 3
+  (2 = 旧四键格式);收方 ref 解析规则 = **字段优先**,`ref` 键缺失时回退 body `[ref:…]` 前缀。
 
 ## cb-send 不可用时: 手拼 JSON 写文件桥
 
@@ -48,7 +51,8 @@ printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<orch签名>","body":"[re
   >> ~/.dsh/maestro/bridge/inbox.log
 ```
 
-armed 的编排会话按游标顺序消费,未 armed 也**不丢**(武装后补投)。
+四键手拼兜底行**仍受理**(受理面按版本四态共存,零幻影键);armed 的编排会话按游标顺序消费,
+未 armed 也**不丢**(武装后补投)。
 
 ## 消息语义(type)
 
