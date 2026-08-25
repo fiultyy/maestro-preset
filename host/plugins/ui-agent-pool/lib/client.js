@@ -38,6 +38,7 @@
         locked: "会话已开始，人格锁定",
         noInject: "不加载（默认）",
         noInjectDesc: "当前会话回到 dsh 默认人格（deployment persona）。",
+        derivedBadge: "派生",
         presetHint: "预设（能力组合）在「Agent 预设」页管理；本页与人格轴互不干扰。",
       };
       var en = {
@@ -56,6 +57,7 @@
         locked: "Session started; persona locked",
         noInject: "No loading (default)",
         noInjectDesc: "The session returns to the default dsh persona.",
+        derivedBadge: "derived",
         presetHint: "Presets (capability sets) live in the Agent presets page; this axis never touches them.",
       };
 
@@ -150,6 +152,7 @@
         badges: { display: "flex", gap: "6px", alignItems: "center" },
         badge: { fontSize: "11px", padding: "1px 8px", borderRadius: "999px", border: "1px solid rgba(128,128,128,.4)", opacity: 0.85 },
         badgeDefault: { borderColor: "rgba(46,160,67,.7)", color: "rgba(46,160,67,1)" },
+        badgeDerived: { borderColor: "rgba(156,107,253,.65)", color: "rgba(156,107,253,1)", whiteSpace: "nowrap" },
         seat: { display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", padding: "2px 8px", borderRadius: "999px", border: "1px solid rgba(128,128,128,.4)", background: "transparent", cursor: "pointer", whiteSpace: "nowrap" },
         empty: { fontSize: "12px", opacity: 0.7, padding: "12px" },
         hint: { fontSize: "12px", opacity: 0.6, lineHeight: 1.5 },
@@ -180,7 +183,10 @@
           state.status === "ready" && state.personas.length > 0 && h("div", { style: style.list },
             state.personas.map(function (p, i, arr) {
               return h("div", { key: p.name, style: Object.assign({}, style.row, i === arr.length - 1 ? style.rowLast : null) },
-                h("div", { style: style.name }, p.name),
+                h("div", { style: style.badges },
+                  h("span", { style: style.name }, p.name),
+                  p.derived ? h("span", { style: Object.assign({}, style.badge, style.badgeDerived), title: (p.parent ? " ← " + p.parent : "") }, t("derivedBadge") + "·" + p.derived) : null
+                ),
                 h("div", { style: style.meta }, "v" + p.version + (p.updated ? " · " + t("updated") + " " + fmtTime(p.updated) : ""))
               );
             })
@@ -239,7 +245,8 @@
                 return {
                   id: "persona:" + p.name,
                   label: h("span", { style: style.badges },
-                    h("span", { style: style.name }, p.name + " v" + p.version)
+                    h("span", { style: style.name }, p.name + " v" + p.version),
+                    p.derived ? h("span", { style: Object.assign({}, style.badge, style.badgeDerived) }, t("derivedBadge") + "·" + p.derived) : null
                   ),
                 };
               })),
