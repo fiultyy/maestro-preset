@@ -39,7 +39,10 @@ NM="${DSH}/profiles/${PROFILE}/node_modules/@deepseek-ai"
 for pkg in host/packages/*/; do
   name="$(python3 -c "import json;print(json.load(open('$pkg/package.json'))['name'])")"
   echo "   ${name}"
-  install_dir "$ROOT/$pkg" "${NM}/$(basename "$pkg")"
+  dst="${NM}/$(basename "$pkg")"
+  # 替换语义: 包目录整体换新(叠加 cp 会残留旧 .map/空壳 → release-check 漂移)
+  run rm -rf "$dst"
+  install_dir "$ROOT/$pkg" "$dst"
 done
 
 echo "== 2. host polyfill 插件 → ${DSH}/plugins/"
