@@ -4,7 +4,7 @@
 // ~/.dsh/plugins/persona-axis/）：本插件不再 pool/export、不再
 // agentPresets.select、不再写 agent-presets 默认 —— 预设轴全程不动。
 //
-//   1. composer seat (conversation.input.left)：queen 族 + 「不加载（默认）」，
+//   1. composer seat (conversation.input.left)：池全体人格 + 「不加载（默认）」，
 //      每次选择只作用于当前会话（POST /persona-axis/rpc persona/select）。
 //      首条消息后锁定（persona-locked），与预设轴同构。
 //   2. settings section "Agent 池"：池名册只读视图 + 语义说明。
@@ -33,8 +33,8 @@
         empty: "池为空",
         updated: "更新于",
         poolShort: "池",
-        seatHint: "选择人格（queen）：只作用于当前会话，预设不变；首条消息后锁定。",
-        seatEmpty: "池中没有 queen（或池不可达）",
+        seatHint: "选择人格：只作用于当前会话，预设不变；首条消息后锁定。",
+        seatEmpty: "池为空（或池不可达）",
         locked: "会话已开始，人格锁定",
         noInject: "不加载（默认）",
         noInjectDesc: "当前会话回到 dsh 默认人格（deployment persona）。",
@@ -51,8 +51,8 @@
         empty: "Pool is empty",
         updated: "updated",
         poolShort: "Pool",
-        seatHint: "Pick a persona (queen): current session only, presets unchanged; locked after the first message.",
-        seatEmpty: "No queen in the pool (or pool unreachable)",
+        seatHint: "Pick a persona: current session only, presets unchanged; locked after the first message.",
+        seatEmpty: "Pool is empty (or unreachable)",
         locked: "Session started; persona locked",
         noInject: "No loading (default)",
         noInjectDesc: "The session returns to the default dsh persona.",
