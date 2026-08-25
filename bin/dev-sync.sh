@@ -35,7 +35,8 @@ case "${1:-}" in
   PL="${DSH_HOME:-$HOME/.dsh}/plugins"
   diff -rq --exclude __pycache__ "$SRC/plugins/host-callback-bridge" "$PL/host-callback-bridge" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
   diff -rq --exclude __pycache__ "$SRC/plugins/_narrow-waist" "$PL/_narrow-waist" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
-  echo "== 四段清零 = 完全同步"
+  diff -rq --exclude __pycache__ --exclude .git --exclude state "$SRC/plugins/a2a-profile-server" "$PL/a2a-profile-server" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
+  echo "== 五段清零 = 完全同步"
   exit 0
   ;;
 --reverse)
@@ -97,6 +98,22 @@ if [ -d "$SRC/plugins/_narrow-waist" ]; then
   cp -a "$SRC/plugins/_narrow-waist" "$NW_DIR"
   rm -rf "$NW_DIR/__pycache__"
   echo "narrow-waist synced: $SRC/plugins/_narrow-waist -> $NW_DIR"
+fi
+# a2a lane(2026-08-25 修复案): a2a-profile-server 的 host 面副本(systemd
+# a2a-profile-daemon 常驻 :8790)——dev-sync 原不覆盖它(T4 后静默漂移一天:
+# 装点停在旧 dais DB 路径指向 0 字节死库)。仓是唯一源头;.git/state 是
+# daemon 运行时产物,不同步。
+A2A_DIR="${DSH_HOME:-$HOME/.dsh}/plugins/a2a-profile-server"
+if [ -d "$SRC/plugins/a2a-profile-server" ]; then
+  mkdir -p "$A2A_DIR"
+  for f in "$SRC"/plugins/a2a-profile-server/*; do
+    name="$(basename "$f")"
+    [ "$name" = ".git" ] || [ "$name" = "state" ] && continue
+    rm -rf "$A2A_DIR/$name"
+    cp -a "$f" "$A2A_DIR/$name"
+  done
+  rm -rf "$A2A_DIR/__pycache__"
+  echo "a2a synced: $SRC/plugins/a2a-profile-server -> $A2A_DIR (daemon 需 restart 生效)"
 fi
 
 case "${1:-}" in
