@@ -1,19 +1,26 @@
 // ui-agent-pool — browser half (hand-bundled, no build step).
 //
 // Surfaces over the local a2a profile pool (a2a-profile-server, :8790):
-//   1. a settings section "Agent Pool": roster of pool profiles with a one-click
-//      "export as dsh preset and make it the default composition";
-//   2. a composer seat (conversation.input.left) reachable on the new-session
-//      screen: pick a pool profile for the sessions that come next.
+//   1. a settings section "Agent 池": the FULL incubation roster, each row can
+//      be exported as a dsh preset and made the default composition;
+//   2. a composer seat (conversation.input.left): queen-family profiles plus
+//      「不加载（默认）」 — the pool's injection switch.
 //
-// Selecting a pool profile never touches a running session: it runs
-// pool/export (installs ~/.dsh/.agent-presets/<name>) and then writes the
-// agent-presets default, so the replacement lands on the NEXT session exactly
-// like any other default-preset choice.
+// Relationship model (v2): the pool is the SOURCE; an exported preset is a
+// TRANSIENT deployment artifact.
+//   - Picking a pool profile: pool/export → write the agent-presets default →
+//     immediately recompose the CURRENT blank session (agentPresets.select),
+//     so the very next prompt runs the new persona. When no blank session is
+//     current the pick stays staged and lands on the next one that appears.
+//   - 「不加载（默认）」 reclaims every pool-exported preset directory
+//     (agentPresets.remove) and clears a pool-set default, so nothing
+//     pool-owned lingers in the official preset picker. Official presets and
+//     defaults set through the official UI are never touched.
 (function () {
   var ID = "ui-agent-pool";
   var NS = "agentPool";
   var POOL_ORIGIN = "http://127.0.0.1:8790/";
+  var SEAT_FAMILY = /^queen/; // the seat offers queen-line profiles only
 
   window.__ModuleLoader__.load({
     id: ID,
@@ -27,7 +34,7 @@
       var zh = {
         nav: "Agent 池",
         title: "Agent 池（profile pool）",
-        subtitle: "从本地 profile 池选择组合，导出为 dsh 预设并设为默认。运行中的会话不受影响。",
+        subtitle: "池 = 孵化源，导出 = 临时部署。选中即：导出 → 设为默认 → 立刻重排当前空白会话；「恢复默认」回收全部池导出，官方预设不受影响。",
         statusLoading: "读取池清单…",
         statusError: "池不可达",
         poolOnline: "池在线",
@@ -37,21 +44,22 @@
         isDefault: "默认",
         useAsDefault: "导出并设为默认",
         busy: "导出中…",
-        done: "已设为默认",
+        done: "已应用",
         poolShort: "池",
-        seatHint: "选择池中的 profile 作为之后新会话的默认组合；运行中的会话保持不变。",
-        seatEmpty: "池为空或不可达",
+        seatHint: "选择池中 queen 作为当前空白会话与之后新会话的组合；运行中的会话保持不变。",
+        seatEmpty: "池中没有 queen（或池不可达）",
         errExport: "导出失败",
+        errSelect: "切换会话预设失败",
         setDefault: "设为默认",
-        noInject: "不加载（dsh 默认）",
-        noInjectDesc: "停用池注入，清除自定义默认，新会话回退 dsh 官方默认。",
+        noInject: "不加载（默认）",
+        noInjectDesc: "回收全部池导出预设并清除池设置的默认；官方预设选择不受影响。",
         resetBtn: "恢复默认",
-        presetHint: "此处只管理池中的 base profile 模板；官方/用户预设的选择与恢复在「Agent 预设」页。",
+        presetHint: "本节是完整孵化名册；输入框旁的「池」座席只提供 queen 与「不加载（默认）」。",
       };
       var en = {
         nav: "Agent pool",
         title: "Agent pool (profile pool)",
-        subtitle: "Pick a composition from the local profile pool, export it as a dsh preset and make it the default. Running sessions are untouched.",
+        subtitle: "Pool = incubation source, export = transient deployment. Picking: export → make default → recompose the current blank session now; Reset reclaims every pool export, official presets untouched.",
         statusLoading: "Loading pool…",
         statusError: "Pool unreachable",
         poolOnline: "Pool online",
@@ -61,16 +69,17 @@
         isDefault: "default",
         useAsDefault: "Export & make default",
         busy: "Exporting…",
-        done: "Set as default",
+        done: "Applied",
         poolShort: "Pool",
-        seatHint: "Pick a pool profile as the default composition for future sessions; running sessions keep theirs.",
-        seatEmpty: "Pool empty or unreachable",
+        seatHint: "Pick a pool queen for the current blank session and the sessions after it; running sessions keep theirs.",
+        seatEmpty: "No queen in the pool (or pool unreachable)",
         errExport: "Export failed",
+        errSelect: "Failed to switch the session preset",
         setDefault: "Make default",
-        noInject: "No loading (dsh default)",
-        noInjectDesc: "Disable pool injection, clear the custom default; new sessions fall back to the official dsh default.",
+        noInject: "No loading (default)",
+        noInjectDesc: "Reclaim every pool-exported preset and clear pool-set defaults; official preset choices are untouched.",
         resetBtn: "Reset to default",
-        presetHint: "This section only manages pool base-profile templates; official/user presets live in the Agent presets page.",
+        presetHint: "This section is the full incubation roster; the composer Pool seat offers queens and “No loading (default)” only.",
       };
 
       var INITIAL = {
@@ -81,6 +90,7 @@
         presets: [], // roster side: {id, name, trust, broken, isDefault}
         busyName: null,
         lastApplied: null,
+        staged: null, // pool preset waiting for a blank session to land on
       };
 
       function createPoolStore() {
@@ -99,6 +109,9 @@
       function PoolController(api, store) {
         this.api = api;
         this.store = store;
+        // Attached when the runtime exposes the sessions store (see apply()).
+        // Without it the seat degrades to default-only semantics.
+        this.currentSession = null;
       }
       PoolController.prototype.rpc = function (method, params) {
         return fetch(POOL_ORIGIN, {
@@ -149,6 +162,35 @@
           self.store.set({ fetching: false, status: "error", error: String((e && e.message) || e) });
         });
       };
+      // Hand a staged pick to the current session, official-seat semantics:
+      // a blank session takes it at once; a running one never does. No session
+      // yet (new-session screen): the stage waits for the next blank one.
+      PoolController.prototype.applyStaged = function () {
+        var self = this;
+        var staged = self.store.getSnapshot().staged;
+        if (!staged) return Promise.resolve();
+        var cs = self.currentSession && self.currentSession();
+        if (cs === undefined || cs === null) return Promise.resolve();
+        if (!cs.blank || cs.agentPreset === staged) {
+          self.store.set({ staged: null });
+          return Promise.resolve();
+        }
+        return self.api.agentPresets.select({ sessionId: cs.id, agentPreset: staged }).then(function (r) { return r.result; })
+          .then(function (result) {
+            self.store.set({ staged: null });
+            if (!result.ok) throw new Error((result.error && result.error.message) || "select failed");
+            self.store.set({ lastApplied: result.value.agentPreset });
+            return self.load();
+          })
+          .catch(function (e) {
+            self.store.set({ staged: null, error: String((e && e.message) || e) });
+          });
+      };
+      PoolController.prototype.stageAndApply = function (name) {
+        var self = this;
+        self.store.set({ staged: name });
+        return self.applyStaged();
+      };
       PoolController.prototype.setDefault = function (id) {
         var self = this;
         var before = self.store.getSnapshot();
@@ -158,7 +200,7 @@
           .then(function (result) {
             if (!result.ok) throw new Error((result.error && result.error.message) || "default write failed");
             self.store.set({ busyName: null, lastApplied: id });
-            return self.load();
+            return self.stageAndApply(id).then(function () { return self.load(); });
           })
           .catch(function (e) {
             self.store.set({ busyName: null, error: String((e && e.message) || e) });
@@ -168,10 +210,25 @@
         var self = this;
         var before = self.store.getSnapshot();
         if (before.busyName) return Promise.resolve();
-        self.store.set({ busyName: "__reset__", error: null });
-        // unset (not write-null): the user layer disappears and the deployment
-        // default surfaces again — same op the stock service runs on delete.
-        return self.api.settings.mutate({ ns: "agent-presets", ops: [{ op: "unset", path: ["default"] }] }).then(function (r) { return r.result; })
+        self.store.set({ busyName: "__reset__", error: null, staged: null });
+        // Reclaim exactly what the pool exported — never an official preset.
+        var doomed = before.profiles.filter(function (p) { return p.exported; }).map(function (p) { return p.name; });
+        var wasDefault = before.presets.some(function (p) { return p.isDefault && doomed.indexOf(p.id) >= 0; });
+        var chain = Promise.resolve();
+        doomed.forEach(function (name) {
+          chain = chain.then(function () {
+            return self.api.agentPresets.remove({ agentPreset: name }).then(function (r) {
+              if (r.result && r.result.ok === false) throw new Error((r.result.error && r.result.error.message) || ("remove " + name + " failed"));
+            });
+          });
+        });
+        return chain
+          .then(function () {
+            // agentPresets.remove already clears a default it deleted; unset
+            // directly as well so a stale default can never outlive its preset.
+            if (!wasDefault) return null;
+            return self.api.settings.mutate({ ns: "agent-presets", ops: [{ op: "unset", path: ["default"] }] }).then(function (r) { return r.result; });
+          })
           .then(function (result) {
             if (result && result.ok === false) throw new Error((result.error && result.error.message) || "unset failed");
             self.store.set({ busyName: null, lastApplied: null });
@@ -191,7 +248,7 @@
         }).then(function (result) {
           if (!result.ok) throw new Error((result.error && result.error.message) || "default write failed");
           self.store.set({ busyName: null, lastApplied: name });
-          return self.load();
+          return self.stageAndApply(name).then(function () { return self.load(); });
         }).catch(function (e) {
           self.store.set({ busyName: null, error: String((e && e.message) || e) });
         });
@@ -294,7 +351,6 @@
         var t = props.t;
         var load = props.load;
         var applyDefault = props.applyDefault;
-        var setDefault = props.setDefault;
         var resetDefault = props.resetDefault;
         var store = props.poolStore;
         var state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
@@ -303,26 +359,48 @@
         React.useEffect(function () {
           if (state.status === "loading" && load) load();
         }, []);
-        var ready = state.status === "ready" && state.profiles.length > 0;
+        // The seat offers queen-line profiles and nothing else.
+        var seatProfiles = state.status === "ready"
+          ? state.profiles.filter(function (p) { return SEAT_FAMILY.test(p.name); })
+          : [];
+        var ready = state.status === "ready";
         var anchor = h("button", {
           type: "button",
           style: style.seat,
           "aria-haspopup": "menu",
-          "aria-expanded": state.status === "ready" && undefined,
+          "aria-expanded": ready && undefined,
           title: t("seatHint"),
           disabled: !ready || !!state.busyName,
           onClick: function () { setOpen(function (v) { return !v; }); },
         },
-          t("poolShort") + " · " + (ready ? String(state.profiles.length) : "—"),
+          t("poolShort") + " · " + (ready ? String(seatProfiles.length + 1) : "—"),
           state.busyName ? "…" : ""
         );
         if (!ready) return anchor;
+        if (seatProfiles.length === 0) {
+          return h(primitives.Menu, {
+            open: open[0],
+            onClose: function () { setOpen(false); },
+            items: [
+              { id: "__none__", label: h("span", { style: style.badges }, h("span", { style: style.name }, t("noInject"))) },
+              { id: "__empty__", disabled: true, label: h("span", { style: style.meta }, t("seatEmpty")) },
+            ],
+            selectedId: "__none__",
+            onSelect: function (id) {
+              setOpen(false);
+              if (id === "__none__") resetDefault && resetDefault();
+            },
+            align: "start",
+            portal: true,
+            anchor: anchor,
+          });
+        }
         return h(primitives.Menu, {
           open: open[0],
           onClose: function () { setOpen(false); },
           items: [{ id: "__none__", label: h("span", { style: style.badges },
               h("span", { style: style.name }, t("noInject"))
-            ) }].concat(state.profiles.map(function (p) {
+            ) }].concat(seatProfiles.map(function (p) {
             return {
               id: "pool:" + p.name,
               label: h("span", { style: style.badges },
@@ -332,17 +410,19 @@
             };
           })),
           selectedId: (function () {
+            if (state.staged) return "pool:" + state.staged;
             var pd = state.profiles.find(function (p) { return p.isDefault; });
-            return pd ? "pool:" + pd.name : "__none__";
+            if (!pd) return "__none__";
+            return SEAT_FAMILY.test(pd.name) ? "pool:" + pd.name : undefined;
           })(),
           onSelect: function (id) {
             setOpen(false);
             if (id === "__none__") { resetDefault && resetDefault(); return; }
             if (id.indexOf("pool:") !== 0) return;
-            var prof = state.profiles.find(function (q) { return q.name === id.slice(5); });
-            if (!prof) return;
-            if (prof.exported) { setDefault && setDefault(prof.name); return; }
-            applyDefault && applyDefault(prof.name);
+            var name = id.slice(5);
+            // Always run the full pipeline: force re-export keeps the preset
+            // fresh with the pool copy, then default + blank-session switch.
+            applyDefault && applyDefault(name);
           },
           align: "start",
           portal: true,
@@ -359,6 +439,28 @@
         ctx.effect(function () {
           return ctx.locale.register(NS, { zh: zh, en: en });
         }, "ui-agent-pool: dictionaries");
+        // Session awareness (optional): when the runtime exposes the sessions
+        // store, read the current session and re-apply a staged pick whenever
+        // the current session changes (a blank one may appear after the pick).
+        // Wrapped so an unavailable service degrades to default-only, never
+        // breaks the seat.
+        try {
+          ctx.inject(["sessions"], function (scope) {
+            controller.currentSession = function () {
+              var state = scope.sessions.list.getSnapshot();
+              var summary = state.current === undefined ? undefined : state.byId[state.current];
+              if (summary === undefined) return undefined;
+              return summary === null ? undefined : {
+                id: summary.id,
+                blank: summary.blank,
+                agentPreset: summary.agentPreset,
+              };
+            };
+            scope.effect(function () {
+              return scope.sessions.list.subscribe(function () { controller.applyStaged(); });
+            }, "ui-agent-pool: session watch");
+          });
+        } catch (e) { /* sessions service unavailable: default-only semantics */ }
         var face = function () {
           return {
             poolStore: store,
