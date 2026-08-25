@@ -18,6 +18,7 @@
 | adapter | dsh(session-send 链路) / dais(a2a 重载) / orca(orchestration send) / cb-send 升格 | P2/P3 |
 | 对拍 | `tests/p2-a-b-test.sh`、`tests/p3-cb-send-a-b-test.sh`(OF-005/VO-005 基底模式) | P2/P3 |
 | 退役 | cordis.yml 切行、旧插件目录删除、bridge_http_status 退役、AGENT_CARD.json | P4 |
+| 触发机制 | dais router 盲轮询→到达事件唤醒(router.rs Condvar,见 §5) | P5(独立轴) |
 
 包选址: `plugins/_narrow-waist/`,前缀 `_` = 非 DSH 插件(无 apply/inject),纯库。
 **分发选型依据**: preset 是目录复制分发,`node_modules` 不可达(mount.ts 裸名排除),4 个 adapter 以相对路径 `import ... from '../_narrow-waist/envelope.js'` 引入——与现有 plugins/ 分发方式一致,零 npm 依赖。
@@ -117,6 +118,8 @@ v2 消费者按 `]`+json.loads 解析忽略未知键即兼容;v3 消费者收 v2
 
 ```
 P1(库: 信封+寻址+去重+词汇表,纯函数) ─→ P2(dsh adapter + A/B 对拍) ─→ P3(dais/orca/cb-send adapter) ─→ P4(退役+Agent Card)
+
+P5(dais router 轮询→到达事件,独立部署轴,可与 P1-P4 任意并行,见 §5)
 ```
 
 ### P1 — 库落地(零生产接触)
@@ -150,7 +153,37 @@ P1(库: 信封+寻址+去重+词汇表,纯函数) ─→ P2(dsh adapter + A/B �
 
 对拍基底 = OF-005-report.md(VO-005)模式: 全 temp 域、`[ ok ]/[FAIL]` 原子断言、幂等可重跑、零副作用、并发安全。
 
-## 5. 逐文件改造清单
+## 5. 统一投递机制: 到达事件 + 指针直发 + 拉结算
+
+三面共同语义一句话:**推只负责"叫一声",正文永远躺库里,消费权与结算权都在收方**——
+持久队列 + 到达事件触发 + idle 闸 + 指针直发 + agent 拉取权威结算。
+
+### 5.1 裁决记录(防反复)
+
+- **拒绝"到达即直发正文 steer"**: read 闭环只有拉链拥有(`check-messages` 是 authoritative consumer,delivery.rs 头注释)。直注正文进对话: 不标 read → 同一消息双消费;发送时标 read → PTY 写失败消息永久丢。正确性模型原文: *"No failure path mutates the DB except a successful pointer write"*——指针写成功才落 `delivered_at`,任何失败路径不动库。且外部 harness 终端(Claude Code/ccr…)只有 PTY 字节流,busy 时无 queue 契约,直注=打断/污染进行中 turn。
+- **结构化 turn 插入仅对 DSH 收方存在**: 宿主拥有运行时,`session.prompt mode:'queue'` = "queue appends a turn; steer interrupts the running one"(client/contract/session.ts:38)。队列天然串行,busy 零干扰——DSH 面即统一形态的完全体。
+- **B 链整段注入仅限 dispatch**: prompt_injection.rs(bracketed paste + 500ms + 单独 `\r`)只用于编排器驱动全程、主动接受打断的场景,不用于普通消息。
+- **指针行不承正文**: 正文永远在 SQLite,PTY 只搬 ~40 字节指针(`format_message_pointer`);长度风险与 PTY 丢字节风险与消息大小解耦。
+
+### 5.2 三面映射(现状 vs 差距)
+
+| 平面 | 持久队列 | 到达触发 | idle 闸 | 推形态 | 拉结算 | 差距 |
+|---|---|---|---|---|---|---|
+| DSH | 宿主持久 turn 队列 | ✅ 到达即入列 | 不需要(queue 不打断) | 结构化插 turn 即投递 | 回合驱动即消费 | 无——统一形态完全体 |
+| dais | SQLite `read=0 AND delivered_at IS NULL` | ❌ router 线程盲轮询: POLL 500ms,空转 3 次退避 2s(router.rs:27-29,105-127) | ✅ idle_detector(title 主路径 + alt-screen/precmd/静默多信号融合) | A 链指针行注入 PTY | `check-messages` 权威标 read | **唯一差距: 轮询→到达事件** |
+| Orca | Run mailbox 运行时存储 | 同源(dais delivery.rs 注释: 移植自 Orca deliverPendingMessagesForLeaf) | ✅ | 指针推 | `check/inbox` + `check --wait --types worker_done,escalation,question` 阻塞会合 | 随其运行时同构同步 |
+
+### 5.3 P5 改造: dais router 轮询→到达事件(独立阶段,可与 P1-P4 并行)
+
+- **改造点(唯一)**: `crates/ai/src/agent/orchestration/router.rs` router 线程的 `thread::sleep(POLL_INTERVAL)` 盲等改为 Condvar wait + notify:`send-message` 落库成功后 notify 立即跑一轮 `push_pending + drain_and_route`;notify 丢失兜底 = 保留轮询间隔作 wait timeout——**正确性不依赖事件,事件只消延迟**。
+- **效果**: 指针注入延迟 500ms~2s(轮询间隔+退避)→ 落库即触发;退避态不被事件放大负载(唤醒≠加速空转)。
+- **不变量(必须保持)**: ①指针写成功才落 `delivered_at`,失败路径不动库;②pending 判定仍以 SQLite 为准,内存 watermark 只防重复注入;③idle 闸不跳过——事件只提前尝试,Busy 仍不注入;④拉链仍是权威消费者。
+- **范围**: 不动 MessageType 枚举、不动 SQLite schema、不动 idle_detector、不动 B 链;落库点加一次 notify 调用。
+- **验证**: dais 单测(Condvar 唤醒 + notify 丢失兜底路径)+ 沙箱 dais 实例新旧二进制双跑,量 arrival→指针行出现延迟;dais-build 重建+断言后部署 resident。
+- **回滚**: dais 独立仓库独立二进制,git revert + dais-build 旧版重建;与 maestro-preset 四阶段零耦合。
+- **部署轴**: 需 dais 平面短暂下线(重建 resident),与 P4 的 DSH host 重启是**两个不同部署轴**,窗口错开。
+
+## 6. 逐文件改造清单
 
 ### A. 外部→DSH 回调入口(host-callback-bridge)
 
@@ -191,7 +224,7 @@ P1(库: 信封+寻址+去重+词汇表,纯函数) ─→ P2(dsh adapter + A/B �
 | bin/fleet-touch:105-118 | get_entry() 与 session-send resolve() 各自内联 | 合并提炼进库 fleet-resolve;claim/heartbeat/release/sweep/flock 零变化 |
 | shared/skills/dais-orchestration/SKILL.md:50-55 | 9 MessageType 约定 | 增词汇表交叉引用与重载路径升格说明;映射必须与 C 实现 `denormalizeType` 逐条一致 |
 
-## 6. 不变量(全阶段)
+## 7. 不变量(全阶段)
 
 1. 载体一字不动: inbox.log 行格式 / `ORCA-CB]`、`MSGBR]`、`DSHMSG]` 前缀 / session.prompt RPC wire / SQLite messages 表 schema / PTY 字节流。
 2. fleet.json / registry.json / ledger.db 格式零变化(腰部只读消费)。
