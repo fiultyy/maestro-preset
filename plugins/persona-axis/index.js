@@ -33,8 +33,9 @@ export const version = '1.0.0'
 export const inject = ['webServer', 'agents']
 
 const A2A_ORIGIN = process.env.A2A_PROFILE_ORIGIN || 'http://127.0.0.1:8790/'
-/** 座席只暴露 queen 族（用户定案：池座席 = queen + 不加载）。 */
-const SEAT_FAMILY = /^queen(-|$)/
+/** 座席如实反映池 roster（人格源唯一 = 池），不做名称族过滤——
+ *  早先"只放 queen 族"是池内仅有 queen 时期的临时定案，与
+ *  "queen 派生新人格入池 → 会话经座席消费"的工作流冲突（2026-08-25 纠正）。 */
 /** 与 dsh-persona / dsh-subagent 对齐：遮蔽 deployment 默认人格段。 */
 const PERSONA_SECTION = 'deployment:persona'
 const PERSONA_ORDER = 0
@@ -107,7 +108,7 @@ function apply (ctx) {
 
   async function listPersonas () {
     const result = await a2a('profiles/list', {})
-    const profiles = (result?.profiles || []).filter((p) => SEAT_FAMILY.test(p.name))
+    const profiles = result?.profiles || []
     return {
       personas: profiles.map((p) => ({
         name: p.name, version: p.version, updated: p.updated
