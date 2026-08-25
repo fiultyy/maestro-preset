@@ -29,3 +29,22 @@
 
 ## 生产切换(待安静窗口,cb-send ask 请示后执行)
 - 六步链: 单提交 → dev-sync → verify → 删 http.port.sig → 重启 :3080 → p4-smoke + 24h p4-watch
+
+## 生产切换执行(2026-08-25 15:18-15:26, 窗口令授权)
+
+pre-flight(planner 复验 15:18 + 本侧快照):
+- 无在飞编排(最后回报 = T7 done);bridge/registry.json consumers=12(含 planner holder)
+- :3080 持有 pid 322941(`dsh --profile web`, systemd 用户单元 dsh-web.service)——预期
+- :3081 沙箱在线(pid 953109)
+
+六步链实录:
+1. dev-sync ✓(正向同步,shared skills 两项回显)
+2. dev-sync --verify 四段清零 ✓(装点/回流/镜像/polyfill lane 全零)
+3. rm ~/.dsh/maestro/bridge/http.port.sig ✓(PORT-R1 退役,45B,2026-08-23 遗留)
+4. systemctl --user restart dsh-web ✓(15:20:07;新 pid 2979936,active,:3080 LISTEN 恢复;planner 会话中断属预期,用户自行刷新)
+5. p4-smoke 五路径 6/6 全绿 ✓(①cb-send http 200+异 msgid 200;②session-send rc0;③journal 基线 31;④⑤Orca 面由验收方会话执行;共同断言 dead.log 零新增(81)+去重窗同 msgid 208)
+6. p4-watch ✓: baseline 落 ~/.dsh/maestro/bridge/p4-watch-baseline-20260825.json(deadLines=81/counters.failed=0/rjFailed=0);24h watch 以 persistent 进程 p4-watch-24h(pid 2983244)托管,每 30min check 一次,留痕 ~/.dsh/maestro/bridge/p4-watch-24h.log
+
+切换后基线核验: host-lane.log 837 行续写,registry consumers 12(持久文件),冒烟无 dead 新增。
+
+dais 侧(P5 装车): 与本切换间隔 ≥30min 排期(见 T7 票面);新二进制已在 target 原位(dais-build --assert-current PASS,sentinel=0),生效待 dais GUI 自然重启。
