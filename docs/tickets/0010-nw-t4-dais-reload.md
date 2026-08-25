@@ -47,3 +47,30 @@
 ---
 
 *P3a 起草完毕。断言编号 1-26 在 spec(A.1-A.7)与 ticket(重排 1-14)间映射: ticket1-14 ⊇ spec(1)-(26) 的可执行子集;spec(17)(18)(20)(21) 为文档/流程级断言,分别归 ticket 工作说明的禁区条款、spec 汇总者核验、单提交验证与回滚演练留痕承载。*
+
+---
+
+## 实施记录(2026-08-25,T4 执行 agent)
+
+- **改造 diff 摘要**(plugins/a2a-profile-server/http-server.js,7 处):
+  ①daisDbPath 缺省 `~/.local/share/dais/data.sqlite`→`~/.local/state/dais/warp.sqlite`;
+  ②ROUTER_TYPES 邻近新增并导出 `DAIS_MESSAGE_TYPE={notify:'status',steer:'status',ping:'status'}`;
+  ③重载分支:`--message-type direct`→`DAIS_MESSAGE_TYPE[type]??'status'`、`--body` 信封行→纯 body、
+  `--subject route`→`refSubject(ref)`;④新增 `refSubject`(单行化+整 subject UTF-8≤120 码点截断,
+  缺省/'-'→`[ref:-]`)与 `refFromSubject`(`/^\[ref:([^\]]*)\]$/`,不中返 null);
+  ⑤extractRef 注释升 legacy 永久保留(函数体 diff 零改动);⑥defaultInboxReader 重写
+  (SELECT sequence,from_handle,to_handle,message_type,subject,body…WHERE to_handle;行映射增
+  to/subject 增量键,ref=字段优先/编码回退);⑦红线注释与 schema 注释同步。
+- **vocabulary.js**(_narrow-waist): DAIS_TYPE_MAP 补 notify/steer/ping→'status'(R-B06/T4 断言 5
+  parity 要求;§G 终表该列"—"系漏记——与 P3a spec"词汇表显式补三型映射"裁决一致);库测试 58/58 复跑绿。
+- **selftest 输出全量**: 11/11 全绿(exit 0);两遍连跑均 0。断言逐条: ①三型 heavy 投递
+  delivered:'mailbox'+ackRef 数字 seq+journal×3 ②message_type 均 status ③body 与原文逐字节等、
+  无 DSHMSG]/信封键 ④direct 拒收 -32602 'invalid type' ⑤parity inline==lib 三值 ⑥grep 'direct' 0 命中
+  ⑦inbox RPC 无 no such column ⑧ref='LB-002'→subject='[ref:LB-002]' ⑨旧格式两形态 ref=legacy-ref/body-pref
+  ⑩静态路径断言过 ⑪[ref:-]/换行单行化/300B 截断≤120B ⑫生产库 nw-sbx-* 前后均 0、DSHMSG] 计数不变、
+  沙箱计数=投递数(9)。
+- **生产库前后快照**: nw-sbx-* = 0 → 0;body LIKE 'DSHMSG]%' 计数前后不变(只读快照,数值不落票)。
+- **回滚演练留痕**: cp 新版至模拟装点 → grep DAIS_MESSAGE_TYPE=3 命中;换回 HEAD 版 → 0 命中;
+  旧 extractRef 对纯 body 返 `'-'`(已接受降级,E-S04/R-S08);旧 reader SQL 对真实 schema 报
+  `no such column: seq`(证实三重断裂;发/收同 commit revert 无混合态窗口)。
+- **残余风险**: 无阻塞;G 终表 notify 行 dais 列"—"与库映射 'status' 的文案不一致待方案层统一(非行为)。

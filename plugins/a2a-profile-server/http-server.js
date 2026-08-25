@@ -56,6 +56,8 @@ const NEW_PROFILE = '*new*'
 
 /** router 消息类型集（KG 06 §2.4）；推模式经 session-send 透传进固定 DSHMSG 信封。 */
 const ROUTER_TYPES = ['notify', 'steer', 'ping']
+/** a2a router 三型 → dais 合法 MessageType(direct 非枚举值,R-B06;与 _narrow-waist denormalizeType(t,'dais') 逐值 parity) */
+export const DAIS_MESSAGE_TYPE = { notify: 'status', steer: 'status', ping: 'status' }
 const ROUTER_ROTATE_MAX_BYTES = 1024 * 1024 // 对齐 task-store 轮转阈值
 
 /** RPC 可映射错误：branch 捕获后按 rpcCode 返 JSON-RPC error（缺省 -32000）。 */
@@ -69,16 +71,40 @@ class RouterError extends Error {
 // 底座 bin（调用时求值，env 可覆写；缺省与 maestro/dais 现网路径一致）
 const sessionSendBin = () => process.env.A2A_SESSION_SEND ?? join(HOME, '.dsh/maestro/bin/session-send')
 const daisBin = () => process.env.A2A_DAIS_BIN ?? join(HOME, '.local/bin/dais')
-const daisDbPath = () => process.env.A2A_DAIS_DB ?? join(HOME, '.local/share/dais/data.sqlite')
+const daisDbPath = () => process.env.A2A_DAIS_DB ?? join(HOME, '.local/state/dais/warp.sqlite')
 const daisRunId = () => process.env.A2A_DAIS_RUN_ID ?? 'router'
 
-/** 信封/正文双格式的 ref 提取（DSHMSG] json 行 · [ref:X] 前缀；均不中 → '-'）。 */
+/**
+ * extractRef —— legacy 永久保留(spec A.7): 存量 43 条 `DSHMSG]` body 的唯一解读器
+ * + `[ref:X]` body 前缀(dais→回包现役契约)的兜底解析;ref 主路径已迁 subject
+ * (见 refFromSubject),本函数是 fallback 半边。函数体一字不动,P1-P4 任一阶段不删不重构。
+ */
 function extractRef(body) {
   if (body.startsWith('DSHMSG]')) {
     try { return JSON.parse(body.slice('DSHMSG]'.length)).ref ?? '-' } catch { return '-' }
   }
   const m = body.match(/^\[ref:([^\]]+)\]/)
   return m ? m[1] : '-'
+}
+
+/** ref → subject 编码: '[ref:' + 单行化 + UTF-8 ≤120 码点截断 + ']';缺省/'-' → '[ref:-]'。 */
+function refSubject(ref) {
+  let r = typeof ref === 'string' ? ref.replace(/[\r\n]+/g, ' ').trim() : ''
+  if (r === '' || r === '-') return '[ref:-]'
+  const budget = 120 - '[ref:]'.length // 整 subject UTF-8 ≤120(assertion 11)
+  if (Buffer.byteLength(r, 'utf8') > budget) {
+    const cps = Array.from(r)
+    while (cps.length > 0 && Buffer.byteLength(cps.join(''), 'utf8') > budget) cps.pop()
+    r = cps.join('')
+  }
+  return `[ref:${r}]`
+}
+
+/** subject → ref 反解: 恰 '[ref:…]' 全匹配形式;不中返回 null(fallback 半边走 extractRef)。 */
+function refFromSubject(subject) {
+  if (typeof subject !== 'string') return null
+  const m = subject.match(/^\[ref:([^\]]*)\]$/)
+  return m ? m[1] : null
 }
 
 /**
@@ -91,9 +117,10 @@ function extractRef(body) {
  *   inboxReader:  async (mailbox) => rows —— 缺省只读 sqlite（mode=ro 纪律）快照 messages
  *                 表 read=0 行；check-messages 为消费语义，不可用于只读 inbox。
  *   grants:       [{from,to,ts}] 或 async () => [...] —— 跨 project 显式授权（KG §2.5）。
- * 红线（G5 同源）：只经底座注入固定信封格式——推模式由 session-send CLI 构造
- * DSHMSG]{from,to,type,ref,body} 单行；重载投递正文 = 同构单行信封；router 绝不
- * 直接 session.prompt 注入任意指令。
+ * 红线（G5 同源）：只经底座注入固定格式——推模式由 session-send CLI 构造
+ * DSHMSG]{from,to,type,ref,body} 单行；重载投递正文 = 纯 body + 信封头走结构化
+ * 参数 + subject 承载 ref（spec A.1 反模式消灭）；router 绝不直接 session.prompt
+ * 注入任意指令。
  */
 export function createRouter({
   registry, journalPath,
@@ -168,11 +195,12 @@ export function createRouter({
         await journal({ from: envelope.from, to: toA.mailbox, type, ref, delivered: 'push' })
         return { delivered: 'push', ackRef: `${ref}@push` }
       }
-      // 重载：dais 邮箱投递；正文 = 与推模式同构的单行 DSHMSG] 信封（VO-005 对拍基底）
-      const line = 'DSHMSG]' + JSON.stringify(envelope)
+      // 重载：dais 邮箱投递(spec A.1)——正文 = 纯 body;信封头 from/to/type/ref 走
+      // 结构化参数;subject 承载 ref(refSubject);message-type 经 DAIS_MESSAGE_TYPE
+      // 映射为合法 9 值(direct 非枚举值,CLI+DB 双层拒,真实库 0 条落库——R-B06)。
       const stdout = await dais([
         'orchestration', 'send-message', daisRunId(), envelope.from, toA.mailbox,
-        '--message-type', 'direct', '--subject', 'route', '--body', line,
+        '--message-type', DAIS_MESSAGE_TYPE[type] ?? 'status', '--subject', refSubject(ref), '--body', body,
       ])
       const seq = (String(stdout).match(/seq[=:\s]+(\d+)/) ?? [])[1] ?? '?'
       await journal({ from: envelope.from, to: toA.mailbox, type, ref, delivered: 'mailbox' })
@@ -201,17 +229,19 @@ export function createRouter({
 }
 
 /**
- * 缺省 inbox 读法：dais 存储 sqlite 只读连接快照（file mode=ro 纪律，零写入路径）。
- * 表假设：messages(seq, sender, recipient, message_type, subject, body, read)；
- * schema 不符时显式抛错（不静默伪造空结果）；live 偏差由 VO-005 对拍收敛。
+ * 缺省 inbox 读法：dais 存储 sqlite 只读连接快照（mode=ro 纪律，零写入路径）。
+ * 真实 schema（spec A.0 亲证）：messages(sequence 主键, from_handle, to_handle,
+ * message_type[CHECK 9 值], subject[NOT NULL], body, read)。
+ * ref 解析 = 字段优先、编码回退：优先 refFromSubject(subject)，fallback extractRef(body)
+ * （存量 43 条 DSHMSG] body 与 [ref:] 前缀契约的兼容半边，spec A.4/A.7）。
  */
 function defaultInboxReader(mailbox) {
   const db = new DatabaseSync(daisDbPath(), { readOnly: true })
   try {
     const rows = db
-      .prepare('SELECT seq, sender, message_type, body FROM messages WHERE recipient = ? AND read = 0 ORDER BY seq')
+      .prepare('SELECT sequence, from_handle, to_handle, message_type, subject, body FROM messages WHERE to_handle = ? AND read = 0 ORDER BY sequence')
       .all(mailbox)
-    return rows.map((r) => ({ from: r.sender, type: r.message_type, body: r.body, seq: r.seq, ref: extractRef(r.body) }))
+    return rows.map((r) => ({ from: r.from_handle, to: r.to_handle, type: r.message_type, body: r.body, seq: r.sequence, subject: r.subject, ref: refFromSubject(r.subject) ?? extractRef(r.body) }))
   } finally {
     db.close()
   }

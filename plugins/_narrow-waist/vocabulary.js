@@ -24,6 +24,11 @@ export const DAIS_TYPE_MAP = Object.freeze({
   handoff: 'handoff',
   decision_gate: 'decision_gate',
   merge_ready: 'merge_ready',
+  // a2a router 三型 → 统一译 status(R-B06: a2a 面全部合法 type 无 dais 原生映射;
+  // T4 parity 断言 DAIS_MESSAGE_TYPE[t] === denormalizeType(t,'dais'))
+  notify: 'status',
+  steer: 'status',
+  ping: 'status',
   // 'direct' 不是合法 dais MessageType(CLI+DB CHECK 双层拒,真实库 0 条落库):
   // 显式归 null——误译 status 会把"必死的历史发送值"洗成合法语义。
   direct: null,
