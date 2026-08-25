@@ -98,7 +98,7 @@ export function createProfileStore(root) {
     return { name, version: meta.version, agentsMd, profile, meta, historyTail: history }
   }
 
-  /** list() -> [{ name, version, targets, updated, lineage }]（lineage 供消费面区分派生通道） */
+  /** list() -> [{ name, version, targets, updated }] */
   async function list() {
     await ensureRoot()
     let entries = []
@@ -111,7 +111,7 @@ export function createProfileStore(root) {
     for (const e of entries) {
       if (!e.isDirectory()) continue
       const meta = await readJson(join(dirFor(e.name), 'meta.json'), null)
-      if (meta) out.push({ name: meta.name, version: meta.version, targets: meta.targets ?? [], updated: meta.updated, lineage: meta.lineage ?? {} })
+      if (meta) out.push({ name: meta.name, version: meta.version, targets: meta.targets ?? [], updated: meta.updated })
     }
     out.sort((a, b) => a.name.localeCompare(b.name))
     return out
