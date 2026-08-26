@@ -19,7 +19,7 @@ DST="${DSH_HOME:-$HOME/.dsh}/.agent-presets/maestro"
 # 排除集: .git / 运行时产物 / 镜像副本互不相干;host/ 与 agent-presets/ 是分发面
 # (装点在 ~/.dsh/plugins、profile node_modules、~/.dsh/.agent-presets/<id>,走
 # host/install.sh),不随 maestro preset 本体同步。
-EXCLUDES=(--exclude .git --exclude __pycache__ --exclude host --exclude agent-presets --exclude .pytest_cache)
+EXCLUDES=(--exclude .git --exclude __pycache__ --exclude host --exclude agent-presets --exclude .pytest_cache --exclude githooks)
 
 # 镜像兜底(maestro-bridge 技能的 [ -x 装点 ] || 镜像 回退路径, 0006 收编)
 MIRROR="${DSH_HOME:-$HOME/.dsh}/maestro/bin"
@@ -31,7 +31,7 @@ case "${1:-}" in
   echo "== install -> repo (仓落后项, 应逐个回流):"
   diff -rq "${EXCLUDES[@]}" "$DST" "$SRC" | sed "s|$DST|<install>|g; s|$SRC|<repo>|g" || true
   echo "== mirror drift (镜像漂移项, 下次正向同步自动齐平):"
-  diff -rq --exclude __pycache__ "$SRC/bin" "$MIRROR" 2>/dev/null | sed "s|$MIRROR|<mirror>|g; s|$SRC|<repo>|g" || true
+  diff -rq --exclude __pycache__ --exclude githooks "$SRC/bin" "$MIRROR" 2>/dev/null | sed "s|$MIRROR|<mirror>|g; s|$SRC|<repo>|g" || true
   echo "== polyfill lane drift (P4.4: host-callback-bridge + _narrow-waist → ~/.dsh/plugins):"
   PL="${DSH_HOME:-$HOME/.dsh}/plugins"
   diff -rq --exclude __pycache__ "$SRC/plugins/host-callback-bridge" "$PL/host-callback-bridge" 2>/dev/null | sed "s|$PL|<polyfill>|g; s|$SRC|<repo>|g" || true
