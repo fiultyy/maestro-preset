@@ -16,9 +16,10 @@ description: >-
 # Dais Orchestration (cross-harness turn driving + supervised runs)
 
 The dais orchestration plane is the stable external surface of the dais
-terminal app: 18 CLI subcommands over a SQLite-backed message bus, reachable
+terminal app: 27 CLI subcommands over a SQLite-backed message bus, reachable
 as `dais orchestration <sub>`. Capability contract: see
-`docs/orchestration-capabilities.md` in the dais repo (audited 2026-08-22).
+`docs/orchestration-capabilities.md` in the dais repo (audited 2026-08-22;
+count re-verified against the live CLI 2026-08-27).
 
 ## When to use / not use
 
@@ -101,6 +102,10 @@ as `dais orchestration <sub>`. Capability contract: see
   dais orchestration promote-tasks <run_id>              # deps done → ready
   dais orchestration transition-worker <dispatch_id> <state>  # 9-state machine
   dais orchestration check-status [--run-id <rid>]
+
+  # housekeeping: GC finished runs (no pending/ready/dispatched/blocked task
+  # left) older than the cutoff — D-05 fix for the unbounded runs registry
+  dais orchestration gc-runs
 
 ### Worker terminal interaction
 

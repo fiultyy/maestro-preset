@@ -25,7 +25,9 @@ description: >-
 python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.dsh/maestro/bridge/registry.json')));[print(k[:22],c.get('alias'),c.get('pid')) for k,c in d['consumers'].items()]"
 ```
 
-- 目标 `<alias>@<sessionId>` 在列且 pid 活(`kill -0 <pid>`)才发;
+- 目标 `<alias>@<sessionId>` 在列才发;**别拿 pid 探活当会话验活**——HTTP /register
+  落的 pid 恒为宿主进程 pid(恒活),`kill -0` 对它永真;会话死活的权威信号 = 投递后
+  死信 reason(`wake failed … session-not-found`),不是 registry 里的 pid 字段;
 - 派发契约给的签名不在册 → **别猜替代目标、别填 `orch1` 兜底**(不在册一样死信):
   把 ack 落文件桥(`printf … >> inbox.log`)+ 在报告里注明"目标未在册,编排者需 re-arm";
 - 你自己的 `from` 只是标识,**不能收回信**: 桥是单向漏斗(外部→armed DSH 会话),
@@ -56,6 +58,9 @@ CB=~/.dsh/.agent-presets/maestro/bin/cb-send    # 安装点
 - `<orch签名>` = 派发契约里编排者给的 `<alias>@<sessionId>`,且**经第零步验活在册**。
   **别填 `*`**(广播吵醒所有在册会话,还会命中陈旧死会话翻倍死信)。
 - `<ref>` = 派发消息 `[ref:…]` 里的任务号,没有填 `-`。
+- **裸别名也能填**(2026-08-26 起 cb-send 本地预解析): 恰一持有者自动升级全签名
+  (stderr 打 `resolved ->`);撞名本地报错列出在册候选(exit 2,裸别名必死信早失败);
+  零命中原样透传。派发契约仍应给全签名(多编排者并发下唯一无歧义)。
 - cb-send 自动选路: HTTP(有语义应答 200/208)优先;显式 to 失配(404)或 HTTP 不可
   用时自动降级文件桥,皆不丢消息(PORT-R1 sig 机制已于 P4 退役;防线=host lane 常驻口)。
 - **v3 行形状(2026-08 起)**: 落行为七键 `{"type","from","to","body","ref","msgid","ver"}`——
@@ -81,6 +86,7 @@ printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<orch签名>","body":"[re
 | `ask` | 被阻塞,需编排者拍板 | 问题 + 你已试过的路 |
 | `report` | 中途进度通报 | 阶段结论 |
 | `ping` | 链路自检 | 任意;应收到 `DSH-RE]` pong |
+| `status` | 轻量状态行(V2 遗留,受理面兼容) | 当前阶段一句话 |
 
 共同纪律: body 以 `[ref:<ref>] ` 前缀(编排者按它对账节点)。
 
@@ -96,7 +102,8 @@ printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<orch签名>","body":"[re
 - 编排者收不到: `tail ~/.dsh/maestro/bridge/inbox.log` 看行是否落盘;HTTP 口在
   `~/.dsh/maestro/bridge/http.port`,可 `curl -sS -X POST http://127.0.0.1:$(cat ~/.dsh/maestro/bridge/http.port)/callback -H 'content-type: application/json' -d '<同上JSON>'` 直测;
 - **发了没回音先查死信**: `tail -5 ~/.dsh/maestro/bridge/dead.log`——`unknown-addressee`
-  = 目标不在册(回第零步);`wake failed … session-not-found` = 目标会话已死(等 lane re-arm,
+  = 目标不可寻址: 不在册(回第零步),或文案含 `is ambiguous across N`(多编排者
+  同别名撞名,换全签名 `<alias>@<sessionId>` 重投);`wake failed … session-not-found` = 目标会话已死(等 lane re-arm,
   并把 ack 落文件桥留痕)。死信带 reason 是**设计行为**,不是丢消息。
 - 回复查看: `orca terminal read --terminal $(cat ~/.dsh/maestro/bridge/handle)` 读桥
   pane,或 tail inbox.log 找 `DSH-RE]` 行;

@@ -41,7 +41,7 @@
 | §6C | a2a http-server.js ①②③+新增④ reader 修复 | **P3** |
 | §6D | plugins/orca-callback/pump.js | **过渡期零改动;P4 删除**(改造行删除) |
 | §6D | bin/fleet-touch(get_entry@137-141) | **P3**(fleet-resolve 库函数归 P1 交付) |
-| §6D | shared/skills/dais-orchestration/SKILL.md(:49-55) | **P3** |
+| §6D | shared/dais-orchestration/SKILL.md(:49-55;2026-08-27 自 shared/skills/ 拍平) | **P3** |
 | §6E(新增表) | plugins/callback-bridge/ | **P4** |
 
 2. **新设阶段 P3.5 — host lane 单源化**,插入 §4 的 P3 与 P4 之间,小节文本:
@@ -1136,7 +1136,7 @@ v4 现状 = v3.5/v1.0 时代内核,**按现状注册即复活 incident 0003(多�
    | `docs/orch-loop.md:9` | "arm bridge_arm{alias} + bridge_http_status" | "register 签名(host lane: POST /register;裸 preset: bridge_arm{alias});签名落笔 maestro/bridge/orch.signature" |
    | `docs/comm-architecture.md:15,87` | message-bridge/bridge_http_status 标注 | 更新为 "callback-bridge v4(会话内兼容层)/host lane(常驻)";:87 行增"P4 起唯一 HTTP 持有者=host 进程" |
    | `docs/handoff-orch-gen2.md:6,20` | 开场双 arm 指令 | 同 persona 新措辞(评审清单外,grep 亲证存在,一并改) |
-   | `skills/orca-bridge/SKILL.md:16,66-67` | bridge_arm 武装/HTTP armed 槽措辞 | 补 host-lane 分支;404 降级语义改指 host lane |
+   | `shared/orca-bridge/SKILL.md:16,66-67`(2026-08-27 自 skills/ 提升) | bridge_arm 武装/HTTP armed 槽措辞 | 补 host-lane 分支;404 降级语义改指 host lane |
    | `shared/maestro-bridge/SKILL.md:41` | "端口持有者(sig 失配)" 选路描述 | 删 sig 支(并入 P4.1.4) |
    | `plugins/host-callback-bridge/README.md:36` | 对比表"编排会话(bridge_http_status arm)" | 标注该列已于 P4 退役 |
    | `docs/callback-bridge-design.md:174,195` | 别名承诺/清理计划 | 标注:P4 已执行,别名窗口计时起点=合入日 |

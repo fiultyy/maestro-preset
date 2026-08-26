@@ -27,7 +27,7 @@ maestro 模式自建的项目状态 log：一个本地 SQLite 文件记录每个
 ## 怎么用
 
 ```bash
-BASE=<本 skill 目录>   # ~/.dsh/.agent-presets/maestro/skills/maestro-ledger
+BASE=<本 skill 目录>   # 装点 ~/.agents/skills/maestro-ledger;或 preset 面 ~/.dsh/.agent-presets/maestro/shared/maestro-ledger
 
 # 1. 同步项目/worktree 底账（幂等，sweep 第一步必跑；自动建库建表）
 python3 "$BASE/scripts/sync.py"

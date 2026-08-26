@@ -12,13 +12,22 @@
 git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/maestro
 ```
 
-可选但推荐——安装**对端共享 skill**(Orca/dais 等其他 harness 的 agent 冷发现回调协议用;不装则冷 agent 只能靠派发消息内嵌的契约行):
+可选但推荐——安装**对端共享 skill**(Orca/dais 等其他 harness 的 agent 冷发现用;不装则冷 agent 只能靠派发消息内嵌的契约行)。`shared/` 现含四个技能,全部装:
 
 ```bash
 mkdir -p ~/.agents/skills
-cp -r ~/.dsh/.agent-presets/maestro/shared/maestro-bridge ~/.agents/skills/
-ln -sfn ~/.agents/skills/maestro-bridge ~/.claude/skills/maestro-bridge   # claude 发现面(存在 ~/.claude/skills 时)
+cp -r ~/.dsh/.agent-presets/maestro/shared/* ~/.agents/skills/
+# claude 发现面(存在 ~/.claude/skills 时): 逐个软链
+for s in maestro-bridge orca-bridge maestro-ledger dais-orchestration; do
+  ln -sfn ~/.agents/skills/$s ~/.claude/skills/$s
+done
 ```
+
+- `maestro-bridge` — **worker 侧**冷执行手册(cb-send/语义/红线/排查);
+- `orca-bridge` — **编排者侧**派发握手契约模板(Orca 终端编排者必须能发现,否则派发
+  不带回调契约,worker 无从回报——2026-08-27 修复: 原先只在 preset 技能目录);
+- `maestro-ledger` — 账本读写脚本(sync.py/log.sh);
+- `dais-orchestration` — dais 编排面 CLI 参考。
 
 开发流(`bin/dev-sync.sh`)自动镜像 shared/ → `~/.agents/skills` 并接好 claude 软链,无需手工。
 
@@ -208,11 +217,13 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 ### 6.2 技能
 
-- **orca-bridge**: 建桥 pane、布防 watcher、回复署名约定、派发握手契约模板。含 `scripts/watch.sh`(阻塞等一条回调)、`scripts/reply.sh`(回执)。
-- **maestro-ledger**: 账本读写(分发/回收全落账)。含 `scripts/sync.py`/`log.sh`。
-- **maestro-bridge**(shared/,不在本会话技能目录): **对端**冷执行手册——Orca/dais 侧
-  agent 凭它发现回调协议(cb-send 用法/ack·done 语义/红线/排查)。源头在仓库
-  `shared/maestro-bridge/`,镜像到 `~/.agents/skills` + claude 软链(见 §2)。
+- **orca-bridge**(shared/,双面发现: preset 会话 + `~/.agents/skills`): 建桥 pane、
+  布防 watcher、回复署名约定、派发握手契约模板。含 `scripts/watch.sh`/`reply.sh`。
+  Orca 终端编排者(preset 之外)也靠它拿到契约模板——这是 2026-08-27 修复的断路根因之一。
+- **maestro-ledger**(shared/,双面): 账本读写(分发/回收全落账)。含 `scripts/sync.py`/`log.sh`。
+- **maestro-bridge**(shared/): **worker 侧**冷执行手册——对端 agent 凭它发现回调协议
+  (cb-send 用法/ack·done 语义/红线/排查)。镜像到 `~/.agents/skills` + claude 软链(见 §2)。
+- **dais-orchestration**(shared/): dais 编排面 CLI 参考(27 子命令)。
 
 ### 6.3 bin 脚本
 
@@ -220,7 +231,7 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 session-send   <from> <to> <type> <ref> <body>   # 发 DSHMSG;type: ping|pong|done|ask|steer|nack|ack
 session-spawn  <preset> <node> <purpose> [ws]    # 起会话+入组+命名+登记,回显 4 位码
 session-purge  <code|sessionId>                   # 删会话(确认闸门)
-cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回调;type: ack|done|ping|status
+cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回调;type: ack|done|ask|report|ping|status;裸别名自动预解析(单持有者升级/撞名报错)
                                                   # 派发握手投递端: HTTP 优先,文件桥兜底
                                                    # ⚠ HTTP 200 delivered≠送达目标(§3.3 七/八坑)
 fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004): termid 回报匹配才

@@ -329,7 +329,7 @@
 # 原生 Orca→DSH 回调泵（v3.3，替代 bash watcher+goal 方案）：preset 自带的本地
 # 插件，fs.watch 桥 inbox（游标顺序消费，DSH-RE] 回声跳过），经 Agent.followup/
 # inject —— 与 dsh-tool-jobs 唤醒同一条原生接缝 —— 直接驱动回合。仅消费宿主
-# `agents` 服务，不发布服务，无需 realm。桥 pane 的建立见 skills/orca-bridge。
+# `agents` 服务，不发布服务，无需 realm。桥 pane 的建立见 shared/orca-bridge。
 # 相对路径经组合 baseUrl 解析（EntryTree.import 的 '.' 分支）。
 - id: orca-callback
   name: './plugins/orca-callback/pump.js'

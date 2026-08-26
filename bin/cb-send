@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # cb-send — 任意本机进程/agent 向 maestro 编排会话发回调(派发握手 ACK/DONE 的投递端)。
-# 编排者派发 terminal send 时在消息里嵌入回调契约(见 skills/orca-bridge/SKILL.md),
+# 编排者派发 terminal send 时在消息里嵌入回调契约(见 shared/orca-bridge/SKILL.md),
 # 对端照抄本命令即可: ACK=回合已开始握手, DONE=完成+结果摘要。
 #
 # 用法: cb-send [--msgid <id>] [--ver <2|3>] <type> <from> <to> <ref> <body>
-#   type: ack|done|ping|status
+#   type: ack|done|ask|report|ping|status   # intake 白名单 6 值(前 4 为 V2 面)
 #         ack  = 收到派发、回合已开始(握手,编排者据此把节点置 running)
 #         done = 完成,body 为 ≤300 字符结果摘要(编排者据此落账收口)
 #   from: 自己的身份,如 dev1@terminal_xx

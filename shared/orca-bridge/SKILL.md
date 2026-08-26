@@ -30,7 +30,7 @@ re-export）。bash 版 `watch.sh`（job 结算 + goal 续轮）保留为无插�
 ## 落地步骤（手工车道;宿主 lane 部署下链路零手动,以下仅裸 preset/无插件环境需要）
 
 ```bash
-B=~/.dsh/.agent-presets/maestro/skills/orca-bridge/scripts
+B=$HOME/.agents/skills/orca-bridge/scripts   # 装点;或 preset 面 ~/.dsh/.agent-presets/maestro/shared/orca-bridge/scripts
 
 # 1) 建桥（Orca 重启后 handle 失效需重建；成功后 handle 写入 ~/.dsh/maestro/bridge/handle）
 mkdir -p ~/.dsh/maestro/bridge
@@ -71,6 +71,8 @@ orca-ide terminal send --terminal $(cat ~/.dsh/maestro/bridge/handle) \
 - `<orch签名>` = 编排者注册/host-lane `POST /register` 回执的 `<alias>@<sessionId>`（HTTP 面(host lane 常驻口)精确匹配
   在册条目, 失配即 404→cb-send 自动降级文件桥按 registry 路由；文件桥按它路由——
   务必带上，别用 `*` 广播吵醒所有在册会话）。
+- 契约里 `<orch签名>` 永远写全签名——别写裸别名: cb-send 会对裸别名单持有者自动
+  升级(2026-08-26 起)、撞名本地报错列候选,但多编排者并发下全签名是唯一无歧义形式。
 - 对端视角：`cb-send` 一条命令（HTTP 优先、文件桥兜底），语义见共享 skill
   `~/.agents/skills/maestro-bridge/SKILL.md`。
 - 编排者视角：ACK 到达 → 账本节点 `running`；DONE 到达 → 落 outcome 收口。超过一轮

@@ -145,7 +145,7 @@ maestro/
 ## 快速开始(装完后第一个会话)
 
 1. 会话开场注册回调身份——host-lane 部署(USAGE §3.4)**不在会话内 arm**,`POST /register {"sessionId","alias"}` 到 `bridge/http.port` 所记端口(host lane 持有 HTTP 通道);裸 preset 部署单次 `bridge_arm {alias}`(file 桥;`bridge_http_status` 为 deprecated 别名)。回执给出规范签名 `<alias>@<sessionId>`
-2. 按 `skills/orca-bridge/SKILL.md` 建 Orca 桥 pane(一次性)
+2. 按 `shared/orca-bridge/SKILL.md` 建 Orca 桥 pane(一次性)
 3. Orca 终端入编: `MAESTRO_ORCH_SIGNATURE=<签名> bin/fleet-probe <termid>`,回报匹配入 `verified` 后才可派发(见 USAGE §5)
 4. 之后外部 agent 的回调经桥自动驱动本会话回合;对外发消息用 `bin/session-send`
 
