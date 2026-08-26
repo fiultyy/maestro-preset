@@ -7,9 +7,11 @@
  * 动作"的根据)。指针行复用 ORCA-CB] 信封(与 v3.5/v3.6 会话内 sink 投递的行格式
  * 逐字一致): text = `ORCA-CB] {原始 inbox 行 JSON}`。
  *
- * 设计边界(与 callback-bridge sinks/agent-turn.js 的差异): 本 sink 不持 agent 引用、
- * 不区分 idle/busy——queue 模式天然串行(parked 消息在目标会话空闲后驱动回合),
- * 不再中断进行中的回合(旧 sink 的 busy→inject 会打断)。
+ * 时效语义(2026-08-26 orch1 裁定"消息必须到达时 cancel 当前步"): 目标会话在飞时,
+ * 投递前先 POST session.cancel 中断在飞 step,再以 queue 入列——agent loop 会把
+ * 唤醒消息重类为 next-turn 并基于全量历史立即开新回合(即 steer-cancel 模式),
+ * 通知不再排在当前回合之后一条一回合地慢放。空闲会话直接 queue 驱动新回合,
+ * 与旧语义一致。cancel/list 的瞬时失败不阻塞投递(退化为纯 queue)。
  */
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -58,9 +60,58 @@ export function createLoopbackSink(options = {}) {
     return 3080
   }
 
+  /** 单次 RPC: client-request 信封 → /api/<method>;非 ok 应答抛错。 */
+  async function rpc(port, method, payload) {
+    const response = await doFetch(`http://127.0.0.1:${port}/api/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method,
+        payload,
+      }),
+      signal: AbortSignal.timeout(requestTimeoutMs),
+    })
+    let data = null
+    try {
+      data = await response.json()
+    } catch {
+      // 非 JSON 应答按失败处理。
+    }
+    const result = data?.result
+    if (data === null || result?.ok !== true) {
+      const err = result?.error ?? { httpStatus: response.status }
+      throw new Error(`${method} rejected: ${JSON.stringify(err)}`)
+    }
+    return result?.value ?? {}
+  }
+
+  /** 目标会话是否在飞(session.list 权威);查询失败按空闲处理。 */
+  async function isRunning(port, sessionId) {
+    try {
+      const value = await rpc(port, 'session.list', {})
+      const items = Array.isArray(value?.items) ? value.items : []
+      return items.some((it) => it?.sessionId === sessionId && it?.running === true)
+    } catch (error) {
+      console.error('host-callback-bridge session.list precheck failed:', errorMessage(error))
+      return false
+    }
+  }
+
   async function deliver(sessionId, line, info) {
     const port = resolveApiPort()
     const text = `${messagePrefix} ${line}`
+    if (await isRunning(port, sessionId)) {
+      // steer-cancel: 中断在飞 step;随后的 queue 入列会被 agent loop 重类为
+      // next-turn,基于全量历史立即开新回合(时效裁定)。
+      try {
+        await rpc(port, 'session.cancel', { sessionId })
+      } catch (error) {
+        // cancel 失败不阻塞投递: 退化为纯 queue(下一回合边界送达)。
+        console.error('host-callback-bridge session.cancel failed:', errorMessage(error))
+      }
+    }
     const wire = {
       type: 'client-request',
       rpcId: randomUUID(),
