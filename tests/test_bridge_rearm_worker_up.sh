@@ -99,4 +99,85 @@ echo "$OUT" | grep -q "inject-prompt ctx_.* do the thing" && ok "up⑤ 任务注
 echo "$OUT" | grep -q "worker-up: ok" && ok "up 收尾行" || bad "up 收尾" "$OUT"
 OUT=$("$REPO/bin/worker-up" task_x "$REPO" bogus-harness --dry-run 2>&1); [ $? = 2 ] && ok "up 非法 harness 拒绝" || bad "up harness 校验" "$OUT"
 
+# ── ④ cb-send 裸别名预解析(mock registry + mock /callback 验实投 to) ──
+python3 -c "
+import json
+json.dump({'version':'t','consumers':{
+  'session-one':{'alias':'orchX','pid':424242},
+  'session-two':{'alias':'orchX','pid':424243}}}, open('$MOCK_REG','w'))"
+# mock /callback 记录收到的 to
+CALL_LOG="$WORK/callback.log"; : > "$CALL_LOG"
+kill "$MOCK_PID" 2>/dev/null; wait "$MOCK_PID" 2>/dev/null
+echo "$MOCK_PORT" > "$B/http.port"   # 重指新 mock(旧口已死,否则连接失败降级 file-bridge)
+python3 - "$MOCK_PORT" "$MOCK_REG" "$CALL_LOG" <<'EOF' &
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port, reg_path, call_log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get('content-length', 0)); body = json.loads(self.rfile.read(n) or b'{}')
+        if self.path == '/callback':
+            open(call_log, 'a').write(body.get('to','') + '\n')
+            obj = {'ok': True, 'status': 'accepted'}
+        elif self.path == '/register':
+            d = json.load(open(reg_path)); d['consumers'][body['sessionId']] = {'alias': body.get('alias'), 'pid': 424242}
+            json.dump(d, open(reg_path, 'w'))
+            w = None
+            a = body.get('alias')
+            if a:
+                holders = [s for s,c in d['consumers'].items() if c.get('alias')==a and s != body['sessionId']]
+                if holders: w = f'alias "{a}" also held by {len(holders)} other consumer(s)'
+            obj = {'ok': True, 'warning': w} if w else {'ok': True}
+        self.send_response(200); self.send_header('content-type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+HTTPServer(('127.0.0.1', port), H).serve_forever()
+EOF
+MOCK_PID=$!
+
+OUT=$("$REPO/bin/cb-send" ack w1 orchX r1 'hello' 2>&1); rc=$?
+[ $rc = 2 ] && echo "$OUT" | grep -q "被多个在册会话持有" && echo "$OUT" | grep -q "orchX@session-one" && ok "cb-send 撞名本地报错列候选" || bad "cb-send 撞名" "rc=$rc $OUT"
+
+python3 -c "
+import json
+json.dump({'version':'t','consumers':{'session-one':{'alias':'orchX','pid':424242}}}, open('$MOCK_REG','w'))"
+OUT=$("$REPO/bin/cb-send" ack w1 orchX r2 'hi' 2>&1)
+echo "$OUT" | grep -q "resolved -> orchX@session-one" && grep -q "^orchX@session-one$" "$CALL_LOG" && ok "cb-send 单命中升级全签名并按其投递" || bad "cb-send 升级" "$OUT | log=$(cat "$CALL_LOG")"
+
+OUT=$("$REPO/bin/cb-send" ack w1 session-plain r3 'hi' 2>&1)
+echo "$OUT" | grep -qv "resolved" && grep -q "^session-plain$" "$CALL_LOG" && ok "cb-send 裸sessionId原样透传" || bad "cb-send 裸sid" "$OUT"
+OUT=$("$REPO/bin/cb-send" ack w1 nothere r4 'hi' 2>&1)
+echo "$OUT" | grep -q "http 200" && grep -q "^nothere$" "$CALL_LOG" && ok "cb-send 零命中原样(由受理面裁定)" || bad "cb-send 零命中" "$OUT"
+
+# ── ⑤ bridge-rearm --sync: session.list 权威清扫 ──
+DSH_MOCK_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+python3 - "$DSH_MOCK_PORT" <<'EOF' &
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get('content-length', 0)); json.loads(self.rfile.read(n) or b'{}')
+        obj = {'result': {'ok': True, 'value': {'items': [{'sessionId': 'session-live1'}, {'sessionId': 'session-live2'}]}}}
+        self.send_response(200); self.send_header('content-type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+EOF
+SYNC_PID=$!
+python3 -c "
+import json,os
+json.dump({}, open('$WORK/no-fleet.json','w'))
+json.dump({'version':'t','consumers':{
+  'session-live1':{'alias':'a','pid':$PPID},
+  'session-gone':{'alias':'b','pid':$PPID},
+  'session-deadpid':{'alias':'c','pid':999999999}}}, open('$MOCK_REG','w'))"
+python3 -c "import json,sys;json.dump({},open(sys.argv[1],'w'))" "$WORK/no-fleet.json"
+OUT=$(DSH_PORT=$DSH_MOCK_PORT MAESTRO_FLEET="$WORK/no-fleet.json" "$REPO/bin/bridge-rearm" --sync 2>&1)
+echo "$OUT" | grep -q "swept: 2" && ok "sync 清扫服务端不存在+死pid共2" || bad "sync 清扫" "$OUT"
+python3 -c "
+import json,sys
+d=json.load(open('$MOCK_REG'))
+sys.exit(0 if list(d['consumers'])==['session-live1'] else 1)" && ok "sync 仅留服务端在册且pid活" || bad "sync 结果" "$(python3 -c "import json;print(list(json.load(open('$MOCK_REG'))['consumers']))")"
+kill "$SYNC_PID" 2>/dev/null
+
 echo; echo "rearm/worker-up suite: $PASS/$((PASS+FAIL))"; [ "$FAIL" = 0 ]

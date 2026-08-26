@@ -9,16 +9,20 @@
 #
 # 用法:
 #   bridge-rearm                     # 清扫: 死 pid 条目全部移除 + 复读确认 + status
+#   bridge-rearm --sync              # 权威清扫: pid 探活 + DSH session.list 比对
+#                                    # (HTTP /register 落的 pid 恒为 host pid,pid 探活
+#                                    # 扫不掉陈旧 DSH 会话;session.list 是唯一权威)
 #   bridge-rearm --register <sessionId> <alias>   # 清扫后 POST /register 注册会话
 #   bridge-rearm --dry-run           # 只报告不动文件
 # env: MAESTRO_BRIDGE(默认 ~/.dsh/maestro/bridge)
 set -u
 B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
 REG="$B/registry.json"
-DRY=0; REG_SID=''; REG_ALIAS=''
+DRY=0; SYNC=0; REG_SID=''; REG_ALIAS=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
+    --sync) SYNC=1 ;;
     --register) REG_SID="${2:?}"; REG_ALIAS="${3:?}"; shift 2 ;;
     *) echo "bridge-rearm: unknown arg $1" >&2; exit 2 ;;
   esac
@@ -27,11 +31,33 @@ done
 
 [ -f "$REG" ] || { echo "bridge-rearm: no registry at $REG"; exit 1; }
 
-# ── 清扫: 死 pid 条目直改文件(原子写), 然后复读确认 ──
-REPORT=$(python3 - "$REG" "$DRY" <<'EOF'
+# ── 清扫: 死 pid + (--sync)服务端不存在的会话; 直改文件(原子写)后复读确认 ──
+# HTTP /register 落的 pid 恒为 host pid → pid 探活扫不掉陈旧 DSH 会话;
+# --sync 用服务端 session.list 作唯一权威(不可达时只做 pid 探活,不误删)。
+LIVE_SID_FILE=""
+if [ "$SYNC" = 1 ]; then
+  LIVE_SID_FILE="$B/.rearm-live-sessions.json"
+  DSH_PORT="${DSH_PORT:-$(python3 -c "
+import json, os
+try: print(json.load(open(os.path.expanduser('~/.dsh/maestro/fleet.json'))).get('port', 3080))
+except Exception: print(3080)")}"
+  curl -sS -m 5 -X POST "http://127.0.0.1:${DSH_PORT}/api/session.list" \
+    -H 'content-type: application/json' \
+    -d '{"type":"client-request","rpcId":"rearm-'$$'","method":"session.list","payload":{}}' \
+    > "$LIVE_SID_FILE" 2>/dev/null \
+    || { echo "bridge-rearm: --sync needs DSH :${DSH_PORT} session.list (down?); pid-only sweep"; LIVE_SID_FILE=""; }
+fi
+REPORT=$(python3 - "$REG" "$DRY" "$LIVE_SID_FILE" <<'EOF'
 import json, os, sys, tempfile
-reg, dry = sys.argv[1], int(sys.argv[2])
+reg, dry, live_f = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 d = json.load(open(reg))
+live_ids = None
+if live_f:
+    try:
+        v = json.load(open(live_f)).get('result', {}).get('value', {})
+        live_ids = {it.get('sessionId') for it in (v.get('items') or [])}
+    except Exception:
+        live_ids = None
 dead, alive = [], []
 for sid, c in d.get('consumers', {}).items():
     pid = c.get('pid')
@@ -40,6 +66,8 @@ for sid, c in d.get('consumers', {}).items():
         try: os.kill(int(pid), 0); ok = True
         except (ValueError, ProcessLookupError, PermissionError): ok = False
         except OSError: ok = False
+    if ok and live_ids is not None and sid not in live_ids:
+        ok = False  # pid 活但服务端无此会话 → 陈旧 DSH 会话条目
     (alive if ok else dead).append((sid, c.get('alias'), pid))
 if dead and not dry:
     for sid, _, _ in dead: d['consumers'].pop(sid, None)
@@ -49,6 +77,7 @@ if dead and not dry:
 print(json.dumps({'dead': dead, 'alive': alive, 'removed': len(dead) if not dry else 0}))
 EOF
 ) || exit 1
+[ -n "$LIVE_SID_FILE" ] && rm -f "$LIVE_SID_FILE"
 
 DEAD_N=$(python3 -c "import json,sys;print(len(json.loads(sys.argv[1])['dead']))" "$REPORT")
 ALIVE=$(python3 -c "

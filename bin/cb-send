@@ -52,6 +52,43 @@ if [ "$ver" = 2 ] && [ -n "$msgid" ]; then
 fi
 typ="${args[0]}" frm="${args[1]}" to="${args[2]}" ref="${args[3]}" body="${args[4]}"
 B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
+
+# 裸别名预解析(多编排者并发防断路, 2026-08-26): to 不含 '@' 且非 '*' 时按
+# registry 别名表升级为全签名——恰一持有者 → 升级(消灭"编排者换代后旧签名
+# 失效"类断路); 多持有者 → 本地报错列出候选(裸别名在受理面必死信 ambiguous,
+# 早失败可操作); 零命中 → 原样透传(可能是裸 sessionId)。bare sessionId 直投。
+case "$to" in
+  '*'|*@*) ;;
+  *)
+    resolved=$(python3 -c '
+import json, os, sys
+reg = os.path.join(sys.argv[1], "registry.json")
+try:
+    consumers = json.load(open(reg)).get("consumers", {})
+except Exception:
+    sys.exit(0)
+holders = [sid for sid, c in consumers.items() if c.get("alias") == sys.argv[2]]
+if len(holders) == 1:
+    print(f"{sys.argv[2]}@{holders[0]}")
+elif len(holders) > 1:
+    print("AMBIGUOUS:" + ",".join(sorted(holders)), file=sys.stderr)
+    sys.exit(3)
+' "$B" "$to" 2>/dev/null) || {
+      echo "cb-send: alias \"$to\" 被多个在册会话持有 —— 裸别名必死信(ambiguous);改用派发契约里的全签名 <alias>@<sessionId>,在册候选:" >&2
+      python3 -c '
+import json, os, sys
+consumers = json.load(open(os.path.join(sys.argv[1], "registry.json"))).get("consumers", {})
+for sid, c in sorted(consumers.items()):
+    if c.get("alias") == sys.argv[2]: print("  %s@%s (pid %s, armed %s)" % (sys.argv[2], sid, c.get("pid"), str(c.get("armedAt"))[:19]), file=sys.stderr)
+' "$B" "$to" || true
+      exit 2
+    }
+    if [ -n "$resolved" ]; then
+      echo "cb-send: bare alias \"$to\" resolved -> $resolved" >&2
+      to="$resolved"
+    fi
+    ;;
+esac
 if [ "$ver" = 2 ]; then
   payload=$(python3 -c '
 import json, sys

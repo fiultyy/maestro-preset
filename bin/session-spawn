@@ -72,7 +72,10 @@ def bridge_register(sid: str, alias: str) -> None:
             headers={'content-type': 'application/json'},
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
-            json.loads(resp.read())
+            ack = json.loads(resp.read())
+        warn = ack.get('warning')
+        if warn:  # 多编排者撞名: 注册成功但裸别名寻址将死信, 提示编排者差异化别名
+            print(f'bridge-rearm: WARNING {warn}', file=sys.stderr)
         print(f'bridge-rearm: registered {alias}@{sid[:18]}', file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — 旁路面, 任何失败都只 warn
         print(f'bridge-rearm: register skipped ({exc}); session works, callbacks need POST /register', file=sys.stderr)

@@ -336,14 +336,27 @@ export function createHttpIntake(config) {
       sendJson(res, 400, { ok: false, error: 'alias must be a non-empty string when present' })
       return
     }
-    const registry = await registerConsumer(paths.registry, version, { sessionId, alias: alias?.trim() ?? null }, { armedAt: new Date(now()).toISOString(), pid: process.pid })
+    const trimmedAlias = alias?.trim() ?? null
+    const registry = await registerConsumer(paths.registry, version, { sessionId, alias: trimmedAlias }, { armedAt: new Date(now()).toISOString(), pid: process.pid })
     counters.registered += 1
     await persistState()
+    // 多编排者防撞名(2026-08-26): 同 alias 被其他 sessionId 持有时附 warning——
+    // 裸别名寻址将死信(ambiguous), 差异化别名或全签名可解。非阻断: alias 是标签非键。
+    let warning = null
+    if (trimmedAlias) {
+      const holders = Object.entries(registry.consumers)
+        .filter(([sid, c]) => c?.alias === trimmedAlias && sid !== sessionId)
+        .map(([sid]) => sid)
+      if (holders.length > 0) {
+        warning = `alias "${trimmedAlias}" also held by ${holders.length} other consumer(s); bare-alias addressing will dead-letter (ambiguous) — use <alias>@<sessionId>`
+      }
+    }
     sendJson(res, 200, {
       ok: true,
       status: 'registered',
-      consumer: canonicalOf(sessionId, alias?.trim() ?? null),
+      consumer: canonicalOf(sessionId, trimmedAlias),
       registeredConsumers: Object.keys(registry.consumers).length,
+      ...(warning ? { warning } : {}),
     })
   }
 
