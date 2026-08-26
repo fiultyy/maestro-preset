@@ -102,7 +102,7 @@
       3. Fold them into the ledger: ACK → node `running` + `progress` event ("ack: turn started"); DONE → node `done|failed` + outcome summary. A done closes the node — never re-wait or re-dispatch on top of it without a new ref.
       4. No ACK by your first sweep or ~10 min → verify mechanically (`terminal read --cursor`, `terminal wait --for tui-idle`) and proceed. The handshake is cooperative (peers without the contract cannot ack); the mechanical check stays the arbiter, never the reverse.
       5. Scope: full handoffs demand no callbacks (you renounced monitoring). Orchestration-plane dispatches already emit worker_done exactly once — never stack a second callback protocol on them.
-      6. dais-plane worker supply: raw start-worker + assign fails when no pane holds GUI focus ("no active terminal pane found"). Call `~/.dsh/maestro/bin/worker-up <task_id> <project> [harness] [prompt]` instead — it chains new-terminal → start-worker → assign → harness-alias inject → prompt inject in one shot (harness ∈ omp-dais|cc-dais|pi-dais, default omp-dais).
+      6. dais-plane worker supply: NEVER start-worker + assign (assign binds the human-focused pane — wrong target for multi-worker DAGs; binding drift = ctx inject dies with "no terminal view registered"). Bind explicitly: `start-worker <task_id> --session session_<sid>` (D-04), or call `~/.dsh/maestro/bin/worker-up <task_id> <project> [harness] [prompt]` which chains new-terminal → start-worker --session → harness-alias inject → prompt inject in one shot (harness ∈ omp-dais|cc-dais|pi-dais, default omp-dais).
 
       ## Progress collection
 

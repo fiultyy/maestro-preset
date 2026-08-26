@@ -99,8 +99,8 @@ count re-verified against the live CLI 2026-08-27).
   # ── worker supply: ONE command ──
   # start-worker alone leaves the dispatch unbound ("no active terminal pane
   # found" on assign — assign needs the GUI-focused pane). The supply chain
-  # (new-terminal → start-worker → assign → inject harness alias → inject
-  # prompt) is mechanized in ~/.dsh/maestro/bin/worker-up:
+  # (new-terminal → start-worker --session <sid> → inject harness alias →
+  # inject prompt) is mechanized in ~/.dsh/maestro/bin/worker-up:
   worker-up <task_id> <project_path> [harness] [prompt]   # harness default omp-dais
   # harness ∈ omp-dais|cc-dais|pi-dais; prompt optional (omit = just boot the
   # harness). Orchestration agents provisioning dais workers should call

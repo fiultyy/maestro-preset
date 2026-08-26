@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # worker-up — dais 编排面 worker 供给一体化(断路修复件 3/3; 2026-08-26)
 #
-# 背景: P4 后 dispatch 需要绑到面板(assign)才有 worker, 而"开面板→注入 harness→
-# 绑定"没有任何环节承担(2026-08-26 实证: start-worker 成功但 assign 报
-# "no active terminal pane found"; 编排者 agent 不做直发注册、不驱动拉起 harness)。
+# 背景: dispatch 需要绑到面板才有 worker, 而"开面板→绑定→注入 harness"没有
+# 任何环节承担。绑定必须指名(--session), assign(active pane)绑人聚焦的 pane,
+# 多 worker 场景必错(2026-08-27 冒烟实证: 绑定漂移→ctx 注入 no terminal view registered)。
 # 本脚本把供给链机械化, 编排者派发时只调:
 #   worker-up <task_id> <project_path> [harness] [prompt]
 #
 # harness ∈ omp-dais | cc-dais | pi-dais (别名表见 dais-orchestration
 # APPENDIX-aliases.md; 默认 omp-dais)。prompt 缺省只起 harness 不派任务。
 #
-# 流程(五步, 每步失败即停并打印已完成步骤的回滚提示):
-#   1 new-terminal <project>        → session_<sid>(新 tab 成为 active pane)
-#   2 start-worker <task_id>        → ctx_<id>
-#   3 assign <ctx>                  绑 active pane(= 刚开的 tab)
-#   4 inject-prompt <ctx> <harness> 起 harness TUI(别名注入, 流量过 8787)
-#   5 [prompt] settle 后 inject-prompt <ctx> <prompt>  派任务
+# 流程(2026-08-27 三步修订, D-04 指名绑定; 每步失败即停+回滚提示):
+#   1 new-terminal <project>                  → session_<sid>
+#   2 start-worker <task_id> --session <sid>  → ctx_<id> 绑定该 pane
+#     (旧链 start-worker+assign 是错的: assign 绑"人最后聚焦的 pane",
+#      绑错/无人聚焦即断, ctx 注入必死 no terminal view registered)
+#   3 inject-prompt <ctx> <harness> 起 harness TUI(别名注入, 流量过 8787)
+#   4 [prompt] settle 后 inject-prompt <ctx> <prompt>  派任务
 #
 # 选项: --dry-run(打印序列不执行) / --settle <s>(harness 起动等待, 默认 8)
 # env: DAIS_BIN(默认 dais)、WORKER_UP_SETTLE
@@ -53,18 +54,15 @@ SID=$(run "$DAIS" orchestration new-terminal "$PROJECT" | tail -1)
 case "$SID" in session_*) ;; *) echo "worker-up: step1 new-terminal failed: $SID" >&2; exit 1 ;; esac
 echo "pane: $SID"
 
-# 2. dispatch
-CTX=$(run "$DAIS" orchestration start-worker "$TASK" | tail -1)
-case "$CTX" in ctx_*) ;; *) echo "worker-up: step2 start-worker failed: $CTX" >&2; echo "rollback: (pane $SID harmless — idle tab; close via close-terminal $SID)" >&2; exit 1 ;; esac
-echo "dispatch: $CTX"
+# 2. dispatch + 绑定(D-04 指名绑定: start-worker --session 直接绑到刚开的 pane)
+#    旧链 start-worker+assign(active pane)是错的: assign 绑"人最后聚焦的 pane",
+#    多 worker/无人聚焦时绑错目标或报 no active pane, 随后 ctx 注入必死
+#    "no terminal view registered"(2026-08-27 冒烟实证)。
+CTX=$(run "$DAIS" orchestration start-worker "$TASK" --session "$SID" | grep -o 'ctx_[a-f0-9]*' | head -1)
+case "$CTX" in ctx_*) ;; *) echo "worker-up: step2 start-worker --session failed: $CTX" >&2; echo "rollback: (pane $SID harmless — idle tab; close via close-terminal $SID)" >&2; exit 1 ;; esac
+echo "dispatch: $CTX (bound to $SID)"
 
-# 3. 绑定(新 tab 应为 active pane; 失败提示人工聚焦 tab 后重跑 assign)
-A=$(run "$DAIS" orchestration assign "$CTX" 2>/dev/null)
-[ -z "$A" ] && A="assigned $CTX"
-echo "$A" | grep -q '"ok": *true\|^assigned' && echo "$A" \
-  || echo "worker-up: step3 assign said: $A (若 no active pane: 聚焦新 tab 后 \`$DAIS orchestration assign $CTX\`)" >&2
-
-# 4. harness TUI(别名注入)
+# 3. harness TUI(别名注入; ViewRegistry 已由 --session 绑定, ctx 注入可用)
 run "$DAIS" orchestration inject-prompt "$CTX" "$HARNESS"
 
 # 5. 任务 prompt(等 harness 起来; 标题变 busy 时 inject 自带 idle 检查)
