@@ -55,6 +55,32 @@ def atomic_write_json(path: str, obj: dict) -> None:
         raise
 
 
+def bridge_register(sid: str, alias: str) -> None:
+    """P4+: 起会话即入桥册(host lane registry.json)——断路修复件 2/3。
+
+    桥只投递给在册消费者;:3080 重启会杀全部在册条目,靠会话自己 re-arm 从未发生
+    (2026-08-26 实证)。spawn 面是唯一"会话生命起点",在此挂注册 = 编排者/worker
+    零心智。桥属旁路面:不可用只 warn,绝不阻断 spawn。
+    """
+    bridge = os.environ.get('MAESTRO_BRIDGE', os.path.expanduser('~/.dsh/maestro/bridge'))
+    port_file = os.path.join(bridge, 'http.port')
+    try:
+        port = open(port_file).read().strip()
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{port}/register',
+            data=json.dumps({'sessionId': sid, 'alias': alias}).encode(),
+            headers={'content-type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            ack = json.loads(resp.read())
+        warn = ack.get('warning')
+        if warn:  # 多编排者撞名: 注册成功但裸别名寻址将死信, 提示编排者差异化别名
+            print(f'bridge-rearm: WARNING {warn}', file=sys.stderr)
+        print(f'bridge-rearm: registered {alias}@{sid[:18]}', file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — 旁路面, 任何失败都只 warn
+        print(f'bridge-rearm: register skipped ({exc}); session works, callbacks need POST /register', file=sys.stderr)
+
+
 def main() -> None:
     if len(sys.argv) not in (4, 5):
         print(__doc__, file=sys.stderr)
@@ -83,6 +109,7 @@ def main() -> None:
         'status': 'active',
     }
     atomic_write_json(fleet_path, fleet)
+    bridge_register(sid, node)
     print(code)
 
 

@@ -48,3 +48,51 @@ pre-flight(planner 复验 15:18 + 本侧快照):
 切换后基线核验: host-lane.log 837 行续写,registry consumers 12(持久文件),冒烟无 dead 新增。
 
 dais 侧(P5 装车): 与本切换间隔 ≥30min 排期(见 T7 票面);新二进制已在 target 原位(dais-build --assert-current PASS,sentinel=0),生效待 dais GUI 自然重启。
+
+## 24h p4-watch 结论(2026-08-25 15:21 → 08-26 15:21, 48 tick)
+
+三断言终态:
+- **counters.failed == 基线(0) PASS** — host lane 24h 零失败投递
+- **router-journal failed == 基线(0) PASS** — a2a 重载面(live-vo007/live-vo012)零 failed
+- **dead.log 零新增 FAIL** — 81→92(+11), 全部 triage 为非投递面问题(见下), 无一为 P4 拓扑回归
+
++11 行逐条分类:
+| 行 | 时点(CST) | 内容 | 定性 |
+|---|---|---|---|
+| 82 | 08-25 15:22 | 本侧 T6 done 回报 to=nw-planner@orca-main, :3080 重启后 orca-main 消费者尚未重注册(cb-send 已按预期落 file-bridge 兜底) | 窗口期瞬态, 预期内 |
+| 83-88 | 08-26 00:04 | health@check 广播探针(to=*)命中 6 条陈旧 registry 会话(session-not-found ×6) | 陈旧注册项清理噪声; **planner(orch1)已于 00:10 复核并重采基线=88** |
+| 89-90 | 08-26 00:04 | maestro/vh-voice-liaison 回 pong 至 health@check — 探针发送方自注册缺失, 回信无消费方 | 探针发送面卫生问题, 死信行为正确(reason 明确) |
+| 91-92 | 08-26 13:44 | f326 ack/done 至 voice-head-a2a — 该别名未注册 | voice-head lane 自身寻址配置缺口, 非本面问题 |
+
+遗留(移交 planner 裁量, 非本票范围):
+1. registry 含 ≥6 条 session-not-found 陈旧会话 — 可用 bin/session-purge 清(生产面, 需授权)
+2. health@check 类探针应自注册消费方或明示单向 — 探针操作方(orch1)侧修订
+3. voice-head-a2a 别名未注册 — voice-head lane 配置项
+
+结论: **P4 切换后 24h 投递面零失败(dead 计数器/failed/journal 三者中除 dead 行数外全绿; dead +11 全部为死信正确落账, 行为符合窄腰设计 = 死信+明确 reason)**。窗口后 dead 稳定于 92(13:44 后无新增)。
+
+## 断路根因与修复(2026-08-26, 用户现场指认)
+
+症状: "agent 完全不按流程通信,新的形同虚设都是断路"。
+
+根因(三层, 机制都在、无人执行):
+1. **registry 不自清**: :3080 重启杀全部在册消费者, 死条目永久残留 → 寻址/广播持续
+   死信(24h watch +11 全属此类; USAGE §3.4 纪律 2 原文"重启后不再需要 re-arm"是错的);
+2. **注册责任真空**: P4 退役自动 arm 的插件后, "谁把编排会话/worker 注册进桥"无环节
+   承担 —— 编排者 agent 不做直发注册、不驱动拉起 harness(APPENDIX-aliases 注入模板
+   无人执行; dais start-worker 后 assign 无面板可绑, 2026-08-25 实证);
+3. **文档缺口**: maestro-bridge skill 无"发前验在册"步骤, worker 拿旧签名照发 → 死信。
+
+修复(三件套, 机械下沉, 编排者/worker 零新增心智; suite 14/14):
+- `bin/bridge-rearm`: 清死条目(原子改文件+复读闸) + 可选注册 + 验活。错 key POST
+  /unregister 也回 ok:true 的面洞绕开;
+- `bin/session-spawn` 尾部自动 POST /register(桥属旁路面, 失败仅 warn 不阻断 spawn);
+- `bin/worker-up <task> <project> [harness] [prompt]`: dais 面供给一体化五步
+  (new-terminal→start-worker→assign→注入 harness→派任务), 编排者派发只调它。
+
+文档: maestro-bridge skill 增"第零步: 发送前必查目标在册且活"+排查段死信定位;
+orch-loop.md 增"host 重启后通信恢复三步"; USAGE §3.4 纪律 2 改写(不自清事实)+
+§6.1 表删 orca-callback 残行 + §6.3 bin 表补两件。
+
+现场处置: 生产 registry 死条目已清(手工三步, 后固化入 bridge-rearm), 现存
+orch1/webgui/maestro 三条目全活(同宿主 pid); shared skill 已镜像 ~/.agents/skills。
