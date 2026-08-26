@@ -38,7 +38,7 @@
       ## First moves in any orchestration session
 
       1. Resolve the Orca CLI once and reuse it for every later command: $ORCA_CLI_COMMAND, else `orca-dev` when ORCA_DEV_REPO_ROOT is set, else `orca-ide` on Linux outside an Orca-managed terminal, else `orca`. Never run bare `orca` on Linux outside Orca terminals — it is the GNOME screen reader.
-      2. Confirm the planes before coordinating: `ORCA status --json` (start with `ORCA open --json` if down); for dais (formerly zap; renamed 2026-08-17), check the GUI process (`pgrep -af dais`) and resolve the binary (`command -v dais`, else a debug build such as ~/warpdotdev/dais/target/debug/dais). dais send/inject need the GUI app; headless only the pull path works.
+      2. Confirm the planes before coordinating: `ORCA status --json` (start with `ORCA open --json` if down); for dais (formerly zap; renamed 2026-08-17), check the GUI process (`pgrep -af dais`) and resolve the binary (`command -v dais`, else a debug build such as ~/warpdotdev/dais/target/debug/dais). Fresh non-interactive shells lack the harness bins: `export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"` puts dais (~/.local/bin), omp (~/.bun/bin) and claude (~/.local/bin) on PATH — never binary-hunt with find. dais send/inject need the GUI app; headless only the pull path works.
       3. Load the version-matched guide before the first Orca commands: `ORCA skills get orca-cli`, and `ORCA skills get orchestration` when supervising. Never trust remembered subcommands.
       4. Load the matching skill before acting: orca-cli, orchestration, zap-direct-send, orcard, computer-use, herdr, qa-test.
 
@@ -102,6 +102,7 @@
       3. Fold them into the ledger: ACK → node `running` + `progress` event ("ack: turn started"); DONE → node `done|failed` + outcome summary. A done closes the node — never re-wait or re-dispatch on top of it without a new ref.
       4. No ACK by your first sweep or ~10 min → verify mechanically (`terminal read --cursor`, `terminal wait --for tui-idle`) and proceed. The handshake is cooperative (peers without the contract cannot ack); the mechanical check stays the arbiter, never the reverse.
       5. Scope: full handoffs demand no callbacks (you renounced monitoring). Orchestration-plane dispatches already emit worker_done exactly once — never stack a second callback protocol on them.
+      6. dais-plane worker supply: raw start-worker + assign fails when no pane holds GUI focus ("no active terminal pane found"). Call `~/.dsh/maestro/bin/worker-up <task_id> <project> [harness] [prompt]` instead — it chains new-terminal → start-worker → assign → harness-alias inject → prompt inject in one shot (harness ∈ omp-dais|cc-dais|pi-dais, default omp-dais).
 
       ## Progress collection
 

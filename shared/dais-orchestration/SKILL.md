@@ -34,6 +34,12 @@ count re-verified against the live CLI 2026-08-27).
 
 ## Prerequisites
 
+- **PATH bootstrap (run first in any fresh non-interactive shell; these are NOT
+  on the default PATH of DSH/cron/spawned shells)**:
+  `export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"` — `dais` lives at
+  `~/.local/bin/dais`, the `omp` harness at `~/.bun/bin/omp` (bun install),
+  `claude` at `~/.local/bin/claude`, `pi` via nvm node. Don't hunt for binaries
+  with `find ~` — one export covers all of them.
 - dais GUI app running (router + PTY bridge live in the GUI process; CLIs
   share its SQLite at `~/.local/state/dais/warp.sqlite`, WAL + 2s
   busy_timeout, safe for multi-process reads).
@@ -89,6 +95,16 @@ count re-verified against the live CLI 2026-08-27).
   dais orchestration inject-prompt <dispatch_id-or-session_handle> "<text>" [--force]
 
 ### Supervised runs (DAG + settlement)
+
+  # ── worker supply: ONE command ──
+  # start-worker alone leaves the dispatch unbound ("no active terminal pane
+  # found" on assign — assign needs the GUI-focused pane). The supply chain
+  # (new-terminal → start-worker → assign → inject harness alias → inject
+  # prompt) is mechanized in ~/.dsh/maestro/bin/worker-up:
+  worker-up <task_id> <project_path> [harness] [prompt]   # harness default omp-dais
+  # harness ∈ omp-dais|cc-dais|pi-dais; prompt optional (omit = just boot the
+  # harness). Orchestration agents provisioning dais workers should call
+  # worker-up instead of driving the five steps by hand.
 
   dais orchestration create-run --objective "<text>"            # → run_<id>
   dais orchestration create-task <run_id> "<spec>" [--dep t_..] # → task_<id>

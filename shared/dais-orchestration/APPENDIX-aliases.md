@@ -9,5 +9,7 @@
 | `cc-dais` | `claude --settings ~/.config/dais/cc-entry-settings.json`(env 透传+BASE_URL→/cc) | ANTHROPIC_CUSTOM_HEADERS(x-dais-instance) | 同上注入 `cc-dais` |
 | `pi-dais` | `pi`(env 暂 no-op,待上游 env 约定) | DAIS_INSTANCE_TAG | 同上注入 `pi-dais` |
 
-依赖 PATH: `omp`(bun bin)、`pi`(nvm node)、`claude`(~/.local/bin)。
+依赖 PATH(默认不在 DSH/cron/spawned shell 的 PATH 上,先引导一次):
+`export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"`
+`omp`→`~/.bun/bin/omp`(bun)、`pi`→nvm node、`claude`→`~/.local/bin/claude`。
 模型选择零干预: 用户 config 里选的模型/effort 原样生效(实测 glm-5.3:max)。
