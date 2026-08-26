@@ -192,6 +192,11 @@
   config:
     customSkillDirs:
       - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+      # shared/ = 编排面四技能正典位(maestro-bridge/orca-bridge/maestro-ledger/
+      # dais-orchestration);DSH 会话与外部 harness(~/.agents/skills 镜像)双面发现。
+      # 2026-08-27: 技能提升到 shared/ 后漏加此行,DSH 会话内 skill 加载报
+      # not available(冒烟 smk2 实证),agent 只能直读文件绕过。
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('shared/', baseUrl))"
 
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
