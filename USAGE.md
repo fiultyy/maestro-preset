@@ -114,6 +114,8 @@ last-armer 兜底(单会话便利)。
   降级链), 测试 `plugins/message-bridge/index.test.mjs` + `tests/test_cb_send.sh`;
   设计侧见 `docs/callback-bridge-design.md` §9.3, 票 `docs/tickets/0005`;
   装点生效待 dev-sync + 代际切换(护栏二, 用户拍板时机)。
+  (历史: v1.3 会话内载体 `plugins/message-bridge` 已于 P4 退役删除;现行载体 =
+  host lane `plugins/host-callback-bridge` + `plugins/callback-bridge` v4)
 
 ### 3.4 host lane 回调链路(SI-003 起, 宿主 boot 承载)
 
@@ -128,12 +130,15 @@ last-armer 兜底(单会话便利)。
 1. **开场不 arm**——host lane 已持有链路(POST /register 即可);orca-callback/message-bridge 已于 P4 删除,`bridge_http_status`= deprecated 别名; 旧工具
    仍在(preset 兼容), 但再 arm 会与 host lane 双消费(重复唤醒, 无丢失), 迁移期
    尽量不用;
-2. **sessionId 是持久路由键**: 会话在 `~/.dsh/sessions/` 驻留, host 重启后同一
-   sessionId 仍可被 `session.prompt` 原生唤醒, registry 条目跨重启有效——
-   §3.1 的"重启后必做两步"(重 arm + 广播新签名)在 host lane 下**不再需要**,
-   除非换代换了 sessionId;
+2. **sessionId 是持久路由键, 但 registry 不自清**: 会话在 `~/.dsh/sessions/` 驻留,
+   host 重启后同一 sessionId 仍可被 `session.prompt` 原生唤醒, registry 条目跨重启
+   有效——但**服务端已删除/不存在的会话, 其 registry 条目不会自动消失**, 寻址/广播
+   持续对其死信(`wake failed … session-not-found`, 2026-08-26 实证)。重启或清会话后
+   必做: `bin/bridge-rearm`(清死条目+复读闸;错 key POST /unregister 也回 ok:true,
+   故清扫走原子改文件)。
 3. **换代/新编排会话注册**: `POST /register {"sessionId","alias"}`(端口读
-   `bridge/http.port`), 或直接编辑 `registry.json`;
+   `bridge/http.port`), 或 `bin/bridge-rearm --register <sessionId> <alias>`
+   (清扫+注册+复读闸一条命令); `bin/session-spawn` 已自动尾部注册, 仅换代需手动;
 4. **观测**: `GET /status`(端口/计数/在册消费者)、`bridge/state.json` 顶层
    `hostBridge` 分节、`bridge/host-lane.log` 生命周期日志;
 5. **迁移窗护驻**: 插件热载入运行中 host 时若 `http.port` 记录端口仍被旧会话内
@@ -197,8 +202,7 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 | 插件 | 作用 | 模型可见工具 |
 |---|---|---|
-| `orca-callback` | 文件桥泵: watch inbox.log,at-least-once 投递(多消费者寻址/去重/死信/轮转) | `bridge_arm {alias}` |
-| `callback-bridge` | 会话内兼容层: file 桥(file-inbox 单 source,per-session 分槽) | `bridge_arm` / `bridge_status` |
+| `callback-bridge` | 会话内消费层 v4.1.0: file 桥(file-inbox 单 source,per-session 分槽,独立去重窗) | `bridge_arm` / `bridge_status`(`bridge_http_status` deprecated) |
 | `workspace-unarchive` | 归档会话恢复(读 maestro/unarchive.log 逐行恢复) | 无(自动) |
 | `session-purge` | 按需删会话(confirm="PURGE" 闸 + 自删拒 + 忙闸) | 经 `bin/session-purge` |
 
@@ -221,6 +225,10 @@ cb-send        <type> <from> <to> <ref> <body>   # 任意进程→编排者回�
                                                    # ⚠ HTTP 200 delivered≠送达目标(§3.3 七/八坑)
 fleet-probe    <termid> [--wait N]               # Orca 终端准入探测(0004): termid 回报匹配才
                [--reverify] [--status T]         # verified 入册;编排回调回合验证 from==termid
+worker-up       <task_id> <project> [harness] [prompt] # dais 面供给一体化: 开面板→start-worker
+               # →assign→注入 harness(omp-dais/cc-dais/pi-dais)→派任务;编排者派发只调它
+bridge-rearm    [--register <sid> <alias>] [--dry-run] # 桥 registry 卫生: 清死条目+复读闸
+               # +可选注册;:3080 重启/清会话后必跑(断路修复, 见 §3.4 纪律 2)
 ```
 
 ## 7. 运行时状态

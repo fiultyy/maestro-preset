@@ -124,6 +124,24 @@ fleet-conflicts.jsonl 落冲突行),两段式契约只处理"闸已放行"的消
 
 自测:`python3 tests/of006-selftest.py`(27 项,全 temp 域零真实投递)。
 
+## host 重启后通信恢复三步(2026-08-26 增;缺此步 = 全 fleet 回调断路)
+
+:3080 重启(systemd restart / 崩溃 / 机器重启)会**杀死全部在册桥消费者**
+(`bridge/registry.json` 各条目的 pid 全变死)。重启后各 lane 编排会话不 re-arm,
+worker 的 ack/done 全部死信(`unknown-addressee` / `wake failed session-not-found`)。
+恢复三步:
+
+1. **re-arm**: 编排会话回合内调 `bridge_arm`(callback-bridge v4),或 lane 的常驻面
+   `POST /register {"sessionId","alias"}`(host lane 口 = `bridge/http.port`);
+2. **清死条目**: 程序化取 key(`registry.json` consumers 里 `kill -0 pid` 失败的)
+   → `POST /unregister {"sessionId"}`。**注意: unregister 对错 key 也回 `ok:true`**
+   (静默 no-op),必须复读 registry 确认已删;手抄 sessionId 必错,用脚本取;
+3. **验活**: `cb-send ping <self> <alias>@<sessionId> <ref> 're-arm probe'`,回音到
+   且 `dead.log` 零新增才算通。
+
+判据速查: `bridge/state.json` 是 host 泵状态;`registry.json` 是唯一路由表(file-router
+逐行重读,外部清理即时生效);`dead.log` 每行带 reason,是排障第一入口。
+
 ## 纪律
 
 - 自迭代路径分治(坑六):bin/skills 先 .dsh,验收后 sync maestro-preset,**合入待用户定**;

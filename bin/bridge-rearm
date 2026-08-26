@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# bridge-rearm — 桥 registry 卫生一条命令(2026-08-26;断路修复件 1/3)
+#
+# 背景: :3080 重启/清会话后, registry.json 里的死会话条目不会自动消失
+# (2026-08-26 实证: 跨 boot 存活, 寻址/广播持续对其死信
+#  `wake failed … session-not-found`)。本脚本把恢复三步机械化:
+#   清扫死条目(直接原子改 registry.json, 绕开 POST /unregister 对错 key
+#   也回 ok:true 的静默 no-op) → 复读确认 → (可选)注册新会话 → 验活。
+#
+# 用法:
+#   bridge-rearm                     # 清扫: 死 pid 条目全部移除 + 复读确认 + status
+#   bridge-rearm --register <sessionId> <alias>   # 清扫后 POST /register 注册会话
+#   bridge-rearm --dry-run           # 只报告不动文件
+# env: MAESTRO_BRIDGE(默认 ~/.dsh/maestro/bridge)
+set -u
+B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
+REG="$B/registry.json"
+DRY=0; REG_SID=''; REG_ALIAS=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --register) REG_SID="${2:?}"; REG_ALIAS="${3:?}"; shift 2 ;;
+    *) echo "bridge-rearm: unknown arg $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -f "$REG" ] || { echo "bridge-rearm: no registry at $REG"; exit 1; }
+
+# ── 清扫: 死 pid 条目直改文件(原子写), 然后复读确认 ──
+REPORT=$(python3 - "$REG" "$DRY" <<'EOF'
+import json, os, sys, tempfile
+reg, dry = sys.argv[1], int(sys.argv[2])
+d = json.load(open(reg))
+dead, alive = [], []
+for sid, c in d.get('consumers', {}).items():
+    pid = c.get('pid')
+    ok = False
+    if pid:
+        try: os.kill(int(pid), 0); ok = True
+        except (ValueError, ProcessLookupError, PermissionError): ok = False
+        except OSError: ok = False
+    (alive if ok else dead).append((sid, c.get('alias'), pid))
+if dead and not dry:
+    for sid, _, _ in dead: d['consumers'].pop(sid, None)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(reg), prefix='.reg-', suffix='.json')
+    with os.fdopen(fd, 'w') as fh: json.dump(d, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, reg)
+print(json.dumps({'dead': dead, 'alive': alive, 'removed': len(dead) if not dry else 0}))
+EOF
+) || exit 1
+
+DEAD_N=$(python3 -c "import json,sys;print(len(json.loads(sys.argv[1])['dead']))" "$REPORT")
+ALIVE=$(python3 -c "
+import json,sys
+r=json.loads(sys.argv[1])
+print(' '.join(f\"{a or '-'}@{s[:18]}(pid {p})\" for s,a,p in r['alive']) or '(none)')" "$REPORT")
+if [ "$DRY" = 1 ]; then
+  echo "dry-run: dead=$DEAD_N alive=[${ALIVE:-}] (no changes made)"
+else
+  [ "$DEAD_N" -gt 0 ] && echo "swept: $DEAD_N dead entries removed (atomic rewrite)"
+  # 复读确认(不信任写路径, 只信读回)
+  LEFT=$(python3 -c "
+import json,sys,os
+d=json.load(open(sys.argv[1]))
+n=0
+for sid,c in d['consumers'].items():
+    p=c.get('pid')
+    try: os.kill(int(p),0)
+    except Exception: n+=1
+print(n)" "$REG")
+  [ "$LEFT" != 0 ] && { echo "bridge-rearm: FAIL — $LEFT dead entries still present after sweep"; exit 1; }
+  echo "verified: 0 dead entries; alive=[${ALIVE:-}]"
+fi
+
+# ── 注册(可选): POST /register, 需 host lane 活 ──
+if [ -n "$REG_SID" ]; then
+  PORT=$(cat "$B/http.port" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$PORT" ] || { echo "bridge-rearm: no http.port — host lane down; register skipped"; exit 1; }
+  OUT=$(curl -sS -m 5 -X POST "http://127.0.0.1:$PORT/register" \
+    -H 'content-type: application/json' \
+    -d "{\"sessionId\":\"$REG_SID\",\"alias\":\"$REG_ALIAS\"}" 2>&1) \
+    || { echo "bridge-rearm: register failed: $OUT"; exit 1; }
+  echo "registered: $OUT"
+  python3 -c "
+import json,os,sys
+d=json.load(open(sys.argv[1]))
+sys.exit(0 if sys.argv[2] in d['consumers'] else 1)" "$REG" "$REG_SID" \
+    || { echo "bridge-rearm: FAIL — $REG_SID not in registry after register"; exit 1; }
+  echo "verified: $REG_ALIAS@$REG_SID in registry"
+fi
+
+# ── 验活: HTTP 口在则打 status 摘要 ──
+PORT=$(cat "$B/http.port" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$PORT" ]; then
+  ST=$(curl -sS -m 5 "http://127.0.0.1:$PORT/status" 2>/dev/null) \
+    && echo "status: $(echo "$ST" | python3 -c "import json,sys;d=json.load(sys.stdin);print('ok' if d.get('ok') else 'bad','— consumers:',d.get('registeredConsumers','?'))" 2>/dev/null)" \
+    || echo "status: host lane not answering on :$PORT (file-bridge fallback still works)"
+fi
+exit 0

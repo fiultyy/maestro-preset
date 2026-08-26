@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# worker-up — dais 编排面 worker 供给一体化(断路修复件 3/3; 2026-08-26)
+#
+# 背景: P4 后 dispatch 需要绑到面板(assign)才有 worker, 而"开面板→注入 harness→
+# 绑定"没有任何环节承担(2026-08-26 实证: start-worker 成功但 assign 报
+# "no active terminal pane found"; 编排者 agent 不做直发注册、不驱动拉起 harness)。
+# 本脚本把供给链机械化, 编排者派发时只调:
+#   worker-up <task_id> <project_path> [harness] [prompt]
+#
+# harness ∈ omp-dais | cc-dais | pi-dais (别名表见 dais-orchestration
+# APPENDIX-aliases.md; 默认 omp-dais)。prompt 缺省只起 harness 不派任务。
+#
+# 流程(五步, 每步失败即停并打印已完成步骤的回滚提示):
+#   1 new-terminal <project>        → session_<sid>(新 tab 成为 active pane)
+#   2 start-worker <task_id>        → ctx_<id>
+#   3 assign <ctx>                  绑 active pane(= 刚开的 tab)
+#   4 inject-prompt <ctx> <harness> 起 harness TUI(别名注入, 流量过 8787)
+#   5 [prompt] settle 后 inject-prompt <ctx> <prompt>  派任务
+#
+# 选项: --dry-run(打印序列不执行) / --settle <s>(harness 起动等待, 默认 8)
+# env: DAIS_BIN(默认 dais)、WORKER_UP_SETTLE
+set -u
+DRY=0; SETTLE="${WORKER_UP_SETTLE:-8}"
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --settle) SETTLE="${2:?}"; shift ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${ARGS[@]}"
+[ $# -ge 2 ] || { sed -n 's/^# \{0,1\}//p' "$0" | sed -n '3,22p' >&2; exit 2; }
+TASK="$1"; PROJECT=$(realpath "$2"); HARNESS="${3:-omp-dais}"; PROMPT="${4:-}"
+DAIS="${DAIS_BIN:-dais}"
+case "$HARNESS" in omp-dais|cc-dais|pi-dais) ;; *) echo "worker-up: harness must be omp-dais|cc-dais|pi-dais" >&2; exit 2 ;; esac
+[ -d "$PROJECT" ] || { echo "worker-up: no project dir $PROJECT" >&2; exit 2; }
+
+run() {  # dry-run: 命令行打 stderr, stdout 出合成占位供解析; 实跑透传
+  if [ "$DRY" = 1 ]; then
+    echo "[dry] $*" >&2
+    case "$*" in
+      *new-terminal*) echo "session_drypane" ;;
+      *start-worker*) echo "ctx_dry" ;;
+      *) true ;;
+    esac
+  else "$@"; fi
+}
+
+# 1. 面板
+SID=$(run "$DAIS" orchestration new-terminal "$PROJECT" | tail -1)
+case "$SID" in session_*) ;; *) echo "worker-up: step1 new-terminal failed: $SID" >&2; exit 1 ;; esac
+echo "pane: $SID"
+
+# 2. dispatch
+CTX=$(run "$DAIS" orchestration start-worker "$TASK" | tail -1)
+case "$CTX" in ctx_*) ;; *) echo "worker-up: step2 start-worker failed: $CTX" >&2; echo "rollback: (pane $SID harmless — idle tab; close via close-terminal $SID)" >&2; exit 1 ;; esac
+echo "dispatch: $CTX"
+
+# 3. 绑定(新 tab 应为 active pane; 失败提示人工聚焦 tab 后重跑 assign)
+A=$(run "$DAIS" orchestration assign "$CTX" 2>/dev/null)
+[ -z "$A" ] && A="assigned $CTX"
+echo "$A" | grep -q '"ok": *true\|^assigned' && echo "$A" \
+  || echo "worker-up: step3 assign said: $A (若 no active pane: 聚焦新 tab 后 \`$DAIS orchestration assign $CTX\`)" >&2
+
+# 4. harness TUI(别名注入)
+run "$DAIS" orchestration inject-prompt "$CTX" "$HARNESS"
+
+# 5. 任务 prompt(等 harness 起来; 标题变 busy 时 inject 自带 idle 检查)
+if [ -n "$PROMPT" ]; then
+  if [ "$DRY" = 1 ]; then run "$DAIS" orchestration inject-prompt "$CTX" "$PROMPT"
+  else
+    sleep "$SETTLE"
+    OUT=$("$DAIS" orchestration inject-prompt "$CTX" "$PROMPT" 2>&1) \
+      || { echo "worker-up: step5 inject prompt: $OUT (harness 可能未 idle; 用 scan-wait-blocked $CTX 查)"; exit 0; }
+    echo "task injected"
+  fi
+fi
+echo "worker-up: ok — pane=$SID dispatch=$CTX harness=$HARNESS"
