@@ -58,29 +58,25 @@ echo "pane: $SID"
 #    旧链 start-worker+assign(active pane)是错的: assign 绑"人最后聚焦的 pane",
 #    多 worker/无人聚焦时绑错目标或报 no active pane, 随后 ctx 注入必死
 #    "no terminal view registered"(2026-08-27 冒烟实证)。
-#    --command 登记结算哨兵: worker 跑完 sentinel 命令即 block 自动结算
-#    (exit 0=succeeded), 编排者无需手动 transition-worker(smk3/smk4 实证:
-#    手动 send-message worker_done 不触发结算, 只有 block 匹配或 transition 才结)。
-SENTINEL="worker-done-$$"
-CTX=$(run "$DAIS" orchestration start-worker "$TASK" --session "$SID" --command "$SENTINEL" | grep -o 'ctx_[a-f0-9]*' | head -1)
+#    结算: agent 类 worker(omp-dais 等 TUI harness)收 done 回调后由编排者
+#    transition-worker succeeded 收口——block 自动结算(--command 命令匹配)只
+#    适用于 shell 命令 dispatch, omp 内 bash -c 的命令串不构成 PTY block 匹配
+#    (smk5 三形态实证: 裸命令 exit 0 也不触发)。
+CTX=$(run "$DAIS" orchestration start-worker "$TASK" --session "$SID" | grep -o 'ctx_[a-f0-9]*' | head -1)
 case "$CTX" in ctx_*) ;; *) echo "worker-up: step2 start-worker --session failed: $CTX" >&2; echo "rollback: (pane $SID harmless — idle tab; close via close-terminal $SID)" >&2; exit 1 ;; esac
-echo "dispatch: $CTX (bound to $SID, sentinel: $SENTINEL)"
+echo "dispatch: $CTX (bound to $SID; done 回调后 transition-worker $CTX succeeded 收口)"
 
 # 3. harness TUI(别名注入; ViewRegistry 已由 --session 绑定, ctx 注入可用)
 run "$DAIS" orchestration inject-prompt "$CTX" "$HARNESS"
 
 # 5. 任务 prompt(等 harness 起来; 标题变 busy 时 inject 自带 idle 检查)
 if [ -n "$PROMPT" ]; then
-  if [ "$DRY" = 1 ]; then run "$DAIS" orchestration inject-prompt "$CTX" "$PROMPT (+sentinel $SENTINEL)"
+  if [ "$DRY" = 1 ]; then run "$DAIS" orchestration inject-prompt "$CTX" "$PROMPT"
   else
     sleep "$SETTLE"
-    P2="$PROMPT
-
-—— 收工(全部完成后再执行,一步到位)——
-$SENTINEL"
-    OUT=$("$DAIS" orchestration inject-prompt "$CTX" "$P2" 2>&1) \
+    OUT=$("$DAIS" orchestration inject-prompt "$CTX" "$PROMPT" 2>&1) \
       || { echo "worker-up: step5 inject prompt: $OUT (harness 可能未 idle; 用 scan-wait-blocked $CTX 查)"; exit 0; }
-    echo "task injected (sentinel: $SENTINEL — worker 收工执行它即自动结算)"
+    echo "task injected"
   fi
 fi
 echo "worker-up: ok — pane=$SID dispatch=$CTX harness=$HARNESS"
