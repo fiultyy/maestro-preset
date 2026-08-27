@@ -67,8 +67,8 @@ function makeBridgeDir() {
   return dir
 }
 
-/** mock 会话宿主: 记录 session.prompt 调用(可编程失败)。 */
-function makeMockHost({ failFor = null } = {}) {
+/** mock 会话宿主: 记录 session.prompt 调用(可编程失败;runningSessions 内会话报在飞)。 */
+function makeMockHost({ failFor = null, runningSessions = new Set() } = {}) {
   const calls = []
   const server = createServer((req, res) => {
     let body = ''
@@ -76,6 +76,17 @@ function makeMockHost({ failFor = null } = {}) {
     req.on('end', () => {
       const payload = JSON.parse(body)
       calls.push({ method: payload.method, sessionId: payload.payload?.sessionId, text: payload.payload?.content?.[0]?.text, rpcId: payload.rpcId })
+      if (payload.method === 'session.list') {
+        const items = [...runningSessions].map((sid) => ({ sessionId: sid, running: true }))
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ result: { ok: true, value: { items } } }))
+        return
+      }
+      if (payload.method === 'session.cancel') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ result: { ok: true, value: {} } }))
+        return
+      }
       const shouldFail = failFor !== null && payload.payload?.sessionId === failFor
       const result = shouldFail
         ? { ok: false, error: { code: 'SESSION_NOT_FOUND', message: 'no such session' } }
@@ -84,7 +95,7 @@ function makeMockHost({ failFor = null } = {}) {
       res.end(JSON.stringify({ result }))
     })
   })
-  return { calls, server }
+  return { calls, runningSessions, server }
 }
 
 function listen(server) {
@@ -199,6 +210,17 @@ async function mainScene() {
       seq.push('seq-' + i)
     }
     ok('t08:queued-delivery-all-arrive', await waitFor(() => seq.every((s) => mockHost.calls.some((c) => c.text?.includes(s)))))
+
+    // T13: 目标在飞 → 先 session.cancel 再 session.prompt(steer-cancel 时效语义)。
+    mockHost.runningSessions.add(ORCH)
+    appendFileSync(join(bridgeDir, 'inbox.log'), JSON.stringify({ type: 'report', from: 'cx', to: `orch1@${ORCH}`, body: 'cancel-me' }) + '\n')
+    ok('t13:busy-target-cancel-then-prompt', await waitFor(() =>
+      mockHost.calls.some((c) => c.method === 'session.cancel' && c.sessionId === ORCH)
+      && mockHost.calls.some((c) => c.method === 'session.prompt' && c.text?.includes('cancel-me'))))
+    const cancelIdx = mockHost.calls.findIndex((c) => c.method === 'session.cancel' && c.sessionId === ORCH)
+    const promptIdx = mockHost.calls.findIndex((c) => c.method === 'session.prompt' && c.text?.includes('cancel-me'))
+    ok('t13:cancel-precedes-prompt', cancelIdx >= 0 && promptIdx > cancelIdx)
+    mockHost.runningSessions.delete(ORCH)
 
     // 观测面冒烟。
     r = await httpJson(port, 'GET', '/status', undefined)

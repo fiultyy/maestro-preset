@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# pre-push — 装点漂移闸门(2026-08-25 裁定: 两次单日漂移后挂强制钩子)。
+#
+# 推 master 时强制 dev-sync --verify 五段清零;非清零即挡推送,防止
+# "提交了但忘了同步/回流"的尾巴再依赖人肉记。feature 分支(如 comm-iter)
+# 允许漂移——它们的工作树本来就可能领先/落后装点,闸门只看 master。
+#
+# 版本化: core.hooksPath=bin/githook(随仓走,clone 后需重设一次:
+#   git config core.hooksPath bin/githooks)
+set -uo pipefail
+cd "$(dirname "$0")/../.."   # 仓根(支持 worktree: 脚本在各自工作树 bin/ 下)
+
+ENFORCE=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$remote_ref" = "refs/heads/master" ] && ENFORCE=1
+done
+
+[ "$ENFORCE" = 1 ] || exit 0
+
+# LC_ALL=C: diff 输出语言钉死("differ"/"Only in"),不随终端 locale 漂
+OUT="$(LC_ALL=C bin/dev-sync.sh --verify 2>&1)"
+if printf '%s' "$OUT" | grep -qE 'differ|^只在|Only in'; then
+  echo "✘ pre-push: dev-sync 五段未清零 — 装点与源码存在漂移,推送被挡。" >&2
+  echo "  修复顺序: 先回流(--reverse 装点领先项) → dev-sync 正向 → 再推。" >&2
+  printf '%s\n' "$OUT" | grep -E 'differ|只在|Only in' | head -20 >&2
+  exit 1
+fi
+echo "✔ pre-push: dev-sync 五段清零"
+exit 0

@@ -10,6 +10,11 @@
 # force hmr reload 3
     - id: host-callback-bridge
       name: !!js '`${process.env.DSH_HOME || (process.env.HOME || process.env.USERPROFILE) + "/.dsh"}/plugins/host-callback-bridge/index.js`'
+    # persona-axis: 会话级人格轴(host)。人格与预设正交:源=A2A 池(AGENTS.md),
+    # 注入=agent 作用域 systemPrompt.section(deployment:persona) 遮蔽,
+    # 落账=state/sessions.json(v1.2.0 起零事件写入),冷恢复重建。RPC=/persona-axis/rpc。
+    - id: persona-axis
+      name: !!js '`${process.env.DSH_HOME || (process.env.HOME || process.env.USERPROFILE) + "/.dsh"}/plugins/persona-axis/index.js`'
     # N10-GUI: browser-side agent-pool picker (settings 分区 + 新会话输入行入口),
     # pool/export → dsh preset → 设为默认组合。浏览器 roster 由 dsh-client-modules
     # 扫描 Loader entries 发现（package.json dsh.client 声明 + exports["./client"]）。
