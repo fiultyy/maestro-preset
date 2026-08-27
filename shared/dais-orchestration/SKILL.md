@@ -7,78 +7,60 @@ description: >-
   (create-run/create-task/start-worker), auto-settle via block-driven
   worker_done, read worker terminal tails with cursors, scan for wait-blocked
   signals, answer interactive prompts, and manage decision gates. Use when the
-user says "direct send", "inject prompt", "poke terminal", "message another
+  user says "direct send", "inject prompt", "poke terminal", "message another
   agent", "drive the other harness", "cross-harness", "session mailbox", or
   "dais orchestration". Use plain terminal send for one-off shell input with
   no mailbox semantics.
 ---
 
-# Dais Orchestration — 用法速查
+# dais-orchestration — 目的→命令→参数
 
-**第一条命令永远是 PATH 引导**（DSH/cron/spawned shell 缺这些目录）：
+**第一条 bash 永远先 PATH 引导**(DSH/cron/spawned shell 缺目录,跳过即后面全 command not found):
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 ```
 
-## 30 秒任务：给 dais 面派一个 worker 并让它回调你
+## 目的 → 命令
+
+| 我要… | 调什么 | 传什么 |
+|---|---|---|
+| 派 worker 干活并等回报 | `worker-up <task_id> <项目绝对路径> [harness] [prompt]`(harness∈omp-dais\|cc-dais\|pi-dais,缺省 omp-dais) | prompt 里嵌回调契约(见 maestro-bridge skill);回显 pane/dispatch |
+| 开新终端 | `dais orchestration new-terminal <项目绝对路径>` | 项目须已 project-add;→ `session_<sid>` |
+| 建 run/task | `create-run --objective "<目标>"` → `create-task <run_id> "<任务描述>" [--dep t_..]` | → run_<id> / task_<id>,各取输出末行 |
+| worker 绑到指定终端 | `start-worker <task_id> --session session_<sid>` | **必须带 --session**;→ ctx_<id> |
+| 收口任务 | `transition-worker <ctx_id> succeeded`(或 failed) | worker_done 自动结算,手动只是兜底 |
+| 查状态 | `check-status [--run-id <rid>]` | — |
+| 给某终端发消息 | `send-message <run_id> <from> <to> --message-type status --subject "<短>" --body "<内容>"` | to=ctx_<id> 或 session_<sid> |
+| 等回复 | `check-messages <handle> [--wait --timeout-ms 120000 --type T]` | 拉取即已读 |
+| 注入整段 prompt | `inject-prompt <ctx或session_handle> "<全文>"` | 目标须 idle,否则报错(等 8-10s 或 --force) |
+| 看 worker 输出 | `read-worker <ctx_id> [--lines 40] [--after <cursor>]` | 游标在 stderr |
+| 诊断卡死 | `scan-wait-blocked <ctx_id>` | — |
+| 应答交互提示 | `answer <ctx_id> --text "<答案>" --enter` | — |
+| 注册测试项目 | `project-add <绝对路径>`(测完 `project-remove <路径> --force`) | — |
+| 关测试终端 | `close-terminal <session_sid> --force` | 测完必关 |
+
+## 规则
+
+1. **要给 dais 派 worker → 必须走 worker-up(或 start-worker --session <sid>)**。裸 start-worker+assign 会绑错 pane(绑"人最后聚焦的"),之后 ctx 注入/读取必死 `no terminal view registered`。
+2. **要结算 → 首选 worker_done 自动**(send-message 一条 `{"task_id","dispatch_id","outcome":"succeeded"}` JSON 即触发);手动 transition-worker 只是兜底。
+3. **worker_done/heartbeat 的 body 必须是 JSON**(上表字段);其余 7 类消息类型纯文本。
+4. **要回调编排者 → prompt 里必须嵌 cb-send 契约**(命令见 maestro-bridge skill),否则 worker 无从回报。
+5. **回调没到 → 先 `tail -3 ~/.dsh/maestro/bridge/dead.log`**: `unknown-addressee`=目标不在册;`ambiguous`=撞名改全签名;`session-not-found`=目标会话死了。
+6. dais GUI 必须活着(`pgrep -af dais`),死了整个面不可用。
+7. 测试产物(临时项目/终端)测完必须清理: `close-terminal --force` + `project-remove --force`。
+
+## 30 秒完整配方
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 RUN=$(dais orchestration create-run --objective "<目标>" | tail -1)
-TASK=$(dais orchestration create-task "$RUN" "<任务描述>" | tail -1)
-# prompt 里嵌回调契约(把 <MY-SIG> 换成你的签名,如 smk3@session-xxxx):
-P="<任务正文>。完成后用 bash 执行两行:
-~/.dsh/maestro/bin/cb-send ping <你的ID> <MY-SIG> <ref> '<一句话>'
-~/.dsh/maestro/bin/cb-send done <你的ID> <MY-SIG> <ref> '<摘要≤300字>'"
-worker-up "$TASK" <项目绝对路径> omp-dais "$P"    # 一条命令: 开pane→绑定→起harness→派任务
+TASK=$(dais orchestration create-task "$RUN" "<任务>" | tail -1)
+P="<任务正文>。完成后 bash 执行:
+~/.dsh/maestro/bin/cb-send ping <worker-ID> <编排者签名> <ref> '<一句话>'
+~/.dsh/maestro/bin/cb-send done <worker-ID> <编排者签名> <ref> '<摘要>'"
+worker-up "$TASK" /tmp/my-proj omp-dais "$P"    # 开pane→绑定→起harness→派任务,一条命令
+# 回调原生唤醒你的回合; 收到后:
+dais orchestration transition-worker <ctx> succeeded
+dais orchestration close-terminal <pane> --force
 ```
-
-回调会**原生唤醒你的回合**(ORCA-CB] 前缀注入),无需轮询。收 ping+done 即收口:
-`dais orchestration transition-worker <ctx> succeeded`(ctx 见 worker-up 回显)。
-清理: `dais orchestration close-terminal <pane> --force`。
-
-## 命令速查
-
-### 消息
-```bash
-dais orchestration send-message <run_id> <from> <to> --message-type status --subject "<短>" --body "<内容>"
-dais orchestration check-messages <handle> [--wait --timeout-ms 120000 --type T]   # 拉取即已读
-dais orchestration inject-prompt <dispatch_id-or-session_handle> "<text>"          # 全文进 idle TUI;忙则 --force
-```
-
-### 监督任务
-```bash
-dais orchestration create-run --objective "<text>"                                # → run_<id>
-dais orchestration create-task <run_id> "<spec>" [--dep t_..]                      # → task_<id>
-dais orchestration start-worker <task_id> --session session_<sid>                  # → ctx_<id>,指名绑定(勿用 assign)
-dais orchestration transition-worker <dispatch_id> <state>                         # 9态; 结算=succeeded/failed
-dais orchestration check-status [--run-id <rid>]
-dais orchestration gc-runs                                                        # GC 已完结 run
-```
-
-### Worker 终端
-```bash
-dais orchestration read-worker <dispatch_id> [--lines 40] [--after <cursor>]       # 游标在 stderr
-dais orchestration scan-wait-blocked <dispatch_id>                                 # 诊断卡死
-dais orchestration answer <dispatch_id> --text "<t>" --enter                       # 应答交互提示
-```
-
-### 项目/终端(开测试终端前先 project-add)
-```bash
-dais orchestration project-add <abs_path>; dais orchestration project-remove <abs_path> [--force]
-dais orchestration new-terminal <project_path> [--cwd <dir>]                       # → session_<sid>
-dais orchestration close-terminal <session_sid> [--force]                          # 测完必关
-```
-
-## 硬规则
-
-- **供给 worker 只用 `worker-up` 或 `start-worker --session <sid>`**。裸 `start-worker`+`assign` 是坑: assign 绑"人聚焦的 pane", 错绑后 ctx 注入/读取死 `no terminal view registered`。
-- `worker_done`/`heartbeat` 的 body 必须是 JSON(`{"task_id","dispatch_id","outcome"}`); 其余 7 类纯文本。
-- inject-prompt 只进 idle TUI(标题判), 忙则报错——等 8-10s 或 `scan-wait-blocked` 诊断。
-- 回调收不到先看 `tail -3 ~/.dsh/maestro/bridge/dead.log`: `unknown-addressee`=目标不在册; `ambiguous`=撞名,改全签名 `<alias>@<sessionId>`。
-- dais GUI 必须活着(`pgrep -af dais`); 死了面全部不可用。
-
-## 别名(注入即起 harness)
-
-`omp-dais` / `cc-dais` / `pi-dais` — 每 shell 已武装,注入别名名即启动对应 harness。模型选择归用户 config, 别名零干预。

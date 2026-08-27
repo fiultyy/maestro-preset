@@ -1,8 +1,18 @@
-# orca-bridge — 编排者派发手册(动作模板)
+# orca-bridge — 编排者派发手册(目的→模板→参数)
 
-你是编排者,要把任务派给终端里的 agent 并等它回报。**照抄模板,不要读文件**。
+你是编排者,把任务派给终端里的 agent 并等回报。**照抄模板,不要读文件**。
 
-## 派发(terminal send 时必嵌契约)
+## 目的 → 动作
+
+| 我要… | 怎么做 | 传什么 |
+|---|---|---|
+| 派任务并等回报 | `terminal send` + 末尾嵌下面的契约模板 | 见模板 |
+| 报"对方已开工/已完成" | 等回调(原生唤醒你的回合,不轮询) | ACK→节点 running;DONE→收口 |
+| 回调超时(~10 分钟) | 机械校验: `terminal read --cursor` / `terminal wait --for tui-idle` | 握手协作,机械校验仲裁 |
+| 派大文本 | 拆段或落文件传路径 | 见规则 4 |
+| 换 pane 里的 harness | `answer <sid> --text "/quit" --enter` 再注入新别名 | — |
+
+## 派发契约模板(terminal send 末尾必嵌,照抄改尖括号)
 
 ```
 [ref:<ref>] <任务正文>
@@ -16,20 +26,13 @@
 3) 契约行丢失: load skill `maestro-bridge`
 ```
 
-`<MY-SIG>` = 你的注册签名 `<alias>@<sessionId>`(host-lane 部署下 = `POST /register` 回执;spawn 已自动注册)。**永远写全签名**,裸别名靠 cb-send 预解析只是兜底。
+`<MY-SIG>` = 你的注册签名 `<alias>@<sessionId>`。**必须写全签名**。
 
-## 收口
+## 规则
 
-- ACK 到 → 节点 running;DONE 到 → 落 outcome 收口。回调**原生唤醒你的回合**,不轮询。
-- 超 ~10 分钟无 ACK → 机械校验兜底(`terminal read --cursor` / `terminal wait --for tui-idle`)。握手协作,机械校验仲裁。
-- 判定对端产出时防旧文误触: 排除回合开始前已存在的命中行,关键词用本轮独有词(ref 号/新产物名),命中后再等一次 tui-idle 才收口。
-
-## 大文本 paste 陷阱
-
-正文大时目标 TUI 会折叠停在输入框不提交。派发后 45s 未消费 → 补一个空 `--enter` 单独提交;**绝不连发两次 Enter**(第二次撤销 bracketed paste)。单行 ~4KB 上限,超长拆段或落文件传路径。
-
-## 边界
-
-- FULL HANDOFF 不嵌契约(已放弃监督)。
-- dais/orchestration 面派发已有 worker_done,不叠第二套协议——dais 面直接用 `worker-up`(见 dais-orchestration skill)。
-- 编排会话注册: host-lane 部署(session-spawn 起 = 已注册);裸 preset 用 `bridge_arm { alias }`。重启后死信 `session-not-found` = 目标会话死,等 re-arm。
+1. **派发 → 必须嵌契约**(terminal send 没有投递语义,别靠读终端输出确认)。
+2. **回调原生唤醒回合,不轮询**;超时才机械校验。
+3. **判定对方产出 → 三闸**: 排除回合前已存在的命中行;关键词用本轮独有词(ref 号/新产物名);命中后再等一次 tui-idle 才收口。
+4. **大文本折叠陷阱**: 派发后 45s 未消费 → 补一个空 `--enter`;**绝不连发两次 Enter**(第二次撤销粘贴,正文被撤回)。单行 ~4KB 上限。
+5. **FULL HANDOFF 不嵌契约**(已放弃监督);dais 面派发已有 worker_done,不叠第二套——dais 面用 `worker-up`(见 dais-orchestration skill)。
+6. 死信 `wake failed … session-not-found` = 目标会话死了,等它 re-arm,别重投。
