@@ -18,16 +18,14 @@ git clone https://github.com/fiultyy/maestro-preset.git ~/.dsh/.agent-presets/ma
 mkdir -p ~/.agents/skills
 cp -r ~/.dsh/.agent-presets/maestro/shared/* ~/.agents/skills/
 # claude 发现面(存在 ~/.claude/skills 时): 逐个软链
-for s in maestro-bridge orca-bridge maestro-ledger dais-orchestration; do
+for s in maestro-orch cb-send dais-orchestration; do
   ln -sfn ~/.agents/skills/$s ~/.claude/skills/$s
 done
 ```
 
-- `maestro-bridge` — **worker 侧**冷执行手册(cb-send/语义/红线/排查);
-- `orca-bridge` — **编排者侧**派发握手契约模板(Orca 终端编排者必须能发现,否则派发
-  不带回调契约,worker 无从回报——2026-08-27 修复: 原先只在 preset 技能目录);
-- `maestro-ledger` — 账本读写脚本(sync.py/log.sh);
-- `dais-orchestration` — dais 编排面 CLI 参考。
+- `maestro-orch` — **编排者总入口**(内部调用/Orca 派发契约模板/ledger/dais worker-up 三步链);
+- `cb-send` — **worker 侧**回调卡(cb-send/语义/红线/排查,全编排面通用);
+- `dais-orchestration` — dais 编排面 CLI 参考(通用,任何 agent 可加载)。
 
 开发流(`bin/dev-sync.sh`)自动镜像 shared/ → `~/.agents/skills` 并接好 claude 软链,无需手工。
 
@@ -49,7 +47,7 @@ bridge_arm                          # 裸 preset: file 桥绑定;host lane 部�
 回执给出规范签名 `orch@session-xxxx`。记住它——这是别人把回调精准投给你的地址,
 也是派发握手契约里嵌给对端的回信地址(见 §5)。
 
-**② 建 Orca 桥**(一次性,Orca 重启后 handle 失效需重建): 让 agent 读 `skills/orca-bridge/SKILL.md` 执行建桥脚本,把桥 pane 的 handle 写进 `~/.dsh/maestro/bridge/handle`。桥 pane 就是一个 `cat >> inbox.log` 的终端,是外部回调进 DSH 的入口。
+**② 建 Orca 桥**(一次性,Orca 重启后 handle 失效需重建): 让 agent 读 `shared/maestro-orch/SKILL.md`(Orca 面)执行相关脚本,把桥 pane 的 handle 写进 `~/.dsh/maestro/bridge/handle`。桥 pane 就是一个 `cat >> inbox.log` 的终端,是外部回调进 DSH 的入口。
 
 **③ 对外发消息**: 用 `bin/session-send`(见 §7)。
 
@@ -187,7 +185,7 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 #   MAESTRO_ORCH_SIGNATURE=<orch签名> bin/fleet-probe <termid> --wait 120
 #   → 探测回调 from==termid → fleet 条目 verified(编排回调回合验证+落账)
 
-# 派发时消息末尾嵌入 ACK/DONE 契约（模板见 skills/orca-bridge/SKILL.md）:
+# 派发时消息末尾嵌入 ACK/DONE 契约（模板见 shared/maestro-orch/SKILL.md Orca 面）:
 #   [ref:t1] 在仓库 X 跑 cargo test 并回报
 #   —— 回调契约 ——
 #   1) 回合开始: bin/cb-send ack dev1 <orch签名> t1 "turn started"
@@ -217,13 +215,14 @@ session-send dev1 orch1 done reg1 "3 通过 0 失败"
 
 ### 6.2 技能
 
-- **orca-bridge**(shared/,双面发现: preset 会话 + `~/.agents/skills`): 建桥 pane、
-  布防 watcher、回复署名约定、派发握手契约模板。含 `scripts/watch.sh`/`reply.sh`。
-  Orca 终端编排者(preset 之外)也靠它拿到契约模板——这是 2026-08-27 修复的断路根因之一。
-- **maestro-ledger**(shared/,双面): 账本读写(分发/回收全落账)。含 `scripts/sync.py`/`log.sh`。
-- **maestro-bridge**(shared/): **worker 侧**冷执行手册——对端 agent 凭它发现回调协议
-  (cb-send 用法/ack·done 语义/红线/排查)。镜像到 `~/.agents/skills` + claude 软链(见 §2)。
-- **dais-orchestration**(shared/): dais 编排面 CLI 参考(27 子命令)。
+- **maestro-orch**(shared/,双面发现: preset 会话 + `~/.agents/skills`): 编排者总入口——
+  内部调用(签名/ledger/bridge-rearm)+ Orca 派发契约模板 + dais 面 worker-up 三步链。
+  含 `scripts/watch.sh`/`reply.sh`(Orca 桥)/`scripts/ledger/`(sync.py·log.sh)。
+  Orca 终端编排者(preset 之外)也靠它拿到契约模板——2026-08-27 修复的断路根因之一。
+- **cb-send**(shared/): **worker 侧**回调卡——对端 agent 凭它发现回调协议
+  (cb-send 用法/ack·done 语义/红线/排查),全编排面通用。镜像到 `~/.agents/skills` + claude 软链(见 §2)。
+- **dais-orchestration**(shared/): dais 编排面 CLI 参考(通用手册,任何 agent——含非 DSH
+  编排者的 Orca 终端——要操作 dais 面都加载它;maestro-orch 只放三步链+入口行)。
 
 ### 6.3 bin 脚本
 

@@ -1,17 +1,18 @@
 ---
-name: maestro-bridge
+name: cb-send
 description: >-
-  Cross-harness callback into a DSH maestro orchestrator session: send ack/done
-  dispatch handshakes, ask/report/ping messages that drive the orchestrator's
-  turn natively. Use when a dispatched task message tells you to "cb-send",
-  reply "ack"/"done" to an orchestrator, you see a "[ref:...]" callback contract,
-  or you need to report to / ask the maestro coordinator from Orca terminals,
-  dais (formerly zap) panes, cron, or any local agent process.
+  Callback to an orchestrator session from any plane (works for every
+  orchestration plane's workers): send ack/done dispatch handshakes,
+  ask/report/ping messages that drive the orchestrator's turn natively. Use
+  when a dispatched task message tells you to "cb-send", reply "ack"/"done"
+  to an orchestrator, you see a "[ref:...]" callback contract, or you need to
+  report to / ask the coordinator from Orca terminals, dais (formerly zap)
+  panes, cron, or any local agent process.
 ---
 
-# maestro-bridge — 回调编排者(目的→命令→参数)
+# cb-send — 回调编排者(目的→命令→参数)
 
-你是 worker,要回报 DSH maestro 编排会话。**一条命令,不需要读任何文件**:
+你是 worker,要回报编排会话(全编排面通用: Orca 终端/dais pane/cron/任意进程)。**一条命令,不需要读任何文件**:
 
 ```bash
 CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro/bin/cb-send

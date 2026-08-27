@@ -25,7 +25,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 | 我要… | 调什么 | 传什么 |
 |---|---|---|
-| 派 worker 干活并等回报 | `worker-up <task_id> <项目绝对路径> [harness] [prompt]`(harness∈omp-dais\|cc-dais\|pi-dais,缺省 omp-dais) | prompt 里嵌回调契约(见 maestro-bridge skill);回显 pane/dispatch |
+| 派 worker 干活并等回报 | `worker-up <task_id> <项目绝对路径> [harness] [prompt]`(harness∈omp-dais\|cc-dais\|pi-dais,缺省 omp-dais) | prompt 里嵌回调契约(见 cb-send skill);回显 pane/dispatch |
 | 开新终端 | `dais orchestration new-terminal <项目绝对路径>` | 项目须已 project-add;→ `session_<sid>` |
 | 建 run/task | `create-run --objective "<目标>"` → `create-task <run_id> "<任务描述>" [--dep t_..]` | → run_<id> / task_<id>,各取输出末行 |
 | worker 绑到指定终端 | `start-worker <task_id> --session session_<sid>` | **必须带 --session**;→ ctx_<id> |
@@ -45,7 +45,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 1. **要给 dais 派 worker → 必须走 worker-up(或 start-worker --session <sid>)**。裸 start-worker+assign 会绑错 pane(绑"人最后聚焦的"),之后 ctx 注入/读取必死 `no terminal view registered`。
 2. **要自动结算 → 必须在 start-worker 时 `--command <哨兵命令>`**(worker-up 已自动配好并在 prompt 尾部注入);worker 在终端跑完哨兵命令即 block 自动结算(exit 0=succeeded)。**手动 send-message 发 worker_done 不触发结算**(纯审计事件)——没配哨兵就 `transition-worker <ctx> succeeded` 收口。
 3. **worker_done/heartbeat 的 body 必须是 JSON**(上表字段);其余 7 类消息类型纯文本。
-4. **要回调编排者 → prompt 里必须嵌 cb-send 契约**(命令见 maestro-bridge skill),否则 worker 无从回报。
+4. **要回调编排者 → prompt 里必须嵌 cb-send 契约**(命令见 cb-send skill),否则 worker 无从回报。
 5. **回调没到 → 先 `tail -3 ~/.dsh/maestro/bridge/dead.log`**: `unknown-addressee`=目标不在册;`ambiguous`=撞名改全签名;`session-not-found`=目标会话死了。
 6. dais GUI 必须活着(`pgrep -af dais`)。死了就裸跑 `dais` 拉起(~/.local/bin wrapper,有实例锁自动取锁,terminal-server ~1s 就绪)——注意 timeout 包装的实例到期会死,别当它是稳定 GUI。
 7. 测试产物(临时项目/终端)测完必须清理: `close-terminal --force` + `project-remove --force`。

@@ -160,11 +160,23 @@ if [ -d "$SRC/shared" ]; then
     name="$(basename "$d")"
     rm -rf "$SHARED/$name"
     cp -a "$d" "$SHARED/$name"
+    touch "$SHARED/$name/.maestro-preset-owned"   # 属主标记: stale 清理只碰本仓技能
     # claude 发现面: 沿用 orca-cli/orcard 先例(软链 → ~/.agents/skills)
     if [ -d "$HOME/.claude/skills" ] && { [ ! -e "$HOME/.claude/skills/$name" ] || [ -L "$HOME/.claude/skills/$name" ]; }; then
       ln -sfn "$SHARED/$name" "$HOME/.claude/skills/$name"
     fi
     echo "shared skill: $SHARED/$name"
+  done
+  # stale 清理: 仓 shared/ 已无的技能,镜像与 claude 软链同步摘除
+  # (2026-08-27 技能重构 maestro-bridge→cb-send / orca-bridge+maestro-ledger→maestro-orch 引入)
+  for m in "$SHARED"/*/; do
+    [ -d "$m" ] || continue
+    name="$(basename "$m")"
+    if [ -f "$m/.maestro-preset-owned" ] && [ ! -d "$SRC/shared/$name" ]; then
+      rm -rf "$SHARED/$name"
+      [ -L "$HOME/.claude/skills/$name" ] && rm -f "$HOME/.claude/skills/$name"
+      echo "stale skill removed: $SHARED/$name"
+    fi
   done
 fi
 echo "reminder: 改 agent.cordis.yml → 新会话自动新代际; 只改 plugins/*.js → 重启 DSH 才确定性生效"

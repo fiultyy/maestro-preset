@@ -2,7 +2,7 @@
 """OF-003 selftest — 控制消息两段式契约三处齐 + 派发 prompt 契约头 + SKILL 主叙事切换(D-08 尾)
 
 覆盖验收 ①③④ 全量 + ② 的可离线半面(docs/kg/09-orch-hardening-plan.md §3 OF-003):
-  ① 契约文本三处齐(orch-loop.md / bin/dispatch-ticket 模板 / maestro-bridge SKILL.md,grep 可验)
+  ① 契约文本三处齐(orch-loop.md / bin/dispatch-ticket 模板 / cb-send SKILL.md,grep 可验)
   ② dispatch-ticket --dry-run 生成的派发 prompt 头部含 ack/nack 契约头
      (live steer 往返半面=GM 验收窗口双真实会话执行,见报告 B 节)
   ③ SKILL.md 主叙事含 session-send 直投完整 sessionId;cb-send 标注备胎
@@ -18,7 +18,7 @@ import tempfile
 MAESTRO = os.path.expanduser('~/.dsh/maestro')
 ORCH_LOOP = os.path.join(MAESTRO, 'orch-loop.md')
 DISPATCH = os.path.join(MAESTRO, 'bin', 'dispatch-ticket')
-SKILL = os.path.expanduser('~/.agents/skills/maestro-bridge/SKILL.md')
+SKILL = os.path.expanduser('~/.agents/skills/cb-send/SKILL.md')
 
 CHECKS = []
 
@@ -50,13 +50,17 @@ def main():
     loop = read(ORCH_LOOP)
     disp = read(DISPATCH)
     skill = read(SKILL)
-    sites = {'orch-loop.md': loop, 'bin/dispatch-ticket': disp, 'SKILL.md': skill}
+    sites = {'orch-loop.md': loop, 'bin/dispatch-ticket': disp}
 
-    print('① 契约文本三处齐(grep 可验):')
+    print('① 契约文本两处齐(grep 可验; SKILL.md 已表格化为 worker 卡,不再承载两段式叙事):')
     for name, text in sites.items():
         missing = [a for a in ANCHORS if a not in text]
         check(f'{name} 含全部 {len(ANCHORS)} 个契约锚点', not missing,
               f'missing={missing}' if missing else '7/7')
+    cb_anchors = ['cb-send ack', 'cb-send done', 'inbox.log', '全签名']
+    missing = [a for a in cb_anchors if a not in skill]
+    check(f'SKILL.md 含全部 {len(cb_anchors)} 个 cb-send 契约锚点', not missing,
+          f'missing={missing}' if missing else f'{len(cb_anchors)}/{len(cb_anchors)}')
 
     print('② dispatch-ticket 生成的派发 prompt 头部含契约头(--dry-run,不发送不落账):')
     tmp = tempfile.mkdtemp(prefix='of003-selftest-')
@@ -82,15 +86,9 @@ def main():
           '[ref:TST-001]' in out and marker in out
           and '{REF}' not in out and '{TICKET_BLOCK}' not in out and '{WORKER}' not in out)
 
-    print('③ SKILL.md 主叙事切换(session-send 直投为主,cb-send 降备胎;D-08 尾):')
-    i_main = skill.find('## 主通道: 编排者可达性 = 直投完整 sessionId')
-    i_cb = skill.find('## 备胎通道: cb-send')
-    check('主叙事 = 编排者可达性直投完整 sessionId(session-send 推唤醒)',
-          i_main >= 0 and 'session-send' in skill[i_main:i_main + 400]
-          and '完整 sessionId' in skill[i_main:i_main + 400])
-    check('主通道节在 cb-send 备胎节之前(叙事主次落地)', i_main >= 0 and i_cb > i_main,
-          f'main@{i_main} < cb-fallback@{i_cb}')
-    check('cb-send 明确标注备胎(降级定位)', i_cb >= 0 and '备胎' in skill[i_cb:i_cb + 200])
+    print('③ SKILL.md 为 worker 回调卡(目的→命令表;表格化后形态):')
+    check('SKILL.md 头部即命令卡(cb-send ack/done 首块)',
+          'cb-send ack' in skill[:1200] and 'cb-send done' in skill[:1200])
 
     print('④ 旧 peer 零阻塞语义在 orch-loop 有明文(nack busy 不丢不重同验):')
     check('orch-loop 明文: 发送方零阻塞/不等待 ack-nack/机械核查为仲裁',

@@ -91,7 +91,7 @@ echo "$OUT" | grep -q "survived" && echo "$OUT" | grep -q "register skipped" && 
 
 # ── ③ worker-up dry-run 序列形状 ──
 OUT=$("$REPO/bin/worker-up" task_x "$REPO" cc-dais 'do the thing' --dry-run 2>&1)
-echo "$OUT" | grep -q "new-terminal .*maestro-preset-iter" && ok "up① new-terminal 带项目路径" || bad "up①" "$OUT"
+echo "$OUT" | grep -q "new-terminal .*$REPO" && ok "up① new-terminal 带项目路径" || bad "up①" "$OUT"
 echo "$OUT" | grep -q "start-worker task_x --session session_" && ok "up② start-worker --session 指名绑定" || bad "up②" "$OUT"
 echo "$OUT" | grep -q "dispatch: ctx_.* (bound to session_" && ok "up③ 绑定回显" || bad "up③" "$OUT"
 echo "$OUT" | grep -q "inject-prompt ctx_.* cc-dais" && ok "up④ harness 注入" || bad "up④" "$OUT"
