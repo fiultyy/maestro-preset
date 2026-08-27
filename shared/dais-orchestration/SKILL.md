@@ -43,7 +43,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 ## 规则
 
 1. **要给 dais 派 worker → 必须走 worker-up(或 start-worker --session <sid>)**。裸 start-worker+assign 会绑错 pane(绑"人最后聚焦的"),之后 ctx 注入/读取必死 `no terminal view registered`。
-2. **要结算 → 首选 worker_done 自动**(send-message 一条 `{"task_id","dispatch_id","outcome":"succeeded"}` JSON 即触发);手动 transition-worker 只是兜底。
+2. **要自动结算 → 必须在 start-worker 时 `--command <哨兵命令>`**(worker-up 已自动配好并在 prompt 尾部注入);worker 在终端跑完哨兵命令即 block 自动结算(exit 0=succeeded)。**手动 send-message 发 worker_done 不触发结算**(纯审计事件)——没配哨兵就 `transition-worker <ctx> succeeded` 收口。
 3. **worker_done/heartbeat 的 body 必须是 JSON**(上表字段);其余 7 类消息类型纯文本。
 4. **要回调编排者 → prompt 里必须嵌 cb-send 契约**(命令见 maestro-bridge skill),否则 worker 无从回报。
 5. **回调没到 → 先 `tail -3 ~/.dsh/maestro/bridge/dead.log`**: `unknown-addressee`=目标不在册;`ambiguous`=撞名改全签名;`session-not-found`=目标会话死了。
