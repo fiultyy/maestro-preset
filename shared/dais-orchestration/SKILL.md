@@ -47,7 +47,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 3. **worker_done/heartbeat 的 body 必须是 JSON**(上表字段);其余 7 类消息类型纯文本。
 4. **要回调编排者 → prompt 里必须嵌 cb-send 契约**(命令见 maestro-bridge skill),否则 worker 无从回报。
 5. **回调没到 → 先 `tail -3 ~/.dsh/maestro/bridge/dead.log`**: `unknown-addressee`=目标不在册;`ambiguous`=撞名改全签名;`session-not-found`=目标会话死了。
-6. dais GUI 必须活着(`pgrep -af dais`),死了整个面不可用。
+6. dais GUI 必须活着(`pgrep -af dais`)。死了就裸跑 `dais` 拉起(~/.local/bin wrapper,有实例锁自动取锁,terminal-server ~1s 就绪)——注意 timeout 包装的实例到期会死,别当它是稳定 GUI。
 7. 测试产物(临时项目/终端)测完必须清理: `close-terminal --force` + `project-remove --force`。
 
 ## 30 秒完整配方
