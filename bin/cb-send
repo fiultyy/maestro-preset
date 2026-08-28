@@ -3,7 +3,7 @@
 # 编排者派发 terminal send 时在消息里嵌入回调契约(见 shared/maestro-orch/SKILL.md),
 # 对端照抄本命令即可: ACK=回合已开始握手, DONE=完成+结果摘要。
 #
-# 用法: cb-send [--msgid <id>] [--ver <2|3>] <type> <from> <to> <ref> <body>
+# 用法: cb-send [--msgid <id>] [--ver <2|3>] [--selftest] <type> <from> <to> <ref> <body>
 #   type: ack|done|ask|report|ping|status   # intake 白名单 6 值(前 4 为 V2 面)
 #         ack  = 收到派发、回合已开始(握手,编排者据此把节点置 running)
 #         done = 完成,body 为 ≤300 字符结果摘要(编排者据此落账收口)
@@ -13,6 +13,8 @@
 #   body: 单行正文
 #   --msgid: 可选,透传既有 msgid(重发保号);缺省 uuid4;与 --ver 2 互斥
 #   --ver:   2|3,缺省 3;--ver 2 输出与 cb-send.v2 逐字节一致
+#   --selftest: 内置自测(可单独使用;mktemp 临时目录,只做参数解析/信封构造/URL
+#               拼装/别名预解析的纯断言,绝不发真实 HTTP/文件桥)
 #
 # 信封 v3(P3b.1,七键): {"type","from","to","body","ref","msgid","ver"}——头四键
 #       与 v2 逐字节不动;尾部追加 ref(权威,R-S03)/msgid/ver;body 恒带 "[ref:<ref>] "
@@ -26,41 +28,69 @@
 #       400、503)亦降级文件桥(append inbox.log,游标消费不丢)。
 # 依赖: curl + python3(与 session-send 同);二者皆无时按 SKILL.md 手拼 JSON。
 set -euo pipefail
-# 参数解析(P3b.4): --msgid/--ver 位置无关 scan-and-delete;删除后恰 5 位置参
-msgid=""; ver=3
-args=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --msgid)
-      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-        echo "cb-send: --msgid requires a value" >&2; exit 2
-      fi
-      msgid="$2"; shift 2 ;;
-    --ver)
-      if [ "$#" -lt 2 ]; then grep '^#' "$0" >&2; exit 2; fi
-      case "$2" in
-        2|3) ver="$2" ;;
-        *) grep '^#' "$0" >&2; exit 2 ;;
-      esac
-      shift 2 ;;
-    *) args+=("$1"); shift ;;
-  esac
-done
-if [ "${#args[@]}" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
-if [ "$ver" = 2 ] && [ -n "$msgid" ]; then
-  echo "cb-send: --ver 2 conflicts with --msgid (pick one)" >&2; exit 2
-fi
-typ="${args[0]}" frm="${args[1]}" to="${args[2]}" ref="${args[3]}" body="${args[4]}"
-B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
 
-# 裸别名预解析(多编排者并发防断路, 2026-08-26): to 不含 '@' 且非 '*' 时按
-# registry 别名表升级为全签名——恰一持有者 → 升级(消灭"编排者换代后旧签名
-# 失效"类断路); 多持有者 → 本地报错列出候选(裸别名在受理面必死信 ambiguous,
-# 早失败可操作); 零命中 → 原样透传(可能是裸 sessionId)。bare sessionId 直投。
-case "$to" in
-  '*'|*@*) ;;
-  *)
-    resolved=$(python3 -c '
+# 参数解析(P3b.4): --msgid/--ver/--selftest 位置无关 scan-and-delete;删除后恰 5 位置参
+parse_cli() {
+  msgid=""; ver=3; selftest=0
+  args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --msgid)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          echo "cb-send: --msgid requires a value" >&2; exit 2
+        fi
+        msgid="$2"; shift 2 ;;
+      --ver)
+        if [ "$#" -lt 2 ]; then grep '^#' "$0" >&2; exit 2; fi
+        case "$2" in
+          2|3) ver="$2" ;;
+          *) grep '^#' "$0" >&2; exit 2 ;;
+        esac
+        shift 2 ;;
+      --selftest) selftest=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [ "$selftest" = 1 ]; then return 0; fi   # 自测旗标可单独使用,免位置参
+  if [ "${#args[@]}" -ne 5 ]; then grep '^#' "$0" >&2; exit 2; fi
+  if [ "$ver" = 2 ] && [ -n "$msgid" ]; then
+    echo "cb-send: --ver 2 conflicts with --msgid (pick one)" >&2; exit 2
+  fi
+  typ="${args[0]}" frm="${args[1]}" to="${args[2]}" ref="${args[3]}" body="${args[4]}"
+}
+
+# 信封构造(纯函数): v2 四键(与 cb-send.v2 逐字节一致);v3 七键(尾部追加 ref/msgid/ver)
+build_payload() { # <ver> <msgid> <typ> <frm> <to> <ref> <body>
+  if [ "$1" = 2 ]; then
+    python3 -c '
+import json, sys
+print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
+                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}"}, ensure_ascii=False))
+' "$3" "$4" "$5" "$6" "$7"
+  else
+    local m="${2:-$(python3 -c 'import uuid; print(uuid.uuid4())')}"
+    python3 -c '
+import json, sys
+print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
+                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}",
+                  "ref": sys.argv[4], "msgid": sys.argv[6], "ver": 3}, ensure_ascii=False))
+' "$3" "$4" "$5" "$6" "$7" "$m"
+  fi
+}
+
+# URL 拼装(纯函数): bridge 目录有 http.port → http://127.0.0.1:<port>/callback;
+# 无端口文件 → 非零返回(调用方降级文件桥)
+bridge_url() { # <bridge_dir>
+  [ -f "$1/http.port" ] || return 1
+  local port
+  port=$(tr -d '[:space:]' < "$1/http.port")
+  echo "http://127.0.0.1:${port}/callback"
+}
+
+# 裸别名预解析(多编排者并发防断路): registry 别名表恰一持有者 → 升级全签名;
+# 多持有者 → exit 3(stderr AMBIGUOUS:,调用方本地报错列候选);零命中/无表 → 空输出透传
+resolve_alias() { # <bridge_dir> <bare alias>
+  python3 -c '
 import json, os, sys
 reg = os.path.join(sys.argv[1], "registry.json")
 try:
@@ -73,7 +103,103 @@ if len(holders) == 1:
 elif len(holders) > 1:
     print("AMBIGUOUS:" + ",".join(sorted(holders)), file=sys.stderr)
     sys.exit(3)
-' "$B" "$to" 2>/dev/null) || {
+' "$1" "$2" 2>/dev/null
+}
+
+# ---------- selftest(mktemp 临时目录;纯断言;零 HTTP/零文件桥写入) ----------
+
+selftest_run() {
+  local pass=0 total=0 tmp got want rc
+  tmp=$(mktemp -d)
+  st_check() { # <name> <ok:0|1> [detail]
+    total=$((total+1))
+    if [ "$2" = 0 ]; then pass=$((pass+1)); echo "  [ ok ] $1"
+    else echo "  [FAIL] $1 ${3:-}"; fi
+  }
+
+  # 参数解析(子 shell 内跑 parse_cli,变量/退出码不泄入本函数)
+  got=$( parse_cli --msgid M1 ack dev1 orch@s1 R1 hello && \
+         echo "typ=$typ frm=$frm to=$to ref=$ref body=$body msgid=$msgid ver=$ver selftest=$selftest" )
+  st_check 'cb:parse-happy' "$([ "$got" = 'typ=ack frm=dev1 to=orch@s1 ref=R1 body=hello msgid=M1 ver=3 selftest=0' ] && echo 0 || echo 1)" "$got"
+  got=$( parse_cli --selftest ack dev1 orch@s1 R1 hello && echo "selftest=$selftest msgid=$msgid" )
+  st_check 'cb:parse-selftest-flag' "$([ "$got" = 'selftest=1 msgid=' ] && echo 0 || echo 1)" "$got"
+  rc=0; ( parse_cli --msgid ) >/dev/null 2>&1 || rc=$?
+  st_check 'cb:parse-msgid-needs-value' "$([ "$rc" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+  rc=0; ( parse_cli --ver 9 ack dev1 orch@s1 R1 hello ) >/dev/null 2>&1 || rc=$?
+  st_check 'cb:parse-ver-domain' "$([ "$rc" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+  rc=0; ( parse_cli --ver 2 --msgid M ack dev1 orch@s1 R1 hello ) >/dev/null 2>&1 || rc=$?
+  st_check 'cb:parse-ver2-msgid-conflict' "$([ "$rc" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+  rc=0; ( parse_cli ack dev1 orch@s1 R1 ) >/dev/null 2>&1 || rc=$?
+  st_check 'cb:parse-arity' "$([ "$rc" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+
+  # 信封构造: v2 四键逐字节;v3 七键形状 + ref 双写 + msgid 透传
+  got=$(build_payload 2 '' ack dev1 'orch@s1' R1 'hello world')
+  want=$(python3 -c 'import json; print(json.dumps({"type":"ack","from":"dev1","to":"orch@s1","body":"[ref:R1] hello world"},ensure_ascii=False))')
+  st_check 'cb:payload-v2-byte-exact' "$([ "$got" = "$want" ] && echo 0 || echo 1)" "got=$got"
+  got=$(build_payload 3 '11111111-2222-3333-4444-555555555555' done w1 'orch@s2' R2 '结果摘要')
+  rc=0; python3 - "$got" <<'PY' || rc=$?
+import json, sys
+d = json.loads(sys.argv[1])
+assert list(d) == ["type", "from", "to", "body", "ref", "msgid", "ver"], list(d)
+assert d["type"] == "done" and d["from"] == "w1" and d["to"] == "orch@s2"
+assert d["body"] == "[ref:R2] 结果摘要", d["body"]      # legacy ref 双写前缀
+assert d["ref"] == "R2"                                  # 权威 ref 字段
+assert d["msgid"] == "11111111-2222-3333-4444-555555555555"  # msgid 透传保号
+assert d["ver"] == 3
+PY
+  st_check 'cb:payload-v3-shape' "$rc" "got=$got"
+  got=$(build_payload 3 '' ping w1 'orch@s2' R3 x)
+  rc=0; python3 - "$got" <<'PY' || rc=$?
+import json, re, sys
+d = json.loads(sys.argv[1])
+assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    d["msgid"]), d["msgid"]              # 缺省 msgid=uuid4 形制
+assert d["ver"] == 3
+PY
+  st_check 'cb:payload-v3-default-msgid-uuid' "$rc"
+
+  # URL 拼装: 端口文件去空白;缺端口文件 → 非零(降级路径)
+  mkdir -p "$tmp/br"
+  printf '  8123 \n' > "$tmp/br/http.port"
+  got=$(bridge_url "$tmp/br")
+  st_check 'cb:url-assembly' "$([ "$got" = 'http://127.0.0.1:8123/callback' ] && echo 0 || echo 1)" "got=$got"
+  rc=0; bridge_url "$tmp/no-such-bridge" >/dev/null 2>&1 || rc=$?
+  st_check 'cb:url-missing-port-nonzero' "$([ "$rc" != 0 ] && echo 0 || echo 1)" "rc=$rc"
+
+  # 裸别名预解析: 恰一持有者升级/多持有者 exit 3/零命中与无表透传
+  mkdir -p "$tmp/reg1" "$tmp/reg2" "$tmp/reg3"
+  printf '{"consumers": {"session-a": {"alias": "orch"}, "session-b": {"alias": "other"}}}' > "$tmp/reg1/registry.json"
+  printf '{"consumers": {"session-a": {"alias": "orch"}, "session-b": {"alias": "orch"}}}' > "$tmp/reg2/registry.json"
+  got=$(resolve_alias "$tmp/reg1" orch)
+  st_check 'cb:alias-single-holder-upgrade' "$([ "$got" = 'orch@session-a' ] && echo 0 || echo 1)" "got=$got"
+  rc=0; got=$(resolve_alias "$tmp/reg2" orch 2>/dev/null) || rc=$?
+  st_check 'cb:alias-ambiguous-exit3' "$([ "$rc" = 3 ] && [ -z "$got" ] && echo 0 || echo 1)" "rc=$rc got=$got"
+  got=$(resolve_alias "$tmp/reg1" nobody)
+  st_check 'cb:alias-zero-holder-passthrough' "$([ -z "$got" ] && echo 0 || echo 1)" "got=$got"
+  got=$(resolve_alias "$tmp/reg3" orch)
+  st_check 'cb:alias-missing-registry-passthrough' "$([ -z "$got" ] && echo 0 || echo 1)" "got=$got"
+
+  rm -rf "$tmp"
+  echo "cb-send selftest: $pass/$total passed"
+  [ "$pass" = "$total" ]
+}
+
+parse_cli "$@"
+
+if [ "$selftest" = 1 ]; then
+  selftest_run
+  exit $?
+fi
+B="${MAESTRO_BRIDGE:-$HOME/.dsh/maestro/bridge}"
+
+# 裸别名预解析(多编排者并发防断路, 2026-08-26): to 不含 '@' 且非 '*' 时按
+# registry 别名表升级为全签名——恰一持有者 → 升级(消灭"编排者换代后旧签名
+# 失效"类断路); 多持有者 → 本地报错列出候选(裸别名在受理面必死信 ambiguous,
+# 早失败可操作); 零命中 → 原样透传(可能是裸 sessionId)。bare sessionId 直投。
+case "$to" in
+  '*'|*@*) ;;
+  *)
+    resolved=$(resolve_alias "$B" "$to") || {
       echo "cb-send: alias \"$to\" 被多个在册会话持有 —— 裸别名必死信(ambiguous);改用派发契约里的全签名 <alias>@<sessionId>,在册候选:" >&2
       python3 -c '
 import json, os, sys
@@ -89,27 +215,12 @@ for sid, c in sorted(consumers.items()):
     fi
     ;;
 esac
-if [ "$ver" = 2 ]; then
-  payload=$(python3 -c '
-import json, sys
-print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
-                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}"}, ensure_ascii=False))
-' "$typ" "$frm" "$to" "$ref" "$body")
-else
-  m="${msgid:-$(python3 -c 'import uuid; print(uuid.uuid4())')}"
-  payload=$(python3 -c '
-import json, sys
-print(json.dumps({"type": sys.argv[1], "from": sys.argv[2], "to": sys.argv[3],
-                  "body": f"[ref:{sys.argv[4]}] {sys.argv[5]}",
-                  "ref": sys.argv[4], "msgid": sys.argv[6], "ver": 3}, ensure_ascii=False))
-' "$typ" "$frm" "$to" "$ref" "$body" "$m")
-fi
+payload=$(build_payload "$ver" "$msgid" "$typ" "$frm" "$to" "$ref" "$body")
 
 # 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)
-if [ -f "$B/http.port" ] && command -v curl >/dev/null 2>&1; then
-  port=$(tr -d '[:space:]' < "$B/http.port")
+if url=$(bridge_url "$B") && command -v curl >/dev/null 2>&1; then
   tmp=$(mktemp)
-  code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/callback" \
+  code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "$url" \
     -H 'content-type: application/json' -d "$payload" 2>/dev/null || echo 000)
   case "$code" in
     200|208) echo "cb-send: http ${code} $(cat "$tmp")"; rm -f "$tmp"; exit 0 ;;

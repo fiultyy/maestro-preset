@@ -15,22 +15,29 @@
       "file":    [{"name": "…", "glob": "…"}   // 事件类型固定: file-landed/file-grew],
       "process": [{"name": "…", "pid": 1234} 或 {"name": "…", "pattern": "…"},
                    "cpu_max": 1.0, "stale_min": 10, "log": "/path/log"}],
-      "sla":     [ … ],                              // ③ 留位:本票 NotImplemented
-      "lease":   [ … ]                               // ④ 留位:本票 NotImplemented
+      "sla":     [{"name": "…", "ttl_min": 240}],    // ③ ledger 非终态票超 ttl → sla-overdue
+      "lease":   [{"name": "…"}]                     // ④ fleet 租约过期 → lease-expired
     }
   }
 
 看守面语义:
-  ① 文件面: glob → 事件;首轮基线不报(OF-001 base 语义),之后新文件=file-landed、
-     增长=file-grew(old→new 字节);事件后位点推进,同内容重放零回声。
+  ① 文件面: glob → 事件;各 entry 位点独立分桶(共享平面会跨 entry 互踩出
+      file-landed 洪水);首轮基线不报(OF-001 base 语义),之后新文件=file-landed、
+      增长=file-grew(old→new 字节);事件后位点推进,同内容重放零回声。
   ② 进程面: 进程存活 且 CPU(生命周期均值)≤cpu_max 且 日志 mtime 陈旧≥stale_min
      ——双条件与判定(单条件不触发,VO-007 式挂死合成);连续挂死只报一次(latch),
      条件解除后复位。进程缺席 → 不判定(非本面职责)。
-  ③ SLA 面 / ④ 租约面: 留位——逐项打印 WATCHD-STUB NotImplemented 提示(不崩溃、
-     不进事件流不投递),patch 位:③=OF-005 tickets 非终态超 ttl;④=OF-002 fleet lease。
+  ③ SLA 面: 只读打开 ledger.db(mode=ro;env MAESTRO_LEDGER 缺省 MAESTRO/ledger.db,
+      OF-005 tickets 表),非终态(dispatched/running/blocked)票 updated_at 距今 >
+      ttl_min(缺省 240)→ sla-overdue;每票 latch 只报一次,迁终态/回新鲜复位;
+      无库/无表容错为空集,不崩。
+  ④ 租约面: fleet.json(env MAESTRO_FLEET)条目 owner 在而 leaseExpiresAt 已过/
+      缺失 → lease-expired(与 fleet-touch lease_alive 同 fail-open 语义);每条
+      latch,续期/释放复位;owner+未过期 = 有效租约。
 
-自续期(D-09 ②): --max-rounds N>0 时,轮数到期边界若①②有活动
-  (=本轮有事件 或 任一进程看守目标存活)则顺延 N 轮并打 WATCHD-RENEW;无活动才退场。
+自续期(D-09 ②): --max-rounds N>0 时,轮数到期边界若有活动(=本轮有事件,或
+  ①-④ 任一面有存活目标: 存活进程/在飞票/有效租约)则顺延 N 轮并打
+  WATCHD-RENEW;无活动才退场。
 
 升级终点(§6 非目标钉死): notify=session-send 投递失败(owner 失联)→
   追加单行 JSON 到 alerts.log(用户可见告警面)——只此一层,不做递归监督。
@@ -39,13 +46,15 @@
 信号: SIGTERM/SIGINT 优雅退出(打点+落盘位点),无残留进程/锁。
 env: WATCHD_STATE_DIR(默认 ~/.dsh/maestro/state/watch)
      WATCHD_ALERTS   (默认 ~/.dsh/maestro/state/alerts.log)
-     MAESTRO_FLEET/DSH_PORT 透传给 session-send(notify 模式;测试用 stub)
+     MAESTRO_LEDGER  (③ sla 面数据源;缺省 MAESTRO/ledger.db)
+     MAESTRO_FLEET/DSH_PORT (④ lease 面数据源;并透传给 session-send(notify 模式;测试用 stub))
 """
 import fcntl
 import glob
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -95,8 +104,12 @@ def load_state(path):
     except (OSError, ValueError):
         st = {}
     st.setdefault('files', {})
+    if any(not isinstance(v, dict) for v in st['files'].values()):
+        # 旧版平面位点(值=字节 int)迁移: 清空重按 entry 基线(零事件过渡,不误报洪水)
+        st['files'] = {}
+        st['bootstrapped'] = False
     st.setdefault('latch', {})
-    st.setdefault('bootstrapped', False)
+    st.setdefault('bootstrapped', False)  # 兼容保留;首轮基线改按 entry 分桶判定
     return st
 
 
@@ -127,13 +140,13 @@ def scan_file_face(entry, state, events):
         except OSError:
             continue
         current[path] = size
-    state_files = state['files']
-    if not state['bootstrapped']:
-        # 首轮基线(OF-001 base 语义): 只记位点不出事件
-        state_files.clear()
-        state_files.update(current)
-        state['bootstrapped'] = True
+    buckets = state['files']
+    if name not in buckets:
+        # 该 entry 首轮基线(OF-001 base 语义): 只记位点不出事件;
+        # 各 entry 独立分桶——共享平面会跨 entry 互踩出 file-landed 洪水
+        buckets[name] = dict(current)
         return
+    state_files = buckets[name]
     for path, size in current.items():
         prev = state_files.get(path)
         if prev is None:
@@ -218,14 +231,106 @@ def scan_process_face(entry, latch, events):
     return True  # 目标存活 → 活动票
 
 
-# ---------- ③④ 留位 ----------
+# ---------- 看守面③: SLA(OF-005 tickets 非终态超 ttl,只读) ----------
 
-def scan_stub_faces(faces, key, plan_ref):
-    """③SLA/④租约留位: 逐项打印 NotImplemented 提示(不崩溃、不进事件流不投递)。"""
-    for entry in faces.get(key) or []:
-        name = entry.get('name', '(unnamed)') if isinstance(entry, dict) else str(entry)
-        print(f'WATCHD-STUB face={key} watch={name}: NotImplemented — '
-              f'patch 位={plan_ref}(OF-006 分期留位,本票不实现不崩溃)')
+TICKETS_NON_TERMINAL = ('dispatched', 'running', 'blocked')
+SLA_TTL_MIN_DEFAULT = 240
+
+
+def parse_iso(val):
+    """ISO 8601 → aware datetime(容忍 Z;naive 视作 UTC);缺/坏 → None。"""
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def read_tickets():
+    """只读打开 ledger tickets 表(OF-005;mode=ro);无库/无表/SQL 错 → [](容错空集)。"""
+    db = os.environ.get('MAESTRO_LEDGER') or os.path.join(MAESTRO, 'ledger.db')
+    try:
+        con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        return list(con.execute('SELECT ticket_id, state, updated_at FROM tickets'))
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def scan_sla_face(entry, latch, events):
+    """③ SLA 面: 非终态票 updated_at 距今 > ttl_min → sla-overdue;每票 latch
+    只报一次,迁终态/回新鲜/消失复位。返回在飞票(非终态)数 = RENEW 活动票。"""
+    name = entry.get('name') or 'tickets'
+    ttl_min = float(entry.get('ttl_min', SLA_TTL_MIN_DEFAULT))
+    now = datetime.now(timezone.utc)
+    rows = read_tickets()
+    inflight, overdue_now = 0, set()
+    for tid, state, updated in rows:
+        key = f'sla:{tid}'
+        if state not in TICKETS_NON_TERMINAL:
+            continue  # 终态票: latch 由尾部统一清扫复位
+        inflight += 1
+        ts = parse_iso(updated)
+        if ts is None:
+            continue  # 时间戳缺/坏: 无法判定,保守跳过
+        age_min = (now - ts).total_seconds() / 60.0
+        if age_min > ttl_min:
+            overdue_now.add(key)
+            if not latch.get(key):
+                events.append({'face': 'sla', 'watch': name, 'type': 'sla-overdue',
+                               'detail': f'ticket={tid} age={age_min:.0f}m>ttl='
+                                         f'{ttl_min:g}m state={state}'})
+                latch[key] = True
+    for k in list(latch):  # 迁终态/回新鲜/消失 → latch 复位(再触发需新一轮过载)
+        if k.startswith('sla:') and k not in overdue_now:
+            del latch[k]
+    return inflight
+
+
+# ---------- 看守面④: 租约(OF-002 fleet lease 过期,只读) ----------
+
+def scan_lease_face(entry, latch, events):
+    """④ 租约面: fleet 条目 owner 在而 leaseExpiresAt 已过/缺失 → lease-expired
+    (与 fleet-touch lease_alive 同 fail-open 语义);每条 latch,续期/释放复位。
+    返回有效租约数 = RENEW 活动票。"""
+    name = entry.get('name') or 'fleet-lease'
+    fleet_path = os.environ.get('MAESTRO_FLEET') or os.path.join(MAESTRO, 'fleet.json')
+    try:
+        with open(fleet_path) as fh:
+            fleet = json.load(fh)
+    except (OSError, ValueError):
+        fleet = {}
+    table = fleet.get('fleet') if isinstance(fleet, dict) else None
+    table = table if isinstance(table, dict) else {}
+    now = datetime.now(timezone.utc)
+    expired_now, alive = set(), 0
+    for code in sorted(table):
+        ent = table[code]
+        if not isinstance(ent, dict):
+            continue
+        owner = ent.get('owner')
+        exp = parse_iso(ent.get('leaseExpiresAt'))
+        key = f'lease:{code}'
+        if owner and exp and exp > now:
+            alive += 1
+            continue  # 有效租约: 不报(latch 若已设,尾部清扫复位)
+        if owner:
+            expired_now.add(key)
+            if not latch.get(key):
+                events.append({'face': 'lease', 'watch': name, 'type': 'lease-expired',
+                               'detail': f'code={code} owner={owner} leaseExpiresAt='
+                                         f'{ent.get("leaseExpiresAt") or "missing"}'})
+                latch[key] = True
+    for k in list(latch):  # 续期/释放/消失 → latch 复位
+        if k.startswith('lease:') and k not in expired_now:
+            del latch[k]
+    return alive
 
 
 # ---------- 事件出口: stdout / session-send / owner 失联→alerts ----------
@@ -244,7 +349,7 @@ def append_alert(alerts_path, obj):
 
 def deliver(cfg, ev, alerts_path):
     line = event_line(ev)
-    print(f'WATCHD-EVENT {line}')
+    print(f'WATCHD-EVENT {line}', flush=True)
     if cfg.get('notify') != 'session-send':
         return
     owner = cfg.get('owner') or {}
@@ -266,7 +371,7 @@ def deliver(cfg, ev, alerts_path):
         ok, err = False, f'session-send exec: {e}'
     if not ok:
         # 升级终点(§6 非目标): owner 失联 → 用户可见告警面,只此一层
-        print(f'WATCHD-WARN owner unreachable — alert appended: {err[:120]}')
+        print(f'WATCHD-WARN owner unreachable — alert appended: {err[:120]}', flush=True)
         append_alert(alerts_path, {'ts': datetime.now(timezone.utc).isoformat(),
                                    'event': ev['type'], 'watch': ev['watch'],
                                    'error': 'owner unreachable',
@@ -314,7 +419,7 @@ def main():
 
     rnd = 0
     print(f'WATCHD-START pid={os.getpid()} cfg={os.path.abspath(cfg_path)} '
-          f'interval={interval}s max_rounds={max_rounds or "∞"} once={int(once)}')
+          f'interval={interval}s max_rounds={max_rounds or "∞"} once={int(once)}', flush=True)
     while True:
         rnd += 1
         events = []
@@ -324,25 +429,28 @@ def main():
         for entry in faces.get('process') or []:
             if scan_process_face(entry, state['latch'], events):
                 alive_targets += 1
-        scan_stub_faces(faces, 'sla', 'OF-005 tickets ttl')
-        scan_stub_faces(faces, 'lease', 'OF-002 fleet lease')
+        for entry in faces.get('sla') or []:
+            alive_targets += scan_sla_face(entry, state['latch'], events)
+        for entry in faces.get('lease') or []:
+            alive_targets += scan_lease_face(entry, state['latch'], events)
         for ev in events:
             deliver(cfg, ev, alerts_path)
         save_state(state_path, state)
         if STOP['flag']:
-            print(f"WATCHD-SHUTDOWN signal={STOP['signal']} round={rnd} state={state_path}")
+            print(f"WATCHD-SHUTDOWN signal={STOP['signal']} round={rnd} state={state_path}",
+                  flush=True)
             return 0
         if once:
-            print(f'WATCHD-DONE rounds=1 events={len(events)} state={state_path}')
+            print(f'WATCHD-DONE rounds=1 events={len(events)} state={state_path}', flush=True)
             return 0
         # 自续期: 到期边界有活动(事件/存活目标)→顺延;无活动→退场(D-09 ②)
         if effective_limit is not None and rnd >= effective_limit:
             if events or alive_targets:
                 effective_limit += max_rounds
                 print(f'WATCHD-RENEW round={rnd} new_limit={effective_limit} '
-                      f'reason=activity(events={len(events)} alive={alive_targets})')
+                      f'reason=activity(events={len(events)} alive={alive_targets})', flush=True)
             else:
-                print(f'WATCHD-EXIT reason=max-rounds-reached round={rnd}')
+                print(f'WATCHD-EXIT reason=max-rounds-reached round={rnd}', flush=True)
                 return 0
         # 分片 sleep: 信号到达 ≤0.5s 内打断,不拖整 interval
         slept = 0.0

@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""fleet-release — 席位释放原语: 摘 fleet.json 条目(+可选归档会话+清 liaison 绑定)
+
+用法:
+  fleet-release <code|sessionId> [--end] [--fleet <fleet.json>]
+                [--liaison <liaison.json>] [--port <n>] [--selftest]
+
+动作(fleet-touch 同款 flock 哨兵锁全程串行 读-改-写):
+  1. 取锁: $MAESTRO_STATE/<fleet basename>.lock(LOCK_NB 自旋, 超时
+     $FLEET_LOCK_WAIT_S 秒默认 10; 超时放弃, 不写, exit 1)
+  2. 读 fleet.json(缺失/损坏 → exit 3, 不写)
+  3. 定位条目: 先按 fleet 表键(code/终端 handle), 再按 sessionId 反查;
+     不在册 → no-op 成功: {"released": false, "reason": "absent"}, exit 0,
+     不写文件、不调 API(幂等核心: 重放即 absent)
+  4. --end: 先经 loopback 调 workspace.archiveSession 归档其 sessionId
+     (无 sessionId 的条目跳过归档); API 失败 → exit 1, 条目保留可重试
+  5. 摘除该条目, 原子写回(temp + os.replace; 无摘除不触碰文件)
+  6. liaison 绑定文件($VOICE_LIAISON_STATE)若指向被摘席位
+     (sessionId 相同, 或 code 相同——网关两侧口径) → 删除之,
+     输出 "binding-cleared": true; 文件缺席/指向他人 → false
+
+输出: 单行 JSON 对象; 成功摘除:
+  {"released": true, "code": …, "sessionId": …, "archived": <是否经 --end 归档>,
+   "binding-cleared": <是否清了绑定>}
+不在册: {"released": false, "reason": "absent"}
+
+幂等: 同 code 重复运行 → 第二次 absent no-op, fleet.json 逐字节不变;
+      --end 重放不重复调 API(absent 短路); 绑定文件已删 → binding-cleared:false。
+      终态一致: {条目不在册, 会话已归档(若 --end), 绑定已清(若指向它)}。
+
+环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_FLEET(默认 $MAESTRO_HOME/maestro/fleet.json)
+      MAESTRO_STATE(默认 $MAESTRO_HOME/maestro/state; 锁文件落此, gitignored)
+      VOICE_LIAISON_STATE(默认 ~/.local/state/voice-gateway/liaison.json)
+      FLEET_LOCK_WAIT_S(锁自旋上限秒数, 默认 10) · DSH_PORT(默认取 fleet.json
+      的 port, 再缺省 3080);--fleet/--liaison/--port 显式覆盖优先。
+退出码: 0 = 成功(含 absent no-op) · 1 = 锁超时 / --end 归档失败 ·
+        3 = fleet.json 缺失/损坏 · 2 = 用法错
+"""
+import argparse
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+FLEET_DEFAULT = os.environ.get('MAESTRO_FLEET') or os.path.join(HOME, 'maestro', 'fleet.json')
+LIAISON_DEFAULT = os.environ.get(
+    'VOICE_LIAISON_STATE', os.path.expanduser('~/.local/state/voice-gateway/liaison.json'))
+
+
+def die(msg, code=1):
+    print(f'fleet-release: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def load_fleet(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        die(f'fleet.json not found: {path}(不写入)', 3)
+    except json.JSONDecodeError as exc:
+        die(f'fleet.json 损坏,不写入(原样保留): {exc}', 3)
+    if not isinstance(data, dict) or not isinstance(data.get('fleet'), dict):
+        die("fleet.json 结构异常: 顶层缺 'fleet' 对象(不写入)", 3)
+    return data
+
+
+def save_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                               prefix='.fleet-release-', suffix='.json')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_lock(fleet_path):
+    """fleet-touch 同款哨兵锁(<basename>.lock, 稳定 inode); 取 LOCK_NB 自旋
+    最多 FLEET_LOCK_WAIT_S 秒(默认 10)——CLI 场景有界等待优于无限阻塞,
+    超时放弃不写。返回锁句柄, 调用方 finally 解锁。"""
+    state = os.environ.get('MAESTRO_STATE') or os.path.join(HOME, 'maestro', 'state')
+    os.makedirs(state, exist_ok=True)
+    lock_path = os.path.join(state, os.path.basename(os.path.abspath(fleet_path)) + '.lock')
+    fh = open(lock_path, 'a+', encoding='utf-8')
+    wait_s = float(os.environ.get('FLEET_LOCK_WAIT_S', '10'))
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                die(f'fleet lock busy >{wait_s}s: {lock_path}(放弃本次写, 未做任何更改)', 1)
+            time.sleep(0.05)
+
+
+def locate(entries, key):
+    """先按表键, 再按 sessionId 反查(排序保证确定性); 不在册 → None。"""
+    if isinstance(entries.get(key), dict):
+        return key
+    for code in sorted(entries):
+        ent = entries[code]
+        if isinstance(ent, dict) and ent.get('sessionId') == key:
+            return code
+    return None
+
+
+def rpc(port, method, payload):
+    wire = {'type': 'client-request', 'rpcId': str(uuid.uuid4()),
+            'method': method, 'payload': payload}
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{port}/api/{method}',
+        data=json.dumps(wire, ensure_ascii=False).encode(),
+        headers={'content-type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())['result']
+    except Exception as exc:  # noqa: BLE001 — 连接/HTTP/解析任一失败都归 API 失败
+        die(f'{method} 调用失败: {exc}(条目保留, 可重试)', 1)
+    if not result.get('ok'):
+        die(f'{method} RPC error: {json.dumps(result.get("error"), ensure_ascii=False)}'
+            '(条目保留, 可重试)', 1)
+    return result['value']
+
+
+def liaison_bound(path):
+    """读绑定; 缺席/坏/非 dict → {}(网关 _liaison_bound_state 同款容忍)。"""
+    try:
+        with open(path, encoding='utf-8') as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return doc if (doc.get('code') or doc.get('sessionId')) else {}
+
+
+def clear_liaison_if_bound(path, code, sid):
+    """绑定指向被摘席位(sessionId 相同或 code 相同) → 删除文件, 返回 True;
+    缺席/指向他人/删除失败 → False(与网关 fleet.cleanup 清绑口径一致)。"""
+    bound = liaison_bound(path)
+    if not bound:
+        return False
+    if bound.get('sessionId') != sid and bound.get('code') != code:
+        return False
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f'fleet-release: liaison 绑定删除失败: {exc}', file=sys.stderr)
+        return False
+    return True
+
+
+def run(key, fleet_path, liaison_path, port, end):
+    lock = acquire_lock(fleet_path)
+    try:
+        data = load_fleet(fleet_path)
+        if port is None:
+            port = os.environ.get('DSH_PORT') or str(data.get('port') or '3080')
+        code = locate(data['fleet'], key)
+        if code is None:
+            print(json.dumps({'released': False, 'reason': 'absent'}, ensure_ascii=False))
+            return
+        entry = data['fleet'][code]
+        sid = str(entry.get('sessionId') or '')
+        archived = False
+        if end and sid:
+            rpc(port, 'workspace.archiveSession', {'sessionId': sid})
+            archived = True
+        del data['fleet'][code]
+        save_atomic(fleet_path, data)
+        cleared = clear_liaison_if_bound(liaison_path, code, sid)
+        print(json.dumps({'released': True, 'code': code, 'sessionId': sid,
+                          'archived': archived, 'binding-cleared': cleared},
+                         ensure_ascii=False))
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
+# ---------- selftest ----------
+
+def selftest():
+    import fcntl as fcntl_mod
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    tmp = tempfile.mkdtemp(prefix='fr-selftest-')
+    state = os.path.join(tmp, 'state')
+    archived = set()
+    archive_calls = []
+    api_ok = True
+
+    class FakeDSH(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if not api_ok:
+                value = json.dumps({'type': 'server-response', 'rpcId': 'stub',
+                                    'result': {'ok': False, 'error': {
+                                        'message': 'stub failure'}}}).encode()
+            elif self.path.endswith('workspace.archiveSession'):
+                n = int(self.headers.get('content-length', 0))
+                sid = json.loads(self.rfile.read(n))['payload']['sessionId']
+                archive_calls.append(sid)
+                archived.add(sid)
+                value = json.dumps({'type': 'server-response', 'rpcId': 'stub', 'result': {
+                    'ok': True, 'value': {'archivedSessionIds': sorted(archived)}}}).encode()
+            else:
+                value = json.dumps({'type': 'server-response', 'rpcId': 'stub', 'result': {
+                    'ok': True, 'value': {'items': [],
+                                          'archivedSessionIds': sorted(archived)}}}).encode()
+            self.send_response(200)
+            self.send_header('content-type', 'application/json')
+            self.send_header('content-length', str(len(value)))
+            self.end_headers()
+            self.wfile.write(value)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), FakeDSH)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = str(server.server_address[1])
+
+    def run_cli(args, extra_env=None):
+        env = dict(os.environ, MAESTRO_STATE=state)
+        env.update(extra_env or {})
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                              capture_output=True, text=True, timeout=60, env=env)
+
+    def fresh(name, seats=None, liaison_doc=None):
+        path = os.path.join(tmp, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump({'port': 3080, 'defaultWorkspaceId': 'ws-x',
+                       'fleet': seats if seats is not None else {
+                           'aa11': {'sessionId': 'session-aa11', 'role': 'worker',
+                                    'node': 'n1', 'status': 'active'},
+                           'bb22': {'sessionId': 'session-bb22', 'role': 'liaison',
+                                    'node': 'n2', 'status': 'standby'},
+                       }}, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+        lp = os.path.join(tmp, name + '.liaison')
+        if liaison_doc is not None:
+            with open(lp, 'w', encoding='utf-8') as fh:
+                json.dump(liaison_doc, fh)
+        return path, lp
+
+    def sha(path):
+        with open(path, 'rb') as fh:
+            import hashlib
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('fr:release-basic')
+    def _():
+        t, lp = fresh('f1.json')
+        proc = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert proc.returncode == 0, proc.stderr
+        out = json.loads(proc.stdout)
+        assert out == {'released': True, 'code': 'aa11', 'sessionId': 'session-aa11',
+                       'archived': False, 'binding-cleared': False}, out
+        doc = json.load(open(t, encoding='utf-8'))
+        assert 'aa11' not in doc['fleet'] and 'bb22' in doc['fleet'], doc
+        assert doc['port'] == 3080 and doc['defaultWorkspaceId'] == 'ws-x', '顶层字段被破坏'
+
+    @check('fr:absent-noop-and-replay')
+    def _():
+        t, lp = fresh('f2.json')
+        absent = run_cli(['zz99', '--fleet', t, '--liaison', lp, '--port', port])
+        assert absent.returncode == 0, absent.stderr
+        assert json.loads(absent.stdout) == {'released': False, 'reason': 'absent'}
+        before = sha(t)
+        first = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert first.returncode == 0 and json.loads(first.stdout)['released'] is True
+        after_first = sha(t)
+        second = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert second.returncode == 0, '重放应 no-op 成功'
+        assert json.loads(second.stdout) == {'released': False, 'reason': 'absent'}
+        assert sha(t) == after_first, '重放不应再写文件'
+        assert after_first != before
+        n_archive = len(archive_calls)
+        third = run_cli(['aa11', '--end', '--fleet', t, '--liaison', lp, '--port', port])
+        assert third.returncode == 0 and json.loads(third.stdout)['reason'] == 'absent'
+        assert len(archive_calls) == n_archive, 'absent 短路: --end 重放不应调 API'
+
+    @check('fr:binding-cleared-when-matching')
+    def _():
+        t, lp = fresh('f3.json', liaison_doc={'code': 'aa11', 'sessionId': 'session-aa11',
+                                              'spawned_at': 1.5})
+        proc = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)['binding-cleared'] is True, proc.stdout
+        assert not os.path.exists(lp), '绑定文件应被删除'
+        replay = run_cli(['bb22', '--fleet', t, '--liaison', lp, '--port', port])
+        assert json.loads(replay.stdout) == {'released': True, 'code': 'bb22',
+                                             'sessionId': 'session-bb22',
+                                             'archived': False,
+                                             'binding-cleared': False}, '绑定已删: 重放 no-op'
+
+    @check('fr:binding-mismatch-kept')
+    def _():
+        t, lp = fresh('f4.json', liaison_doc={'code': 'bb22', 'sessionId': 'session-bb22',
+                                              'spawned_at': 1.5})
+        proc = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        out = json.loads(proc.stdout)
+        assert out['binding-cleared'] is False, out
+        assert os.path.exists(lp) and json.load(open(lp))['code'] == 'bb22', '他人绑定应保留'
+
+    @check('fr:end-archives-then-removes')
+    def _():
+        t, lp = fresh('f5.json')
+        proc = run_cli(['aa11', '--end', '--fleet', t, '--liaison', lp, '--port', port])
+        assert proc.returncode == 0, proc.stderr
+        out = json.loads(proc.stdout)
+        assert out['archived'] is True and out['released'] is True, out
+        assert archive_calls[-1] == 'session-aa11', archive_calls
+        assert 'aa11' not in json.load(open(t, encoding='utf-8'))['fleet']
+        sid_snapshot = list(archive_calls)
+        replay = run_cli(['aa11', '--end', '--fleet', t, '--liaison', lp, '--port', port])
+        assert replay.returncode == 0 and json.loads(replay.stdout)['reason'] == 'absent'
+        assert archive_calls == sid_snapshot, '重放不应重复归档'
+
+    @check('fr:end-api-fail-keeps-entry')
+    def _():
+        nonlocal api_ok
+        t, lp = fresh('f6.json', liaison_doc={'code': 'aa11', 'sessionId': 'session-aa11'})
+        before = sha(t)
+        api_ok = False
+        try:
+            proc = run_cli(['aa11', '--end', '--fleet', t, '--liaison', lp, '--port', port])
+        finally:
+            api_ok = True
+        assert proc.returncode == 1, (proc.returncode, proc.stderr)
+        assert sha(t) == before, '归档失败不应写 fleet.json'
+        assert 'aa11' in json.load(open(t, encoding='utf-8'))['fleet'], '条目保留可重试'
+        assert os.path.exists(lp), '归档失败不应清绑定'
+
+    @check('fr:lock-held-no-write')
+    def _():
+        t, lp = fresh('f7.json')
+        before = sha(t)
+        lock_path = os.path.join(state, os.path.basename(t) + '.lock')
+        os.makedirs(state, exist_ok=True)
+        held = open(lock_path, 'a+', encoding='utf-8')
+        try:
+            fcntl_mod.flock(held.fileno(), fcntl_mod.LOCK_EX)
+            proc = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port],
+                           extra_env={'FLEET_LOCK_WAIT_S': '0.5'})
+        finally:
+            fcntl_mod.flock(held.fileno(), fcntl_mod.LOCK_UN)
+            held.close()
+        assert proc.returncode == 1, (proc.returncode, proc.stderr)
+        assert 'lock busy' in proc.stderr, proc.stderr
+        assert sha(t) == before, '锁被占时不应写'
+        assert 'aa11' in json.load(open(t, encoding='utf-8'))['fleet']
+
+    @check('fr:lock-released-after-success')
+    def _():
+        t, lp = fresh('f8.json')
+        first = run_cli(['aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert first.returncode == 0, first.stderr
+        second = run_cli(['bb22', '--fleet', t, '--liaison', lp, '--port', port])
+        assert second.returncode == 0, '前次运行应已释放锁'
+
+    @check('fr:sessionid-reverse-lookup')
+    def _():
+        t, lp = fresh('f9.json')
+        proc = run_cli(['session-aa11', '--fleet', t, '--liaison', lp, '--port', port])
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)['code'] == 'aa11', proc.stdout
+
+    @check('fr:missing-and-corrupt-fleet-exit3')
+    def _():
+        proc = run_cli(['aa11', '--fleet', os.path.join(tmp, 'nope.json')])
+        assert proc.returncode == 3 and not os.path.exists(os.path.join(tmp, 'nope.json'))
+        bad = os.path.join(tmp, 'bad.json')
+        with open(bad, 'w', encoding='utf-8') as fh:
+            fh.write('{ nope')
+        proc = run_cli(['aa11', '--fleet', bad])
+        assert proc.returncode == 3, (proc.returncode, proc.stderr)
+
+    @check('fr:no-args-exit2')
+    def _():
+        proc = run_cli([])
+        assert proc.returncode == 2, (proc.returncode, proc.stderr)
+
+    @check('fr:no-temp-residue')
+    def _():
+        junk = [n for n in os.listdir(tmp) if n.startswith('.fleet-release-')]
+        assert not junk, f'残留临时文件: {junk}'
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    server.shutdown()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f'fleet-release selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='fleet-release',
+                                 description='release a fleet seat (registry + optional archive)')
+    ap.add_argument('code', nargs='?', help='fleet 短码/终端 handle, 或完整 sessionId')
+    ap.add_argument('--end', action='store_true',
+                    help='先经 workspace.archiveSession 归档其会话, 再摘册')
+    ap.add_argument('--fleet', default=None, help='fleet.json 路径(默认 $MAESTRO_FLEET)')
+    ap.add_argument('--liaison', default=None,
+                    help='liaison.json 路径(默认 $VOICE_LIAISON_STATE)')
+    ap.add_argument('--port', default=None, help='loopback 端口(默认 $DSH_PORT / fleet.port / 3080)')
+    ap.add_argument('--selftest', action='store_true', help='内置自测(stub API + temp 目录, 不碰真实状态)')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.code:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    run(a.code, a.fleet or FLEET_DEFAULT, a.liaison or LIAISON_DEFAULT, a.port, a.end)
+
+
+if __name__ == '__main__':
+    main()

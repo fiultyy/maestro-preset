@@ -2,6 +2,7 @@
 """session-send — 跨 main 会话消息直发(loopback /api 包装)
 
 用法: session-send [--msgid <id>] <from> <to> <type> <ref> <body>
+       session-send --selftest     # 内置自测(临时目录,纯函数断言,零 prompt/HTTP)
   from/to: fleet.json 里的 4 位码(如 orch1/2437),sessionId 前 4 位,或完整 sessionId
   type:    ping|pong|done|ask|steer|nack|ack
   ref:     关联的 ledger node_id(无则填 -)
@@ -23,10 +24,37 @@ steer 闸(OF-002): resolve 后,type=steer 时查 to 的 fleet 条目属主租约
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+
+
+def parse_cli(argv):
+    """scan-and-delete 旗标解析(纯函数): --msgid <id>/--selftest 删除后恰 5 位置参。
+    返回 (msgid|None, selftest_flag, positionals|None, err);err ∈ None|'msgid'|'arity'。"""
+    argv = list(argv)
+    msgid = None
+    selftest = '--selftest' in argv
+    if selftest:
+        argv.remove('--selftest')
+    if '--msgid' in argv:
+        i = argv.index('--msgid')
+        if i + 1 >= len(argv):
+            return None, False, None, 'msgid'
+        msgid = argv[i + 1]
+        del argv[i:i + 2]
+    if len(argv) != 5:
+        return None, selftest, None, 'arity'
+    return msgid, selftest, argv, None
+
+
+def build_envelope(frm, to, typ, ref, body, msgid, ts):
+    """信封 v2(OF-001,纯函数): 七键 dict + DSHMSG] 单行(收方按 ']'+json.loads 解析)。"""
+    envelope = {'from': frm, 'to': to, 'type': typ, 'ref': ref, 'body': body,
+                'msgid': msgid, 'ts': ts}
+    return envelope, 'DSHMSG]' + json.dumps(envelope, ensure_ascii=False)
 
 
 def resolve(key: str, fleet: dict) -> str:
@@ -101,19 +129,16 @@ def steer_gate(frm, to, fleet, fleet_path, msgid, ts):
 
 
 def main() -> None:
-    argv = sys.argv[1:]
-    msgid = None
-    if '--msgid' in argv:
-        i = argv.index('--msgid')
-        if i + 1 >= len(argv):
-            print('session-send: --msgid requires a value', file=sys.stderr)
-            sys.exit(2)
-        msgid = argv[i + 1]
-        del argv[i:i + 2]
-    if len(argv) != 5:
+    msgid, selftest_flag, pos, err = parse_cli(sys.argv[1:])
+    if err == 'msgid':
+        print('session-send: --msgid requires a value', file=sys.stderr)
+        sys.exit(2)
+    if selftest_flag:
+        sys.exit(selftest())
+    if err == 'arity':
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    frm, to, typ, ref, body = argv
+    frm, to, typ, ref, body = pos
     port = os.environ.get('DSH_PORT', '3080')
     fleet_path = os.environ.get('MAESTRO_FLEET', os.path.expanduser('~/.dsh/maestro/fleet.json'))
     with open(fleet_path) as fh:
@@ -124,9 +149,7 @@ def main() -> None:
     ts = int(time.time() * 1000)
     if typ == 'steer':  # OF-002 控制面闸(仅 steer;其余类型零影响)
         steer_gate(frm, to, fleet, fleet_path, msgid, ts)
-    envelope = {'from': frm, 'to': to, 'type': typ, 'ref': ref, 'body': body,
-                'msgid': msgid, 'ts': ts}
-    line = 'DSHMSG]' + json.dumps(envelope, ensure_ascii=False)
+    _envelope, line = build_envelope(frm, to, typ, ref, body, msgid, ts)
     payload = {
         'sessionId': to_sid,
         'mode': 'queue',
@@ -149,6 +172,152 @@ def main() -> None:
         print('session-send: RPC error:', json.dumps(result.get('error'), ensure_ascii=False))
         sys.exit(1)
     print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}: accepted={result['value']['accepted']}")
+
+
+# ---------- selftest(临时目录;纯函数断言;绝不发真实 prompt/HTTP) ----------
+
+def selftest():
+    tmp = tempfile.mkdtemp(prefix='se-selftest-')
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('se:parse-happy')
+    def _():
+        m, st, pos, err = parse_cli(['--msgid', 'M1', 'a', 'b', 'c', 'd', 'e'])
+        assert err is None and m == 'M1' and st is False, (m, st, err)
+        assert pos == ['a', 'b', 'c', 'd', 'e'], pos
+        m, st, pos, err = parse_cli(['a', 'b', 'c', 'd', 'e'])
+        assert err is None and m is None and st is False, (m, st, err)
+        assert pos == ['a', 'b', 'c', 'd', 'e'], pos
+        m, st, pos, err = parse_cli(['--selftest', 'a', 'b', 'c', 'd', 'e'])
+        assert err is None and st is True and pos == ['a', 'b', 'c', 'd', 'e'], (st, err)
+        m, st, pos, err = parse_cli(['a', 'b', 'c', 'd', 'e', '--selftest'])
+        assert err is None and st is True and len(pos) == 5, (st, err)
+
+    @check('se:parse-errors')
+    def _():
+        assert parse_cli(['--msgid'])[3] == 'msgid'
+        assert parse_cli([])[3] == 'arity'
+        assert parse_cli(['a', 'b', 'c'])[3] == 'arity'
+        assert parse_cli(['a', 'b', 'c', 'd', 'e', 'f'])[3] == 'arity'
+
+    @check('se:resolve-routes')
+    def _():
+        fleet = {'fleet': {
+            '2437': {'sessionId': 'session-2437abcd-0000-0000-0000-000000000001'},
+            'orch1': {'sessionId': 'session-0fffaaaa-0000-0000-0000-000000000002'}}}
+        assert resolve('session-full123', fleet) == 'session-full123'  # 完整 sid 原样
+        assert resolve('2437', fleet) == 'session-2437abcd-0000-0000-0000-000000000001'
+        assert resolve('2437ab', fleet) == 'session-2437abcd-0000-0000-0000-000000000001'
+        try:
+            resolve('zz99', fleet)
+            raise AssertionError('未知键应退出')
+        except SystemExit as exc:
+            assert exc.code not in (0, None), exc.code
+
+    @check('se:parse-ts-tolerance')
+    def _():
+        aware = parse_ts('2026-08-28T10:00:00+00:00')
+        assert aware is not None and aware.tzinfo is not None
+        assert parse_ts('2026-08-28T10:00:00Z') == aware            # 容忍 Z
+        naive = parse_ts('2026-08-28T10:00:00')
+        assert naive is not None and naive.tzinfo is not None       # naive 视作 UTC
+        assert naive == aware
+        assert parse_ts('not-a-ts') is None and parse_ts('') is None and parse_ts(None) is None
+
+    @check('se:find-entry-routes')
+    def _():
+        fleet = {'fleet': {
+            'aa11': {'sessionId': 'session-aa11ffff-0-0-0-1'},
+            'junk': 'not-a-dict',
+            'bb22': {'sessionId': 'session-bb22ffff-0-0-0-2'}}}
+        assert find_entry('aa11', fleet) == fleet['fleet']['aa11']  # 短码
+        assert find_entry('aa11ff', fleet) == fleet['fleet']['aa11']  # sid 前缀
+        assert find_entry('zz99', fleet) is None                     # 未命中
+        assert find_entry('junk', fleet) is None                     # 非法条目不炸、不命中
+
+    @check('se:envelope-v2-shape')
+    def _():
+        env, line = build_envelope('w1', 'orch1', 'done', 'R-1', '正文完成', 'M-9', 1234)
+        assert env == {'from': 'w1', 'to': 'orch1', 'type': 'done', 'ref': 'R-1',
+                       'body': '正文完成', 'msgid': 'M-9', 'ts': 1234}, env
+        assert line.startswith('DSHMSG]'), line
+        assert json.loads(line[len('DSHMSG]'):]) == env  # 老消费者 ']'+json.loads 可解析
+
+    @check('se:steer-conflict-blocks')
+    def _():
+        fleet = {'fleet': {'w9': {'sessionId': 'session-w9', 'owner': 'orchX',
+                                  'leaseExpiresAt': '2099-01-01T00:00:00+00:00'}}}
+        fleet_path = os.path.join(tmp, 'fleet-c.json')
+        with open(fleet_path, 'w') as fh:
+            json.dump(fleet, fh)
+        saved = os.environ.get('MAESTRO_STATE')
+        os.environ['MAESTRO_STATE'] = os.path.join(tmp, 'state')
+        try:
+            try:
+                steer_gate('w1', 'w9', fleet, fleet_path, 'M-c', 42)
+                raise AssertionError('他人有效租约 steer 应 exit 4')
+            except SystemExit as exc:
+                assert exc.code == 4, exc.code
+            conflicts = os.path.join(tmp, 'fleet-conflicts.jsonl')
+            with open(conflicts) as fh:
+                rows = [json.loads(x) for x in fh.read().splitlines()]
+            assert rows == [{'msgid': 'M-c', 'from': 'w1', 'to': 'w9', 'ts': 42}], rows
+        finally:
+            if saved is None:
+                os.environ.pop('MAESTRO_STATE', None)
+            else:
+                os.environ['MAESTRO_STATE'] = saved
+
+    @check('se:steer-reasons-journaled')
+    def _():
+        cases = [  # (frm, to 条目, 期望 reason)
+            ('orchX', {'owner': 'orchX', 'leaseExpiresAt': '2099-01-01T00:00:00+00:00'}, 'owner-self'),
+            ('w1', {'owner': 'orchX', 'leaseExpiresAt': '2020-01-01T00:00:00+00:00'}, 'lease-expired'),
+            ('w1', {}, 'unowned'),
+            ('w1', None, 'no-entry'),
+        ]
+        fleet = {'fleet': {f'k{i}': dict(e, sessionId=f'session-k{i}') if e else
+                           {'sessionId': f'session-k{i}'} for i, (_f, e, _r) in enumerate(cases)}}
+        fleet_path = os.path.join(tmp, 'fleet-r.json')
+        with open(fleet_path, 'w') as fh:
+            json.dump(fleet, fh)
+        journal = os.path.join(tmp, 'state', 'steer-journal.jsonl')
+        saved = os.environ.get('MAESTRO_STATE')
+        os.environ['MAESTRO_STATE'] = os.path.join(tmp, 'state')
+        try:
+            for i, (frm, _e, want) in enumerate(cases):
+                to = f'k{i}' if cases[i][1] is not None else 'zz-unknown'
+                steer_gate(frm, to, fleet, fleet_path, f'M-{i}', i)
+            with open(journal) as fh:
+                rows = [json.loads(x) for x in fh.read().splitlines()]
+            got = [r['reason'] for r in rows if r['msgid'].startswith('M-')]
+            assert got == [c[2] for c in cases], (got, [c[2] for c in cases])
+            assert all(r['from'] and r['to'] and 'ts' in r for r in rows), rows
+        finally:
+            if saved is None:
+                os.environ.pop('MAESTRO_STATE', None)
+            else:
+                os.environ['MAESTRO_STATE'] = saved
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    print(f'session-send selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
 
 
 if __name__ == '__main__':

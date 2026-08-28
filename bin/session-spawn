@@ -2,22 +2,50 @@
 """session-spawn — 按舰队规范 spawn 新 main 会话(出生入组+命名+登记)
 
 用法: session-spawn <preset> <node> <purpose> [workspaceId]
+       session-spawn --selftest     # 内置自测(临时目录,mock loopback,不动真实状态)
   返回: 4 位码(sessionId 前 4 hex,UUID 派生,零额外状态)
 
 做四件事:
   1. session.create {workspaceId, agentPreset}   — 出生入账(可见性前提)
   2. code = sessionId 前 4 位
-  3. session.rename "ORCH/<node>-<code> · <preset> · <purpose>(active)"
-  4. fleet.json 登记(原子写)并回显 code
+  3. session.rename "<code>-<node> · <preset> · <purpose>(active)"
+  4. fleet.json 登记并回显 code
+
+登记锁语义(与 fleet-touch 同款 flock 哨兵锁):
+  fleet.json 登记段 = LOCK_EX 阻塞 flock($MAESTRO_STATE/<fleet basename>.lock,
+  独立 inode 不随 os.replace 换代)全程包住「重读 fleet.json → 改 → temp+os.replace
+  落盘」——与 fleet-touch/session-purge 的写路径互斥,并发读-改-写不丢更新
+  (RPC 窗口内他方的 touch/claim 登记在锁内重读时被吸收);锁被占则阻塞等锁,
+  不超时不抢。loopback RPC 与 bridge 注册都在锁外(慢调用不持锁)。
+  锁文件落 gitignored state/ 目录;不带 --selftest 的既有调用行为不变。
 
 环境: DSH_PORT(默认 3080)/ MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)
+      MAESTRO_STATE(默认 ~/.dsh/maestro/state;flock 锁文件落此)
+      MAESTRO_HOME(默认 ~/.dsh;上两者未设时的缺省基于它)
 """
+import fcntl
+import hashlib
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import uuid
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def default_fleet_path():
+    home = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+    return os.environ.get('MAESTRO_FLEET') or os.path.join(home, 'maestro', 'fleet.json')
 
 
 def rpc(port: str, method: str, payload: dict) -> dict:
@@ -55,6 +83,56 @@ def atomic_write_json(path: str, obj: dict) -> None:
         raise
 
 
+@contextmanager
+def fleet_lock(path):
+    """写路径互斥(flock,与 fleet-touch 唯一锁范本同款): 登记的 读-改-写 全程串行,
+    并发双写不丢失更新(temp+rename 只保证单次写原子,flock 保证读-改-写原子)。
+    锁文件 = $MAESTRO_STATE/<fleet basename>.lock —— 独立 inode 不随 os.replace 换代,
+    落 gitignored state/ 目录;LOCK_EX 阻塞语义: 锁被占则等待,不超时不抢。"""
+    home = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+    state = os.environ.get('MAESTRO_STATE') or os.path.join(home, 'maestro', 'state')
+    os.makedirs(state, exist_ok=True)
+    lock_path = os.path.join(state, os.path.basename(os.path.abspath(path)) + '.lock')
+    fh = open(lock_path, 'a+', encoding='utf-8')
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def build_entry(sid: str, node: str, preset: str) -> dict:
+    """fleet 登记条目(除时间戳外纯函数;时间戳经 now_iso 便于自检钉死)。"""
+    return {
+        'sessionId': sid,
+        'role': 'worker',
+        'node': node,
+        'preset': preset,
+        'spawnedAt': now_iso(),
+        'status': 'active',
+    }
+
+
+def register_fleet_entry(fleet_path: str, code: str, entry: dict) -> None:
+    """锁下读-改-写登记: 锁内重读最新 fleet.json(吸收 RPC 窗口内的并发写)再落盘。"""
+    with fleet_lock(fleet_path):
+        with open(fleet_path) as fh:
+            fleet = json.load(fh)
+        if not isinstance(fleet, dict):
+            fleet = {}
+        fleet.setdefault('fleet', {})[code] = entry
+        atomic_write_json(fleet_path, fleet)
+
+
+def resolve_port_ws(fleet: dict, ws_arg):
+    """端口/工作区解析(纯函数): port = fleet.port 兜底 $DSH_PORT 再兜底 3080;
+    ws = 显式参兜底 fleet.defaultWorkspaceId;皆缺 → None(调用方报用法错)。"""
+    port = str(fleet.get('port', os.environ.get('DSH_PORT', '3080')))
+    ws = ws_arg or fleet.get('defaultWorkspaceId')
+    return port, ws
+
+
 def bridge_register(sid: str, alias: str) -> None:
     """P4+: 起会话即入桥册(host lane registry.json)——断路修复件 2/3。
 
@@ -82,15 +160,17 @@ def bridge_register(sid: str, alias: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) not in (4, 5):
+    argv = sys.argv[1:]
+    if argv[:1] == ['--selftest']:
+        sys.exit(selftest())
+    if len(argv) not in (3, 4):
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    preset, node, purpose = sys.argv[1:4]
-    fleet_path = os.environ.get('MAESTRO_FLEET', os.path.expanduser('~/.dsh/maestro/fleet.json'))
+    preset, node, purpose = argv[0:3]
+    fleet_path = default_fleet_path()
     with open(fleet_path) as fh:
         fleet = json.load(fh)
-    port = str(fleet.get('port', os.environ.get('DSH_PORT', '3080')))
-    ws = sys.argv[4] if len(sys.argv) == 5 else fleet.get('defaultWorkspaceId')
+    port, ws = resolve_port_ws(fleet, argv[3] if len(argv) == 4 else None)
     if not ws:
         sys.exit('session-spawn: no workspaceId given and fleet.json has no defaultWorkspaceId')
 
@@ -100,17 +180,213 @@ def main() -> None:
     title = f'{code}-{node} · {preset} · {purpose}(active)'
     rpc(port, 'session.rename', {'sessionId': sid, 'title': title})
 
-    fleet['fleet'][code] = {
-        'sessionId': sid,
-        'role': 'worker',
-        'node': node,
-        'preset': preset,
-        'spawnedAt': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
-        'status': 'active',
-    }
-    atomic_write_json(fleet_path, fleet)
+    register_fleet_entry(fleet_path, code, build_entry(sid, node, preset))
     bridge_register(sid, node)
     print(code)
+
+
+# ---------- selftest(临时目录 + mock loopback;不动真实 fleet/state) ----------
+
+FIXED_SID = 'session-9f1c2ab3-1111-2222-3333-444455556666'
+FIXED_CODE = '9f1c'
+FIXED_TS = '2026-08-28T12:00:00+00:00'
+
+
+def selftest():
+    tmp = tempfile.mkdtemp(prefix='spawn-selftest-')
+    fleet_path = os.path.join(tmp, 'fleet.json')
+    state_dir = os.path.join(tmp, 'state')
+    seed = {
+        'port': 3080,
+        'defaultWorkspaceId': 'ws-seed',
+        'fleet': {'cc00': {'sessionId': 'session-cc00', 'role': 'worker', 'status': 'active'}},
+    }
+
+    def write_seed():
+        with open(fleet_path, 'w') as fh:
+            json.dump(seed, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+
+    def read_json(path=None):
+        with open(path or fleet_path) as fh:
+            return json.load(fh)
+
+    def sha(path):
+        with open(path, 'rb') as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def run_main_mock(concurrent=None, with_ws_arg=True):
+        """走真实 main() 全路径,mock 掉 loopback(rpc)与 bridge 注册,钉死时钟;
+        concurrent 在 session.create RPC 窗口内模拟并发 fleet 写(如 fleet-touch)。"""
+        calls = []
+
+        def fake_rpc(port, method, payload):
+            calls.append((method, payload))
+            if method == 'session.create':
+                if concurrent:
+                    concurrent()
+                return {'sessionId': FIXED_SID}
+            return {}
+
+        backups = (rpc, bridge_register, now_iso, sys.argv)
+        globals()['rpc'] = fake_rpc
+        globals()['bridge_register'] = lambda *a, **k: None
+        globals()['now_iso'] = lambda: FIXED_TS
+        sys.argv = (['session-spawn', 'code', 'nd1', '自检用途']
+                    + (['ws-x'] if with_ws_arg else []))  # 4/3 位置参: 显式/缺省 ws
+        saved_env = {k: os.environ.get(k) for k in ('MAESTRO_FLEET', 'MAESTRO_STATE')}
+        os.environ['MAESTRO_FLEET'] = fleet_path
+        os.environ['MAESTRO_STATE'] = state_dir
+        out = None
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                main()
+            out = buf.getvalue().strip()
+        finally:
+            globals()['rpc'] = backups[0]
+            globals()['bridge_register'] = backups[1]
+            globals()['now_iso'] = backups[2]
+            sys.argv = backups[3]
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return out, calls
+
+    def concurrent_touch():
+        """RPC 窗口内的并发写方: 与 fleet-touch 同款锁下登记 cc33。"""
+        with fleet_lock(fleet_path):
+            data = read_json()
+            data['fleet']['cc33'] = {'sessionId': 'session-cc33', 'status': 'active',
+                                     'lastSeenAt': FIXED_TS}
+            atomic_write_json(fleet_path, data)
+
+    def main_rc(argv):
+        saved = sys.argv
+        sys.argv = ['session-spawn', *argv]
+        try:
+            buf_err, buf_out = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                main()
+            return 0
+        except SystemExit as exc:
+            return exc.code if isinstance(exc.code, int) else 1
+        finally:
+            sys.argv = saved
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('ss:locked-rmw-preserves-concurrent-write')
+    def _():
+        write_seed()
+        out, _calls = run_main_mock(concurrent=concurrent_touch)
+        assert out == FIXED_CODE, out
+        data = read_json()
+        assert FIXED_CODE in data['fleet'] and 'cc33' in data['fleet'], list(data['fleet'])
+        assert data['fleet']['cc00'] == seed['fleet']['cc00'], '无关条目被破坏'
+        assert data['port'] == 3080 and data['defaultWorkspaceId'] == 'ws-seed', '顶层键被动'
+
+    @check('ss:repeat-same-input-same-state')
+    def _():
+        write_seed()
+        run_main_mock()
+        h1 = sha(fleet_path)
+        run_main_mock()  # 同输入原地重放: 同值覆盖,终态逐字节一致(第二次为 no-op 写)
+        assert sha(fleet_path) == h1, '原地重放终态漂移'
+        write_seed()     # 同输入、同起点重放: 终态一致
+        run_main_mock()
+        assert sha(fleet_path) == h1, '同起点重放终态不一致'
+
+    @check('ss:lock-held-blocks-then-completes')
+    def _():
+        write_seed()
+        os.makedirs(state_dir, exist_ok=True)
+        lock_path = os.path.join(state_dir, os.path.basename(fleet_path) + '.lock')
+        os.makedirs(state_dir, exist_ok=True)
+        holder = open(lock_path, 'a+', encoding='utf-8')
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)  # 先持锁再起子进程(避免起跑竞态)
+        child = (
+            "import importlib.machinery, importlib.util\n"
+            f"loader = importlib.machinery.SourceFileLoader('ss_mod', {os.path.abspath(__file__)!r})\n"
+            "spec = importlib.util.spec_from_loader('ss_mod', loader)\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "loader.exec_module(mod)\n"
+            f"mod.register_fleet_entry({fleet_path!r}, {FIXED_CODE!r}, "
+            f"{{'sessionId': {FIXED_SID!r}, 'spawnedAt': {FIXED_TS!r}, 'status': 'active'}})\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, '-c', child],
+            env=dict(os.environ, MAESTRO_FLEET=fleet_path, MAESTRO_STATE=state_dir),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.0)
+            assert proc.poll() is None, '锁被占时子进程不应完成(应阻塞等锁)'
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+        rc = proc.wait(timeout=10)
+        assert rc == 0, f'释放锁后子进程应完成 rc={rc}'
+        assert FIXED_CODE in read_json()['fleet'], '子进程登记未落盘'
+
+    @check('ss:port-ws-resolution')
+    def _():
+        saved = os.environ.pop('DSH_PORT', None)
+        try:
+            assert resolve_port_ws({'port': 9999}, None) == ('9999', None)
+            assert resolve_port_ws({}, 'ws-arg') == ('3080', 'ws-arg')
+            os.environ['DSH_PORT'] = '4000'
+            assert resolve_port_ws({}, None) == ('4000', None)
+            assert resolve_port_ws({'port': 9999, 'defaultWorkspaceId': 'ws-def'},
+                                   'ws-arg') == ('9999', 'ws-arg')
+            assert resolve_port_ws({'defaultWorkspaceId': 'ws-def'}, None)[1] == 'ws-def'
+        finally:
+            if saved is None:
+                os.environ.pop('DSH_PORT', None)
+            else:
+                os.environ['DSH_PORT'] = saved
+
+    @check('ss:arg-parse-arity')
+    def _():
+        # 只测非法元数(合法元数走 run_main_mock 的 mock 路径,绝不触真实 fleet/RPC)
+        for bad in ([], ['a'], ['a', 'b'], ['a', 'b', 'c', 'd', 'e']):
+            assert main_rc(bad) == 2, bad
+
+    @check('ss:ws-fallback-from-fleet-default')
+    def _():
+        write_seed()
+        _out, calls = run_main_mock(with_ws_arg=False)
+        create = [p for m, p in calls if m == 'session.create']
+        assert create and create[0]['workspaceId'] == 'ws-seed', calls
+
+    @check('ss:no-temp-residue')
+    def _():
+        junk = [n for n in os.listdir(tmp) if n.startswith('.fleet-')]
+        assert not junk, f'残留临时文件: {junk}'
+
+    npass = 0
+    try:
+        for name, fn in results:
+            try:
+                fn()
+            except AssertionError as exc:
+                print(f'[FAIL] {name}: {exc}')
+            except Exception as exc:  # noqa: BLE001
+                print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+            else:
+                print(f'[ ok ] {name}')
+                npass += 1
+        print(f'session-spawn selftest: {npass}/{len(results)} passed')
+        return 0 if npass == len(results) else 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == '__main__':

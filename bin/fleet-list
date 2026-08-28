@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""fleet-list — 列出 fleet.json 在册席位(读侧, 零写入)
+
+用法:
+  fleet-list [--live] [--archived] [--fleet <fleet.json>] [--port <n>] [--selftest]
+
+输出: JSON 数组, 按码排序; 每元素 = {"code": <fleet 表键>} + 该条目现有字段
+      原样平铺(sessionId/role/node/status/spawnedAt/lastSeenAt/…, 不增不删)。
+
+开关:
+  --live      经 dsh loopback API 调 session.list, 为每席附 "live" 布尔
+              (其 sessionId 在活跃会话表中; 无 sessionId 的条目恒 false)
+  --archived  经 loopback 调 workspace.list, 为每席附 "archived" 布尔
+              (其 sessionId 在 archivedSessionIds 中)
+  两开关可并用。sessionId 比较在剥去 "session-" 前缀后进行
+  (session.list 回裸 UUID, fleet.json / workspace.list 带 "session-" 前缀)。
+
+幂等: 纯只读, 不触碰 fleet.json / 不落 state; 重复运行输出逐字节一致
+      (排序固定, 时间类字段只反映文件现状)。
+
+环境: MAESTRO_HOME(默认 ~/.dsh) · MAESTRO_FLEET(默认 $MAESTRO_HOME/maestro/fleet.json)
+      DSH_PORT(默认取 fleet.json 的 port, 再缺省 3080);--fleet/--port 显式覆盖优先。
+退出码: 0 = 成功 · 1 = loopback API 失败(--live/--archived) · 3 = fleet.json 缺失/损坏 · 2 = 用法错
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import uuid
+
+HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+FLEET_DEFAULT = os.environ.get('MAESTRO_FLEET') or os.path.join(HOME, 'maestro', 'fleet.json')
+
+
+def die(msg, code=1):
+    print(f'fleet-list: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def load_fleet(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        die(f'fleet.json not found: {path}', 3)
+    except json.JSONDecodeError as exc:
+        die(f'fleet.json 损坏: {exc}', 3)
+    if not isinstance(data, dict) or not isinstance(data.get('fleet'), dict):
+        die("fleet.json 结构异常: 顶层缺 'fleet' 对象", 3)
+    return data
+
+
+def rpc(port, method, payload):
+    """loopback /api/<method> 单次调用; 失败 die 1(信封与 session-send 同款)。"""
+    wire = {'type': 'client-request', 'rpcId': str(uuid.uuid4()),
+            'method': method, 'payload': payload}
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{port}/api/{method}',
+        data=json.dumps(wire, ensure_ascii=False).encode(),
+        headers={'content-type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())['result']
+    except Exception as exc:  # noqa: BLE001 — 连接/HTTP/解析任一失败都归 API 失败
+        die(f'{method} 调用失败: {exc}', 1)
+    if not result.get('ok'):
+        die(f'{method} RPC error: {json.dumps(result.get("error"), ensure_ascii=False)}', 1)
+    return result['value']
+
+
+def bare(sid):
+    """剥 "session-" 前缀, 统一三种 id 口径(fleet 带 prefix / session.list 裸)。"""
+    return str(sid or '').removeprefix('session-')
+
+
+def live_ids(value):
+    return {bare(it.get('sessionId')) for it in value.get('items', [])
+            if isinstance(it, dict) and it.get('sessionId')}
+
+
+def archived_ids(value):
+    return {bare(sid) for sid in value.get('archivedSessionIds', [])}
+
+
+def run(path, port, want_live, want_archived):
+    data = load_fleet(path)
+    if port is None:
+        port = os.environ.get('DSH_PORT') or str(data.get('port') or '3080')
+    live = live_ids(rpc(port, 'session.list', {})) if want_live else None
+    archived = archived_ids(rpc(port, 'workspace.list', {})) if want_archived else None
+    seats = []
+    for code in sorted(data['fleet']):
+        entry = data['fleet'][code]
+        if not isinstance(entry, dict):
+            continue
+        seat = {'code': code, **entry}
+        sid = bare(entry.get('sessionId'))
+        if live is not None:
+            seat['live'] = sid in live if sid else False
+        if archived is not None:
+            seat['archived'] = sid in archived if sid else False
+        seats.append(seat)
+    print(json.dumps(seats, ensure_ascii=False, indent=2))
+
+
+# ---------- selftest ----------
+
+def selftest():
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    tmp = tempfile.mkdtemp(prefix='fl-selftest-')
+
+    class FakeDSH(BaseHTTPRequestHandler):
+        """stub loopback: session.list/workspace.list 回合成应答, 零真实流量。"""
+
+        def do_POST(self):
+            method = self.path.rsplit('/', 1)[-1]
+            body = {'session.list': {'items': [{'sessionId': 'aa11', 'running': True}]},
+                    'workspace.list': {'items': [],
+                                       'archivedSessionIds': ['session-bb22']}}.get(method)
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            value = json.dumps({'type': 'server-response', 'rpcId': 'stub',
+                                'result': {'ok': True, 'value': body}}).encode()
+            self.send_response(200)
+            self.send_header('content-type', 'application/json')
+            self.send_header('content-length', str(len(value)))
+            self.end_headers()
+            self.wfile.write(value)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), FakeDSH)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = str(server.server_address[1])
+
+    def run_cli(args):
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def fresh(name):
+        path = os.path.join(tmp, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump({'port': 3080, 'defaultWorkspaceId': 'ws-x', 'fleet': {
+                'aa11': {'sessionId': 'session-aa11', 'role': 'worker', 'node': 'n1',
+                         'status': 'active', 'spawnedAt': '2026-08-27T00:00:00+00:00',
+                         'lastSeenAt': '2026-08-27T01:00:00+00:00'},
+                'bb22': {'sessionId': 'session-bb22', 'role': 'liaison', 'node': 'n2',
+                         'status': 'standby', 'spawnedAt': '2026-08-27T00:00:00+00:00'},
+                'term_abcd': {'kind': 'orca-terminal', 'handle': 'term_abcd',
+                              'status': 'verified'},
+            }}, fh)
+        return path
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('fl:basic-fields-verbatim')
+    def _():
+        t = fresh('f1.json')
+        proc = run_cli(['--fleet', t])
+        assert proc.returncode == 0, proc.stderr
+        seats = json.loads(proc.stdout)
+        assert [s['code'] for s in seats] == ['aa11', 'bb22', 'term_abcd'], seats
+        aa = seats[0]
+        assert aa['sessionId'] == 'session-aa11' and aa['role'] == 'worker'
+        assert aa['node'] == 'n1' and aa['status'] == 'active'
+        assert aa['spawnedAt'] == '2026-08-27T00:00:00+00:00'
+        assert aa['lastSeenAt'] == '2026-08-27T01:00:00+00:00'
+
+    @check('fl:live-and-archived-flags')
+    def _():
+        t = fresh('f2.json')
+        proc = run_cli(['--fleet', t, '--live', '--archived', '--port', port])
+        assert proc.returncode == 0, proc.stderr
+        seats = {s['code']: s for s in json.loads(proc.stdout)}
+        assert seats['aa11']['live'] is True and seats['aa11']['archived'] is False
+        assert seats['bb22']['live'] is False and seats['bb22']['archived'] is True
+        assert seats['term_abcd']['live'] is False and seats['term_abcd']['archived'] is False
+
+    @check('fl:read-idempotent-replay')
+    def _():
+        t = fresh('f3.json')
+        first = run_cli(['--fleet', t, '--live', '--archived', '--port', port])
+        second = run_cli(['--fleet', t, '--live', '--archived', '--port', port])
+        assert first.returncode == 0 and second.returncode == 0
+        assert first.stdout == second.stdout, '只读重放输出应逐字节一致'
+        assert first.stdout == run_cli(['--fleet', t, '--live', '--archived',
+                                        '--port', port]).stdout
+
+    @check('fl:missing-fleet-exit3')
+    def _():
+        proc = run_cli(['--fleet', os.path.join(tmp, 'nope.json')])
+        assert proc.returncode == 3, (proc.returncode, proc.stderr)
+        assert not os.path.exists(os.path.join(tmp, 'nope.json')), '读侧不应创建文件'
+
+    @check('fl:corrupt-fleet-exit3')
+    def _():
+        t = os.path.join(tmp, 'bad.json')
+        with open(t, 'w', encoding='utf-8') as fh:
+            fh.write('{ not json')
+        proc = run_cli(['--fleet', t])
+        assert proc.returncode == 3, (proc.returncode, proc.stderr)
+
+    @check('fl:api-down-exit1')
+    def _():
+        t = fresh('f4.json')
+        proc = run_cli(['--fleet', t, '--live', '--port', '1'])  # 127.0.0.1:1 拒连
+        assert proc.returncode == 1, (proc.returncode, proc.stderr)
+        assert 'session.list' in proc.stderr
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    server.shutdown()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f'fleet-list selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='fleet-list', description='list fleet seats (read-only)')
+    ap.add_argument('--live', action='store_true', help='经 session.list 为每席附 live 布尔')
+    ap.add_argument('--archived', action='store_true', help='经 workspace.list 为每席附 archived 布尔')
+    ap.add_argument('--fleet', default=None, help='fleet.json 路径(默认 $MAESTRO_FLEET)')
+    ap.add_argument('--port', default=None, help='loopback 端口(默认 $DSH_PORT / fleet.port / 3080)')
+    ap.add_argument('--selftest', action='store_true', help='内置自测(stub API + temp 目录, 不碰真实状态)')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    run(a.fleet or FLEET_DEFAULT, a.port, a.live, a.archived)
+
+
+if __name__ == '__main__':
+    main()

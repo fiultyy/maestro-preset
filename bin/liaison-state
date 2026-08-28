@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""liaison-state — 读网关 liaison 绑定状态(读侧, 零写入)
+
+用法:
+  liaison-state [--check] [--liaison <liaison.json>] [--port <n>] [--selftest]
+
+输出: JSON 对象
+  文件缺席/损坏/无有效字段 → {"bound": false}
+  有绑定 → {"bound": true, "code": …, "sessionId": …, "spawned_at": …,
+            "archived": false|--check 核验值}
+
+开关:
+  --check  经 dsh loopback API 调 workspace.list, 用 archivedSessionIds
+           核验绑定 sessionId 是否已归档 → 回填 "archived" 布尔。
+           未绑定时不调 API(无事可核), 输出仍为 {"bound": false}。
+
+口径: 绑定文件由网关/rt_dsh_backend 写入 {"code","sessionId","spawned_at"}
+      (rt_dsh_backend._liaison_bound_save); 本工具只读, 坏文件视同无绑定
+      (与网关 _liaison_bound_state 同容忍度)。路径口径同两侧:
+      $VOICE_LIAISON_STATE, 缺省 ~/.local/state/voice-gateway/liaison.json。
+
+幂等: 纯只读; 重复运行输出一致(spawned_at 只反映文件现状)。
+
+环境: VOICE_LIAISON_STATE · DSH_PORT(默认 3080);--liaison/--port 显式覆盖优先。
+退出码: 0 = 成功(含无绑定) · 1 = --check 的 loopback API 失败 · 2 = 用法错
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import uuid
+
+LIAISON_DEFAULT = os.environ.get(
+    'VOICE_LIAISON_STATE', os.path.expanduser('~/.local/state/voice-gateway/liaison.json'))
+
+
+def die(msg, code=1):
+    print(f'liaison-state: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def bound_state(path):
+    """读绑定; 缺席/坏/非 dict/无有效字段 → {}(网关 _liaison_bound_state 同款容忍)。"""
+    try:
+        with open(path, encoding='utf-8') as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out = {'code': str(doc.get('code') or ''),
+           'sessionId': str(doc.get('sessionId') or ''),
+           'spawned_at': doc.get('spawned_at')}
+    return out if (out['code'] or out['sessionId']) else {}
+
+
+def rpc(port, method, payload):
+    wire = {'type': 'client-request', 'rpcId': str(uuid.uuid4()),
+            'method': method, 'payload': payload}
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{port}/api/{method}',
+        data=json.dumps(wire, ensure_ascii=False).encode(),
+        headers={'content-type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())['result']
+    except Exception as exc:  # noqa: BLE001 — 连接/HTTP/解析任一失败都归 API 失败
+        die(f'{method} 调用失败: {exc}', 1)
+    if not result.get('ok'):
+        die(f'{method} RPC error: {json.dumps(result.get("error"), ensure_ascii=False)}', 1)
+    return result['value']
+
+
+def bare(sid):
+    return str(sid or '').removeprefix('session-')
+
+
+def run(path, port, check):
+    bound = bound_state(path)
+    if not bound:
+        print(json.dumps({'bound': False}, ensure_ascii=False))
+        return
+    out = {'bound': True, 'code': bound['code'], 'sessionId': bound['sessionId'],
+           'spawned_at': bound['spawned_at'], 'archived': False}
+    if check:
+        if port is None:
+            port = os.environ.get('DSH_PORT', '3080')
+        archived = {bare(s) for s in rpc(port, 'workspace.list', {}).get(
+            'archivedSessionIds', [])}
+        out['archived'] = bare(bound['sessionId']) in archived
+    print(json.dumps(out, ensure_ascii=False))
+
+
+# ---------- selftest ----------
+
+def selftest():
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    tmp = tempfile.mkdtemp(prefix='ls-selftest-')
+    archived_now = {'session-aa11'}
+
+    class FakeDSH(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = {'items': [], 'archivedSessionIds': sorted(archived_now)}
+            value = json.dumps({'type': 'server-response', 'rpcId': 'stub',
+                                'result': {'ok': True, 'value': body}}).encode()
+            self.send_response(200)
+            self.send_header('content-type', 'application/json')
+            self.send_header('content-length', str(len(value)))
+            self.end_headers()
+            self.wfile.write(value)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), FakeDSH)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = str(server.server_address[1])
+
+    def run_cli(args):
+        return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def liaison(name, doc=None):
+        path = os.path.join(tmp, name)
+        if doc is not None:
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump(doc, fh)
+        return path
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('ls:unbound-when-missing')
+    def _():
+        proc = run_cli(['--liaison', liaison('none.json')])
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == {'bound': False}, proc.stdout
+
+    @check('ls:bound-fields-echoed')
+    def _():
+        doc = {'code': 'aa11', 'sessionId': 'session-aa11', 'spawned_at': 1787900000.5}
+        proc = run_cli(['--liaison', liaison('bound.json', doc)])
+        assert proc.returncode == 0, proc.stderr
+        out = json.loads(proc.stdout)
+        assert out == {'bound': True, 'code': 'aa11', 'sessionId': 'session-aa11',
+                       'spawned_at': 1787900000.5, 'archived': False}, out
+
+    @check('ls:check-archived-verdict')
+    def _():
+        doc = {'code': 'aa11', 'sessionId': 'session-aa11', 'spawned_at': 1}
+        bound = liaison('chk.json', doc)
+        out1 = json.loads(run_cli(['--liaison', bound, '--check', '--port', port]).stdout)
+        assert out1['archived'] is True, out1
+        archived_now.clear()  # 会话脱离归档集 → 核验翻转
+        out2 = json.loads(run_cli(['--liaison', bound, '--check', '--port', port]).stdout)
+        assert out2['archived'] is False, out2
+        archived_now.add('session-aa11')
+
+    @check('ls:unbound-check-skips-api')
+    def _():
+        # 无绑定 + --check + 死端口: 不应触 API, 仍 {"bound": false} exit 0
+        proc = run_cli(['--liaison', liaison('none2.json'), '--check', '--port', '1'])
+        assert proc.returncode == 0, (proc.returncode, proc.stderr)
+        assert json.loads(proc.stdout) == {'bound': False}, proc.stdout
+
+    @check('ls:idempotent-replay')
+    def _():
+        # 用不在归档集里的 sid, 使 --check 与无 --check 两路同为 archived:false
+        doc = {'code': 'cc33', 'sessionId': 'session-cc33', 'spawned_at': 1787900000.5}
+        bound = liaison('rep.json', doc)
+        outs = [run_cli(['--liaison', bound, '--check', '--port', port]).stdout
+                for _ in range(2)]
+        assert outs[0] == outs[1] and outs[0].strip(), outs
+        assert json.loads(outs[0])['archived'] is False
+        # 同值口径: archived=false 时无 --check 的输出应与 --check 完全一致
+        assert run_cli(['--liaison', bound]).stdout == outs[0], '两路口径应同值'
+
+    @check('ls:corrupt-file-unbound')
+    def _():
+        path = os.path.join(tmp, 'bad.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('{ oops')
+        proc = run_cli(['--liaison', path, '--check', '--port', port])
+        assert proc.returncode == 0, (proc.returncode, proc.stderr)
+        assert json.loads(proc.stdout) == {'bound': False}, proc.stdout
+
+    @check('ls:check-api-down-exit1')
+    def _():
+        doc = {'code': 'aa11', 'sessionId': 'session-aa11'}
+        proc = run_cli(['--liaison', liaison('down.json', doc), '--check', '--port', '1'])
+        assert proc.returncode == 1, (proc.returncode, proc.stderr)
+        assert 'workspace.list' in proc.stderr
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    server.shutdown()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f'liaison-state selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='liaison-state', description='read liaison binding state')
+    ap.add_argument('--check', action='store_true', help='经 workspace.list 核验 archived')
+    ap.add_argument('--liaison', default=None,
+                    help='liaison.json 路径(默认 $VOICE_LIAISON_STATE)')
+    ap.add_argument('--port', default=None, help='loopback 端口(默认 $DSH_PORT / 3080)')
+    ap.add_argument('--selftest', action='store_true', help='内置自测(stub API + temp 目录, 不碰真实状态)')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    run(a.liaison or LIAISON_DEFAULT, a.port, a.check)
+
+
+if __name__ == '__main__':
+    main()
