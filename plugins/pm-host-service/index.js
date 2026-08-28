@@ -33,7 +33,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const version = '0.5.0'
+export const version = '0.6.0'
 export const name = 'pm-host-service'
 export const inject = [] // the shell needs no host services (PM-002+ may extend)
 

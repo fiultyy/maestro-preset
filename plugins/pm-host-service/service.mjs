@@ -51,17 +51,26 @@
 // deterministic single-line snapshot (type trace.compact: counts, seq
 // range, type histogram, reason:"threshold") and the most recent tail
 // stays verbatim; zero LLM, content-derived only -> sha-stable replays.
+// PM-006 (flow read projection, op=flow): flows/<id>/state.db via node:sqlite
+// READ-ONLY connections (zero npm dep), v_status/v_rollup views, per-flow
+// degrade (one locked/corrupt db never takes down the rest), ORDER BY for
+// stable output. Whole-plane degraded only when EVERY db is unreadable ->
+// flowc inspect CLI polling as the last-resort fallback, else empty+note —
+// never 5xx. Note on lock simulation: the dbs are WAL, where writer locks
+// do NOT block readers; unreadability (chmod 000) is the equivalent
+// unavailable-simulation that exercises the same open-failure path.
 //
 // Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
 // ledger/sqlite; writes go through maestro CLI (PM-008).
 import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
+import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
 import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -77,6 +86,8 @@ const FLEET_FILE = process.env.MAESTRO_FLEET ?? `${ROOT}/maestro/fleet.json`
 const FLEET_LIST_BIN = process.env.PM_HOST_SERVICE_FLEET_LIST ?? `${ROOT}/maestro/bin/fleet-list`
 const DSH_PORT = process.env.DSH_PORT ?? '3080'
 const SESSIONS_ROOT = process.env.DSH_SESSIONS_ROOT ?? `${ROOT}/sessions`
+const FLOWS_ROOT = process.env.MAESTRO_FLOWS_ROOT ?? `${ROOT}/maestro/flows`
+const FLOWC_BIN = process.env.PM_HOST_SERVICE_FLOWC ?? `${ROOT}/maestro/bin/flowc`
 const TRACE_BUDGET_CHARS = 20_000 // head.compact threshold (KG 14 §2.5 default)
 const TRACE_KEEP_MAX_ENTRIES = 500
 const TRACE_FILE_MAX_BYTES = 64 * 1024 * 1024
@@ -344,6 +355,11 @@ function serveTrace(q) {
       if (maxSeq == null || rec.seq > maxSeq) maxSeq = rec.seq
     }
   }
+  // fold decision input = the payload actually served (re-serialized length,
+  // may exceed the raw-char sum under escaping) — surfaced as
+  // matched.payload_chars so `folded` reads unambiguously as "fold APPLIED
+  // because payload_chars > budget" (orchestrator note on PM-005 semantics).
+  const payloadChars = JSON.stringify(entries).length
 
   // head.compact fold (KG 14 §2.5; JS semantic-equivalent per ADR-010):
   // over-budget filtered payload -> the older (head) entries collapse into
@@ -353,7 +369,7 @@ function serveTrace(q) {
   let droppedEntries = 0
   let droppedChars = 0
   const droppedHistogram = {}
-  if (JSON.stringify(entries).length > TRACE_BUDGET_CHARS) {
+  if (payloadChars > TRACE_BUDGET_CHARS) {
     folded = true
     const keepBudget = Math.floor(TRACE_BUDGET_CHARS * 0.6)
     let keptChars = 0
@@ -391,11 +407,57 @@ function serveTrace(q) {
     parseFailures,
     logTruncated: !!truncated,
     filter: { type: typeParam || null, tool: tool || null, text: text || null, seqFrom, seqTo },
-    matched: { entries: entries.length, chars: matchedChars, seq_range: [minSeq, maxSeq], type_histogram: histogram },
+    matched: { entries: entries.length, chars: matchedChars, payload_chars: payloadChars, seq_range: [minSeq, maxSeq], type_histogram: histogram },
     folded,
     budget: TRACE_BUDGET_CHARS,
     dropped: folded ? { entries: droppedEntries, chars: droppedChars } : { entries: 0, chars: 0 },
     entries: outEntries,
+  }
+}
+
+// ---- PM-006: op=flow (flow read projection; SQL self-walking, no writes) ----
+function serveFlow() {
+  let names = []
+  try {
+    names = readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort()
+  } catch (e) {
+    return { op: 'flow', count: 0, flows: [], degraded: true, note: `flows root unavailable: ${String(e?.message ?? e).slice(0, 140)}` }
+  }
+  const flows = []
+  const notes = []
+  for (const name of names) {
+    const dbPath = `${FLOWS_ROOT}/${name}/state.db`
+    try {
+      const db = new DatabaseSync(dbPath, { readOnly: true }) // read-side red line: never a write handle
+      try {
+        const nodes = db.prepare('SELECT * FROM v_status ORDER BY node_id').all()
+        const rollup = db.prepare('SELECT * FROM v_rollup ORDER BY state').all()
+        flows.push({ flow: name, source: 'sql', degraded: false, nodes, rollup })
+      } finally { db.close() }
+    } catch (e) { // locked / unreadable / corrupt: degrade THIS flow only, 200 always
+      const note = `state.db unreadable: ${String(e?.message ?? e).slice(0, 110)}`
+      flows.push({ flow: name, source: 'sql', degraded: true, nodes: [], rollup: [], note })
+      notes.push(`${name}: ${note}`)
+    }
+  }
+  let cliFallback = null
+  const failed = flows.filter((f) => f.degraded).length
+  if (flows.length > 0 && failed === flows.length) { // every db dead -> flowc inspect as last resort
+    try {
+      const r = spawnSync(FLOWC_BIN, ['inspect'], { encoding: 'utf8', timeout: 8000 })
+      cliFallback = { ran: true, ok: !r.error && r.status === 0, raw: (r.stdout || r.stderr || '').slice(0, 500) }
+    } catch (e) {
+      cliFallback = { ran: true, ok: false, raw: String(e?.message ?? e).slice(0, 200) }
+    }
+  }
+  return {
+    op: 'flow',
+    count: flows.length,
+    flows,
+    degraded: flows.length === 0 ? true : failed === flows.length,
+    sqlFailed: failed,
+    cliFallback,
+    note: notes.join('; ').slice(0, 220),
   }
 }
 
@@ -428,11 +490,12 @@ const server = createServer((req, res) => {
       return finish(200, { op: 'trace', sessionId: u.searchParams.get('sessionId'), degraded: true, entries: [], note: `trace unavailable: ${String(e?.message ?? e).slice(0, 140)}` })
     }
   }
+  if (req.url === '/op/flow') return finish(200, serveFlow())
   if (req.url === '/op/fleet') {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
   }
-  finish(404, { error: 'not found', service: SERVICE, hint: 'op=trace/flow arrive with PM-005..006' })
+  finish(404, { error: 'not found', service: SERVICE, hint: 'op=subscribe arrives with PM-007' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -445,7 +508,7 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace'],
+    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow'],
     note: '幂等键=本文件路径; temp+rename 0600; PM-002 骨架',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)

@@ -30,9 +30,10 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 | ③ 单实例 | daemon 内持有 `flock(2)` 锁 `$MAESTRO_HOME/maestro/pm-host-service.lock` | node 打开锁文件, 短命 `flock -n <fd>` 子进程把 LOCK_EX 绑到共享 open-file-description, fd 不关锁不失; 抢锁失败的实例干净退出 0(不触发 Restart 风暴), 锁随进程死亡自动释放。锁在 daemon 内的原因: flock(1) 包裹 ExecStart 会成为 MainPID, 其信号死亡被 Restart=on-failure 豁免, kill 门拉回失效 |
 | ④ 票面读 | `GET /op/tickets`: 首拉 `$MAESTRO_HOME/maestro/bin/ledger ticket list --json`, 之后按 `tickets.md` 签名(mtime_ns+size, BigInt stat)轮询增量 | 只读天然幂等: 签名未变 → 内存缓存直出(零 CLI 调用、零写盘); 签名变 → 重拉+游标更新。游标 `state/tickets.cursor.json`(0600, temp+rename, 内容一致跳过)。**降级纪律**: ledger 停走(PATH 移除模拟杀 `env python3` shebang)或非零退出 → 仍 200 + `degraded:true` + note(有缓存给 stale, 无缓存给空态), 绝不 5xx。本进程从不打开 ledger sqlite(ADR-002 只读红线) |
 | ⑤ 席位读 | `GET /op/fleet`: `fleet.json` 直读(`bin/fleet-list` CLI 为 fallback 权威) + dsh loopback `POST /api/session.list`(client-request 帧, `DSH_PORT` 缺省 3080, 8s abort) join | **无写盘**(内存 join 实时计算, ADR-007.2: 零状态)。join 仅取身份+存活字段(running/blank/preset/cwd/title), 刻意排除 updatedAt/token 等易变指标 → 同上游重放逐字节一致(sha 相同); 席位按 code 排序。**降级纪律**: dsh 不可达/超时 → 200 + 纯 fleet 视图 + `degraded:true` + note; fleet 源全灭 → 200 + 空态 + note |
-| ⑥ 轨迹读 | `GET /op/trace?sessionId=…&type=&tool=&text=&seqFrom=&seqTo=`: `sessions/<bucket>/<sid>/session.jsonl.zstd` 直读(bucket 扫描 = session-purge findSessionDir 模式; 多帧 zstd 按 magic `28 B5 2F FD` 切分逐帧解压, node 只解首帧; 单槽内存解码缓存按 mtime_ns+size 失效) | **无写盘**(单槽内存缓存)。过滤: type 精确(逗号列表)/tool(`data.name`)/text(原始行子串, 大小写不敏感)/seq 区间(记录显式 `seq`)。**head.compact 折叠**(KG 14 §2.5, ADR-010 JS 语义等价): 过滤负载 >20000 字符 → 旧头部折叠为**单行确定性快照** `trace.compact`(计数/seq 区间/类型直方图/reason:"threshold", 零 LLM), 最近尾部原样保留 → sha 稳定重放。**降级纪律**: sessionId 缺失 400; 目录/文件不可读 → 200 + `degraded:true` + note; 断尾帧截断保留已解部分并标记 `logTruncated` |
+| ⑥ 轨迹读 | `GET /op/trace?sessionId=…&type=&tool=&text=&seqFrom=&seqTo=`: `sessions/<bucket>/<sid>/session.jsonl.zstd` 直读(bucket 扫描 = session-purge findSessionDir 模式; 多帧 zstd 按 magic `28 B5 2F FD` 切分逐帧解压, node 只解首帧; 单槽内存解码缓存按 mtime_ns+size 失效) | **无写盘**(单槽内存缓存)。过滤: type 精确(逗号列表)/tool(`data.name`)/text(原始行子串, 大小写不敏感)/seq 区间(记录显式 `seq`)。**head.compact 折叠**(KG 14 §2.5, ADR-010 JS 语义等价): 过滤负载 >20000 字符 → 旧头部折叠为**单行确定性快照** `trace.compact`(计数/seq 区间/类型直方图/reason:"threshold", 零 LLM), 最近尾部原样保留 → sha 稳定重放。`folded` 语义 = **折叠已应用**: 判定量是实际下发负载的重序列化长度 `matched.payload_chars`(转义可使其高于原始字符和 `matched.chars`), 二者均已暴露。**降级纪律**: sessionId 缺失 400; 目录/文件不可读 → 200 + `degraded:true` + note; 断尾帧截断保留已解部分并标记 `logTruncated` |
+| ⑦ 流程读 | `GET /op/flow`: `flows/<id>/state.db` 逐库 `node:sqlite` **只读连接**(零 npm 依赖), 查 `v_status`/`v_rollup` 视图, `ORDER BY` 稳定输出 | **无写盘**(只读句柄, ADR-002 红线)。**按库降级**: 单库被锁/不可读只标记该 flow(`degraded:true`+note), 其余照常 200, 绝不 5xx; 全部库不可读 → `flowc inspect` CLI 轮询兜底(原样文本, 不解析表格式), 仍败 → 空态+note。锁模拟备注: 库为 WAL, 写者锁不挡读者(SQLite 语义), 不可读(chmod 000)是等价"不可用"模拟, 走同一打开失败路径 |
 
-骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；非 GET → 405（只读红线）；其余 → 404（PM-006 端点占位）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；非 GET → 405（只读红线）；其余 → 404（订阅属 PM-007）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
 
 ## unit 要点
 
@@ -68,6 +69,8 @@ PM-003（spec §PM-003）：op=tickets 重放（签名未变）零 CLI 调用零
 PM-004（spec §PM-004）：op=fleet join 活跃（sessionJoined:true）；幂等重放 sha 一致；dsh API 指向不存在端口 → 200 + 纯 fleet 视图 + `degraded:true` + note；回归：PM-001 三门 + PM-002 flock/端口漂移 + PM-003 三门全绿。
 
 PM-005（spec §PM-005）：合成大 session（>20k 字符）折叠生效（`trace.compact` 快照行 + 尾部保留，after ≤ 预算）；过滤参数重放 sha 一致；真实 session 直读折叠 + text 过滤重放；回归：PM-001..004 全部门绿。
+
+PM-006（spec §PM-006）：op=flow SQL 自走（只读并发连接交叉核对行数一致）；state.db 不可读 → 该库降级不 5xx、其余库照常；回归：PM-001..005 全部门绿。
 
 ## 边界
 
