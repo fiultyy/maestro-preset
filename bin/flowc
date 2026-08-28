@@ -3,7 +3,9 @@
 # 用法:
 #   flowc compile <flow.yml>            # flow.yml → ~/.dsh/maestro/flows/<id>/{state.db,nodes/,units/,triggers.sql}
 #   flowc inspect [flow-id]             # 状态一览(默认 MAESTRO_FLOWC_ROOT 下全部)
-#   flowc advance <flow-id> <node> --result done|failed|redirected [--note X] [--payload JSON]
+#   flowc advance <flow-id> <node> --result done|failed|redirected [--note X] [--payload JSON] [--force]
+#                                       # HF-001: done 迁移前置校验入向 deps(任一 dep ∉ {done,skipped} 拒绝);
+#                                       #         --force 旁路并 journal force-bypass 事件
 #   flowc selftest                      # 内置自测(临时 FLOW_ROOT)
 #
 # 模型(用户定调): 编排业务 = 十动词, 全幂等动作节点, 无深分支:
@@ -357,6 +359,21 @@ def cmd_advance(a):
             # 改向可复活 failed 目标(编排者裁决; retry 才计 attempts)
             c.execute("UPDATE nodes SET state='ready' WHERE node_id=? AND state IN ('pending','failed')", (target,))
         c.commit(); print(f'flowc: {a.node} redirected -> {target}'); return
+    # HF-001 入向 deps 门禁: done 迁移前置校验——任一 dep ∉ {done,skipped} 拒绝
+    # (堵无人值守乱序回报污染 DAG: AND 门此前只存在于解锁侧触发器); --force 旁路并 journal
+    if a.result == 'done':
+        dep_rows = c.execute(
+            "SELECT d.value, dep.state FROM json_each((SELECT deps FROM nodes WHERE node_id=?)) d "
+            "LEFT JOIN nodes dep ON dep.node_id = d.value", (a.node,)).fetchall()
+        unmet = [f'{d}={s or "missing"}' for d, s in dep_rows if (s or '') not in ('done', 'skipped')]
+        force = getattr(a, 'force', False)
+        if unmet and not force:
+            die(f'advance 拒绝: {a.node} 入向 deps 未满足 [{", ".join(unmet)}] — 补齐依赖后重试或 --force 旁路')
+        if unmet and force:
+            c.execute("INSERT INTO events(node_id,kind,detail) VALUES(?,?,?)",
+                      (a.node, 'force-bypass', f'deps 未满足强制旁路: {", ".join(unmet)}; {note}'))
+            c.commit()
+            print(f'flowc: {a.node} --force 旁路未满足 deps [{", ".join(unmet)}](已 journal)')
     # done|failed — 触发器族接管解锁/升级
     try:
         c.execute("UPDATE nodes SET state=?, result=?, updated_at=datetime('now') WHERE node_id=?", (a.result, note, a.node))
@@ -449,6 +466,39 @@ nodes:
     c = sqlite3.connect(db)
     st = dict(c.execute("SELECT node_id,state FROM nodes").fetchall())
     check('redirect 跳目标', st['fallback'] == 'ready' and st['commit'] == 'skipped', str(st))
+    # 8b. HF-001 入向 deps 门禁: 未满足 done 拒绝 / --force 旁路+journal / 满足后放行
+    hf = os.path.join(tmp, 'hf.yml')
+    open(hf, 'w').write('id: t-hf\nentry: x\nnodes:\n'
+                        '  x: {verb: status, title: 根}\n'
+                        '  y: {verb: status, deps: [x], title: 中}\n'
+                        '  z: {verb: status, deps: [y], title: 尾}\n')
+    compile_flow(hf)
+    hfdb = os.path.join(tmp, 't-hf', 'state.db')
+    def adv(node, result='done', note='', force=False):
+        aa = A(); aa.flow='t-hf'; aa.node=node; aa.result=result; aa.note=note; aa.payload=None; aa.force=force
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_advance(aa)
+    try:
+        adv('y'); check('HF-001 未满足 deps done 拒绝(exit≠0)', False)
+    except SystemExit:
+        check('HF-001 未满足 deps done 拒绝(exit≠0)', True)
+    ch = sqlite3.connect(hfdb)
+    st = ch.execute("SELECT state FROM nodes WHERE node_id='y'").fetchone()[0]
+    check('HF-001 拒后 y 仍 pending', st == 'pending', st)
+    ch.close()
+    adv('y', note='裁决旁路', force=True)
+    ch = sqlite3.connect(hfdb)
+    st = ch.execute("SELECT state FROM nodes WHERE node_id='y'").fetchone()[0]
+    fb = ch.execute("SELECT count(*) FROM events WHERE node_id='y' AND kind='force-bypass'").fetchone()[0]
+    check('HF-001 --force 旁路 y=done', st == 'done', st)
+    check('HF-001 force-bypass journal 恰 1 条', fb == 1, str(fb))
+    ch.close()
+    adv('x')
+    adv('z')
+    ch = sqlite3.connect(hfdb)
+    st = dict(ch.execute("SELECT node_id,state FROM nodes").fetchall())
+    check('HF-001 deps 满足后正常放行(x/z=done)', st['x'] == 'done' and st['z'] == 'done', str(st))
+    ch.close()
     # 9. 未知动词编译拒绝
     bad = os.path.join(tmp, 'bad.yml')
     open(bad, 'w').write('id: bad\nnodes:\n  x: {verb: fly}\n')
@@ -477,6 +527,8 @@ def main():
     a.add_argument('flow'); a.add_argument('node')
     a.add_argument('--result', required=True, choices=['done', 'failed', 'redirected'])
     a.add_argument('--note'); a.add_argument('--payload')
+    a.add_argument('--force', action='store_true',
+                   help='HF-001: 旁路入向 deps 门禁(journal force-bypass 事件)')
     s = sub.add_parser('selftest')
     args = p.parse_args()
     {'compile': lambda: compile_flow(args.flow_yml),
