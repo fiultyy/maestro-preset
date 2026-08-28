@@ -144,26 +144,36 @@ async function main() {
   const via = [...viaSegments, 'session-send-v3'].join(',') // 自身 id 恒追加链尾
   const env = lib.createEnvelope({ from: frm, to, type: typ, ref, body, msgid: finalMsgid, ts, via, ttl: 5 })
   const line = lib.serializeLine(env)
-  const wire = {
-    type: 'client-request',
-    rpcId: lib.forgeMsgid(),
-    method: 'session.prompt',
-    payload: {
-      sessionId: toSid,
-      mode: 'queue',
-      content: [{ type: 'text', text: line }],
-    },
-  }
-
-  let json
-  try {
-    const resp = await fetch(`http://127.0.0.1:${port}/api/session.prompt`, {
+  const post = (mode) => {
+    const wire = {
+      type: 'client-request',
+      rpcId: lib.forgeMsgid(),
+      method: 'session.prompt',
+      payload: {
+        sessionId: toSid,
+        mode,
+        content: [{ type: 'text', text: line }],
+      },
+    }
+    return fetch(`http://127.0.0.1:${port}/api/session.prompt`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(wire),
       signal: AbortSignal.timeout(30_000),
-    })
-    json = await resp.json()
+    }).then((resp) => resp.json())
+  }
+
+  // 编排消息默认 steer 打断:时效性第一,历史仍冻结进 session log(用户裁决 2026-08-29 01:18)
+  // steer-unavailable(idle/turn 边界)→ 回落 queue;idle 会话 queue 即开新 turn
+  let mode = 'steer'
+  let json
+  try {
+    json = await post(mode)
+    const first = json && json.result
+    if (first && !first.ok && first.error && first.error.code === 'steer-unavailable') {
+      mode = 'queue'
+      json = await post(mode)
+    }
   } catch (error) {
     process.stderr.write(`session-send: RPC error: ${JSON.stringify({ message: String(error && error.message || error) })}\n`)
     process.exit(1)
@@ -174,7 +184,7 @@ async function main() {
     process.exit(1)
   }
   const accepted = result.value && result.value.accepted === true ? 'True' : 'False'
-  process.stdout.write(`sent ${frm} -> ${to}(${toSid.slice(0, 14)}…) type=${typ} ref=${ref}: accepted=${accepted}\n`)
+  process.stdout.write(`sent ${frm} -> ${to}(${toSid.slice(0, 14)}…) type=${typ} ref=${ref}: mode=${mode} accepted=${accepted}\n`)
 }
 
 main().catch((error) => {

@@ -150,28 +150,38 @@ def main() -> None:
     if typ == 'steer':  # OF-002 控制面闸(仅 steer;其余类型零影响)
         steer_gate(frm, to, fleet, fleet_path, msgid, ts)
     _envelope, line = build_envelope(frm, to, typ, ref, body, msgid, ts)
-    payload = {
-        'sessionId': to_sid,
-        'mode': 'queue',
-        'content': [{'type': 'text', 'text': line}],
-    }
-    wire = {
-        'type': 'client-request',
-        'rpcId': str(uuid.uuid4()),
-        'method': 'session.prompt',
-        'payload': payload,
-    }
-    req = urllib.request.Request(
-        f'http://127.0.0.1:{port}/api/session.prompt',
-        data=json.dumps(wire, ensure_ascii=False).encode(),
-        headers={'content-type': 'application/json'},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())['result']
+
+    def _post(mode):
+        payload = {
+            'sessionId': to_sid,
+            'mode': mode,
+            'content': [{'type': 'text', 'text': line}],
+        }
+        wire = {
+            'type': 'client-request',
+            'rpcId': str(uuid.uuid4()),
+            'method': 'session.prompt',
+            'payload': payload,
+        }
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{port}/api/session.prompt',
+            data=json.dumps(wire, ensure_ascii=False).encode(),
+            headers={'content-type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())['result']
+
+    # 编排消息默认 steer 打断:时效性第一,历史仍冻结进 session log(用户裁决 2026-08-29 01:18)
+    # steer-unavailable(idle/turn 边界)→ 回落 queue;idle 会话 queue 即开新 turn
+    mode = 'steer'
+    result = _post(mode)
+    if not result.get('ok') and (result.get('error') or {}).get('code') == 'steer-unavailable':
+        mode = 'queue'
+        result = _post(mode)
     if not result.get('ok'):
         print('session-send: RPC error:', json.dumps(result.get('error'), ensure_ascii=False))
         sys.exit(1)
-    print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}: accepted={result['value']['accepted']}")
+    print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}: mode={mode} accepted={result['value']['accepted']}")
 
 
 # ---------- selftest(临时目录;纯函数断言;绝不发真实 prompt/HTTP) ----------

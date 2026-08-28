@@ -169,7 +169,7 @@ last-armer 兜底(单会话便利)。
 # 编排者自己: 起一个 worker 会话(code preset,登记为 dev1)
 session-spawn code dev1 "跑个回归" <workspaceId>
 
-# 编排者给 dev1 发任务(DSHMSG,queue 模式进 dev1 的回合)
+# 编排者给 dev1 发任务(DSHMSG,steer 打断优先;idle 回落 queue 开新回合)
 session-send orch1 dev1 task reg1 "在仓库 X 跑 cargo test 并回报"
 
 # dev1 干完,经桥回调编排者(在 dev1 会话里):
