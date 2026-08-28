@@ -1,16 +1,17 @@
 [Unit]
 Description=DSH maestro pm-host-service (read-side projector, PM-001 shell)
 Documentation=file://{{PKG_DIR}}/README.md
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory={{PKG_DIR}}
-ExecStart={{NODE}} {{ENTRY}}
+ExecStart={{EXEC}}
 Restart=on-failure
 RestartSec=2
-StartLimitIntervalSec=0
 Environment=MAESTRO_HOME={{MAESTRO_HOME}}
 Environment=PM_HOST_SERVICE_LOG_DIR={{LOG_DIR}}
+Environment=PM_HOST_SERVICE_LOCK={{LOCK}}
 SyslogIdentifier=pm-host-service
 
 [Install]
