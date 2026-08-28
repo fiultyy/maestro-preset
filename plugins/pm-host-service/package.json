@@ -1,0 +1,14 @@
+{
+  "name": "pm-host-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "maestro read-side projector shell + self-bootstrapping systemd user unit (PM-001; zero npm deps, node:* ESM only)",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "apply": "node -e \"import(process.argv[1]).then(m=>console.log(JSON.stringify(m.apply({}),null,2)))\" ./index.js"
+  }
+}
