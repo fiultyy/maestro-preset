@@ -18,9 +18,18 @@
 // child binds LOCK_EX to the shared open-file description, and the lock
 // lives as long as we keep the fd open — no wrapper process in the unit.
 // A lock loser exits 0 quietly (no restart storm).
-// Projection endpoints (op=tickets/fleet/trace/flow, PM-003..006) and the
-// full health/degraded meta endpoint (PM-009) land here later; the skeleton
-// ships the router frame + GET /health only.
+// PM-003 (ticket read projection, op=tickets): first pull via
+// `$MAESTRO_HOME/maestro/bin/ledger ticket list --json`, then serve from the
+// in-memory cache until the tickets.md signature (mtime_ns+size, BigInt
+// stat) changes — signature polling is the cheap change detector, the CLI
+// the only authority (ADR-002 read-side; this process NEVER opens a ledger
+// sqlite). Cursor $MAESTRO_HOME/maestro/state/tickets.cursor.json (0600,
+// temp+rename, skip-if-identical) persists the signature per ADR-007.2.
+// Degraded discipline: ledger gone (PATH removal simulation kills its
+// `env python3` shebang) or non-zero exit -> 200 + degraded:true + note,
+// serving stale cache when we have one, empty list when we don't — no 5xx.
+// Projection endpoints (op=fleet/trace/flow, PM-004..006) and the
+// full health/degraded meta endpoint (PM-009) land here later.
 //
 // Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
 // ledger/sqlite; writes go through maestro CLI (PM-008).
@@ -28,8 +37,9 @@ import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { dirname } from 'node:path'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -37,6 +47,10 @@ const LOG = `${LOG_DIR}/daemon.log`
 const PORT_FILE = `${ROOT}/maestro/pm.port`
 const TOKEN_FILE = `${ROOT}/maestro/pm.token`
 const LOCK_PATH = process.env.PM_HOST_SERVICE_LOCK ?? `${ROOT}/maestro/${SERVICE}.lock`
+const TICKETS_MD = process.env.PM_HOST_SERVICE_TICKETS_MD ?? `${ROOT}/maestro/tickets.md`
+const LEDGER_BIN = process.env.PM_HOST_SERVICE_LEDGER ?? `${ROOT}/maestro/bin/ledger`
+const STATE_DIR = process.env.PM_HOST_SERVICE_STATE_DIR ?? `${ROOT}/maestro/state`
+const CURSOR_FILE = `${STATE_DIR}/tickets.cursor.json`
 const TOKEN = process.env.PM_HOST_SERVICE_TOKEN ?? '' // ADR-005: default OFF
 
 mkdirSync(LOG_DIR, { recursive: true }) // idempotent (PM-001 side effect ③)
@@ -54,6 +68,7 @@ function writeFileIfChanged(file, data, mode = 0o600) {
   try { if (readFileSync(file, 'utf8') === data) return 'skip: identical' } catch {}
   const tmp = `${file}.tmp.${process.pid}`
   try {
+    mkdirSync(dirname(file), { recursive: true }) // fresh ROOT (e.g. empty MAESTRO_HOME) must not crash the daemon
     writeFileSync(tmp, data, { mode })
     renameSync(tmp, file) // same-directory rename = atomic replace
     return 'write: temp+rename'
@@ -72,7 +87,7 @@ const jsonDoc = (obj) => `${JSON.stringify(obj, null, 2)}\n`
 // double start or a racing restart never triggers a systemd restart storm).
 function acquireSingletonLock() {
   let fd
-  try { fd = openSync(LOCK_PATH, 'a+') } catch (e) { log(`lock open failed (${e?.message}) — proceeding unlocked`); return 'unavailable' }
+  try { mkdirSync(dirname(LOCK_PATH), { recursive: true }); fd = openSync(LOCK_PATH, 'a+') } catch (e) { log(`lock open failed (${e?.message}) — proceeding unlocked`); return 'unavailable' }
   const r = spawnSync('flock', ['-n', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] })
   if (r.error) { log(`flock unavailable (${r.error.message}) — proceeding unlocked`); return 'unavailable' }
   if (r.status !== 0) {
@@ -102,6 +117,55 @@ function publishTokenDoc() {
 }
 publishTokenDoc()
 
+// ---- PM-003: op=tickets (read-side projection, naturally idempotent) ----
+// In-memory cache is the serving plane; the ledger CLI is the pull plane;
+// the tickets.md signature (mtime_ns+size) is the change detector. No
+// wide-table cache (ADR-007.2: R1/R3 not triggered); the cursor file only
+// records the served signature (temp+rename, skip-if-identical).
+const tickets = { list: null, sig: null, pulledAt: null, cliSpawns: 0 }
+
+const mdSignature = () => {
+  try { const s = statSync(TICKETS_MD, { bigint: true }); return `${s.mtimeNs}:${s.size}` } catch { return 'missing' }
+}
+
+function pullLedgerTickets() {
+  tickets.cliSpawns++
+  const r = spawnSync(LEDGER_BIN, ['ticket', 'list', '--json'], { encoding: 'utf8', timeout: 8000 })
+  if (r.error) throw new Error(`spawn failed (PATH/shebang?): ${r.error.message}`)
+  if (r.status !== 0) throw new Error(`exit ${r.status}: ${(r.stderr || r.stdout || '').trim().slice(0, 160)}`)
+  const data = JSON.parse(r.stdout)
+  const list = Array.isArray(data) ? data : data?.tickets
+  if (!Array.isArray(list)) throw new Error('ledger output is not a ticket array')
+  return list
+}
+
+function serveTickets() {
+  const sig = mdSignature()
+  if (tickets.list !== null && tickets.sig === sig) { // replay: zero cli spawns, zero writes
+    return { op: 'tickets', count: tickets.list.length, tickets: tickets.list, cache: 'hit', degraded: false, note: '', signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
+  }
+  try {
+    const list = pullLedgerTickets()
+    tickets.list = list
+    tickets.sig = sig
+    tickets.pulledAt = new Date().toISOString()
+    mkdirSync(STATE_DIR, { recursive: true })
+    const cursorAction = writeFileIfChanged(CURSOR_FILE, jsonDoc({
+      signature: sig,
+      ticketCount: list.length,
+      pulledAt: tickets.pulledAt,
+      version: VERSION,
+    }))
+    log(`op=tickets pull ok count=${list.length} sig=${sig} cursor=${cursorAction}`)
+    return { op: 'tickets', count: list.length, tickets: list, cache: 'miss', degraded: false, note: '', signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt, cursor: cursorAction }
+  } catch (e) {
+    const have = tickets.list !== null
+    const note = `ledger unavailable: ${String(e?.message ?? e).slice(0, 220)}`
+    log(`op=tickets DEGRADED ${note} (serving ${have ? 'stale cache' : 'empty list'})`)
+    return { op: 'tickets', count: have ? tickets.list.length : 0, tickets: have ? tickets.list : [], cache: have ? 'stale' : 'empty', degraded: true, note, signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
+  }
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -122,7 +186,8 @@ const server = createServer((req, res) => {
       note: 'PM-002 skeleton; full health/degraded meta endpoint is PM-009',
     })
   }
-  finish(404, { error: 'not found', service: SERVICE, hint: 'op=tickets/fleet/trace/flow arrive with PM-003..006' })
+  if (req.url === '/op/tickets') return finish(200, serveTickets())
+  finish(404, { error: 'not found', service: SERVICE, hint: 'op=fleet/trace/flow arrive with PM-004..006' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -135,7 +200,7 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health'],
+    endpoints: ['GET /health', 'GET /op/tickets'],
     note: '幂等键=本文件路径; temp+rename 0600; PM-002 骨架',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
