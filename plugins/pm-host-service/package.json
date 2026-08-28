@@ -1,6 +1,6 @@
 {
   "name": "pm-host-service",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "maestro read-side projector shell + self-bootstrapping systemd user unit (PM-001; zero npm deps, node:* ESM only)",

@@ -29,8 +29,9 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 | ② token 说明 | `pm.token` 说明文件（非凭据），0600 | 内容一致 → 跳过写；ADR-005 公网豁免：鉴权为可选占位，默认关闭（仅 `PM_HOST_SERVICE_TOKEN` 非空时启用 Bearer 校验） |
 | ③ 单实例 | daemon 内持有 `flock(2)` 锁 `$MAESTRO_HOME/maestro/pm-host-service.lock` | node 打开锁文件, 短命 `flock -n <fd>` 子进程把 LOCK_EX 绑到共享 open-file-description, fd 不关锁不失; 抢锁失败的实例干净退出 0(不触发 Restart 风暴), 锁随进程死亡自动释放。锁在 daemon 内的原因: flock(1) 包裹 ExecStart 会成为 MainPID, 其信号死亡被 Restart=on-failure 豁免, kill 门拉回失效 |
 | ④ 票面读 | `GET /op/tickets`: 首拉 `$MAESTRO_HOME/maestro/bin/ledger ticket list --json`, 之后按 `tickets.md` 签名(mtime_ns+size, BigInt stat)轮询增量 | 只读天然幂等: 签名未变 → 内存缓存直出(零 CLI 调用、零写盘); 签名变 → 重拉+游标更新。游标 `state/tickets.cursor.json`(0600, temp+rename, 内容一致跳过)。**降级纪律**: ledger 停走(PATH 移除模拟杀 `env python3` shebang)或非零退出 → 仍 200 + `degraded:true` + note(有缓存给 stale, 无缓存给空态), 绝不 5xx。本进程从不打开 ledger sqlite(ADR-002 只读红线) |
+| ⑤ 席位读 | `GET /op/fleet`: `fleet.json` 直读(`bin/fleet-list` CLI 为 fallback 权威) + dsh loopback `POST /api/session.list`(client-request 帧, `DSH_PORT` 缺省 3080, 8s abort) join | **无写盘**(内存 join 实时计算, ADR-007.2: 零状态)。join 仅取身份+存活字段(running/blank/preset/cwd/title), 刻意排除 updatedAt/token 等易变指标 → 同上游重放逐字节一致(sha 相同); 席位按 code 排序。**降级纪律**: dsh 不可达/超时 → 200 + 纯 fleet 视图 + `degraded:true` + note; fleet 源全灭 → 200 + 空态 + note |
 
-骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；非 GET → 405（只读红线）；其余 → 404（PM-004..006 端点占位）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；非 GET → 405（只读红线）；其余 → 404（PM-005..006 端点占位）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
 
 ## unit 要点
 
@@ -62,6 +63,8 @@ node -e "…" "$PWD/index.js"                                          # 门3: �
 PM-002（spec §PM-002）：重启进程后 `pm.port` 更新且旧端口失效（curl 旧端口 refused / 新端口 200）；并发两次裸启动仅单实例存活（撞 systemd 真锁双退 0；互抢临时锁恰好一活）；PM-001 三门回归绿。
 
 PM-003（spec §PM-003）：op=tickets 重放（签名未变）零 CLI 调用零写盘、负载逐字节一致；touch tickets.md（签名变）→ 重拉+游标更新；ledger 停走（PATH 移除模拟）→ 200 + `degraded:true` + note + 空态，不 5xx；回归：PM-001 三门 + PM-002 重启漂移/flock 全绿。
+
+PM-004（spec §PM-004）：op=fleet join 活跃（sessionJoined:true）；幂等重放 sha 一致；dsh API 指向不存在端口 → 200 + 纯 fleet 视图 + `degraded:true` + note；回归：PM-001 三门 + PM-002 flock/端口漂移 + PM-003 三门全绿。
 
 ## 边界
 

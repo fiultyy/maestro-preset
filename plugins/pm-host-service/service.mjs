@@ -30,6 +30,14 @@
 // serving stale cache when we have one, empty list when we don't — no 5xx.
 // Projection endpoints (op=fleet/trace/flow, PM-004..006) and the
 // full health/degraded meta endpoint (PM-009) land here later.
+// PM-004 (seat read projection, op=fleet): in-memory join, ZERO disk writes
+// (ADR-007.2: no state at all — real-time compute). fleet.json direct read
+// (bin/fleet-list CLI as fallback authority) joined over the dsh loopback
+// RPC /api/session.list (POST client-request frame, DSH_PORT default 3080,
+// 8s abort). The joined fields are identity+liveness only (running/blank/
+// preset/cwd/title) — deliberately NO updatedAt/tokens, so the payload is
+// deterministic for same-upstream replays. dsh unreachable/timeout ->
+// 200 + pure fleet view + degraded:true + note, never 5xx.
 //
 // Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
 // ledger/sqlite; writes go through maestro CLI (PM-008).
@@ -39,7 +47,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSyn
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -51,6 +59,9 @@ const TICKETS_MD = process.env.PM_HOST_SERVICE_TICKETS_MD ?? `${ROOT}/maestro/ti
 const LEDGER_BIN = process.env.PM_HOST_SERVICE_LEDGER ?? `${ROOT}/maestro/bin/ledger`
 const STATE_DIR = process.env.PM_HOST_SERVICE_STATE_DIR ?? `${ROOT}/maestro/state`
 const CURSOR_FILE = `${STATE_DIR}/tickets.cursor.json`
+const FLEET_FILE = process.env.MAESTRO_FLEET ?? `${ROOT}/maestro/fleet.json`
+const FLEET_LIST_BIN = process.env.PM_HOST_SERVICE_FLEET_LIST ?? `${ROOT}/maestro/bin/fleet-list`
+const DSH_PORT = process.env.DSH_PORT ?? '3080'
 const TOKEN = process.env.PM_HOST_SERVICE_TOKEN ?? '' // ADR-005: default OFF
 
 mkdirSync(LOG_DIR, { recursive: true }) // idempotent (PM-001 side effect ③)
@@ -166,6 +177,81 @@ function serveTickets() {
   }
 }
 
+// ---- PM-004: op=fleet (seat read projection; in-memory join, no writes) ----
+const SEAT_KEYS = ['sessionId', 'role', 'node', 'preset', 'spawnedAt', 'status']
+const normSeat = (code, s) => {
+  const seat = { code }
+  for (const k of SEAT_KEYS) seat[k] = s?.[k] ?? null
+  return seat
+}
+
+function readSeats() { // fleet.json direct; bin/fleet-list CLI as fallback authority
+  try {
+    const map = JSON.parse(readFileSync(FLEET_FILE, 'utf8'))?.fleet
+    if (!map || typeof map !== 'object') throw new Error('fleet.json has no fleet map')
+    const seats = Object.entries(map).map(([code, s]) => normSeat(code, s))
+    if (!seats.length) throw new Error('fleet.json fleet map is empty')
+    return seats
+  } catch (e1) {
+    const r = spawnSync(FLEET_LIST_BIN, [], { encoding: 'utf8', timeout: 8000 })
+    if (r.error || r.status !== 0) throw new Error(`fleet.json unreadable (${String(e1?.message ?? e1).slice(0, 100)}) and fleet-list fallback failed`)
+    const list = JSON.parse(r.stdout)
+    if (!Array.isArray(list) || !list.length) throw new Error('fleet-list fallback returned no seats')
+    return list.map((s) => normSeat(s.code, s))
+  }
+}
+
+let joinSeq = 0
+async function joinSessions(seats) { // dsh loopback RPC; 8s abort -> caller degrades
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 8000)
+  try {
+    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-fleet-${++joinSeq}`, method: 'session.list', payload: {} }),
+      signal: ctl.signal,
+    })
+    if (!res.ok) throw new Error(`http ${res.status}`)
+    const data = await res.json()
+    if (data?.result?.ok !== true) throw new Error(`rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 120)}`)
+    const byId = new Map((data.result.value?.items ?? []).map((s) => [s.sessionId, s]))
+    return seats.map((seat) => {
+      const s = byId.get(seat.sessionId)
+      // identity+liveness only: volatile metrics (updatedAt/tokens) stay out so
+      // same-upstream replays are byte-identical
+      const session = s ? {
+        running: !!s.running,
+        blank: !!s.blank,
+        agentPreset: s.agentPreset ?? null,
+        cwd: s.cwd ?? null,
+        title: s.projections?.values?.title ?? null,
+      } : null
+      return { ...seat, session }
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function serveFleet() {
+  let seats
+  try {
+    seats = readSeats()
+  } catch (e) {
+    return { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `fleet sources unavailable: ${String(e?.message ?? e).slice(0, 160)}` }
+  }
+  seats.sort((a, b) => (a.code < b.code ? -1 : 1)) // deterministic order
+  try {
+    seats = await joinSessions(seats)
+    return { op: 'fleet', count: seats.length, seats, degraded: false, sessionJoined: true, note: '' }
+  } catch (e) {
+    const note = `dsh session.list unreachable (127.0.0.1:${DSH_PORT}): ${String(e?.message ?? e).slice(0, 140)} — pure fleet view`
+    log(`op=fleet DEGRADED ${note}`)
+    return { op: 'fleet', count: seats.length, seats, degraded: true, sessionJoined: false, note }
+  }
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -187,7 +273,11 @@ const server = createServer((req, res) => {
     })
   }
   if (req.url === '/op/tickets') return finish(200, serveTickets())
-  finish(404, { error: 'not found', service: SERVICE, hint: 'op=fleet/trace/flow arrive with PM-004..006' })
+  if (req.url === '/op/fleet') {
+    serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
+    return
+  }
+  finish(404, { error: 'not found', service: SERVICE, hint: 'op=trace/flow arrive with PM-005..006' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -200,7 +290,7 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets'],
+    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet'],
     note: '幂等键=本文件路径; temp+rename 0600; PM-002 骨架',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
