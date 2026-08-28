@@ -59,6 +59,24 @@
 // never 5xx. Note on lock simulation: the dbs are WAL, where writer locks
 // do NOT block readers; unreadability (chmod 000) is the equivalent
 // unavailable-simulation that exercises the same open-failure path.
+// PM-007 (event fanout, GET /subscribe?consumer=<sessionId>&kinds=<csv>):
+// per-consumer SSE stream. Idempotency keys: subscription = (consumer,
+// kinds); event = (source, msgid) dedup. Side effects: fs.watch on the
+// three data planes (maestro dir filtered to ledger.db / ledger.db-wal /
+// fleet.json; flows/ recursive) -> signature projection -> push, PLUS a 2s
+// reconcile poll as the second channel (inotify is best-effort) — the two
+// channels double-report every change on purpose, and the deterministic
+// msgid `<kind>:<base>:<mtime_ns>:<size>` + 60s dedup window turn that into
+// exactly-once delivery. On subscribe: snapshot replay FIRST (ring buffer
+// capped at 50, kinds-filtered, resuming after the consumer's persisted
+// cursor when that cursor is from this boot — seq is only comparable within
+// one boot, so a cross-boot cursor replays the whole ring), then live
+// increments. Storage per ADR-007.2 (files by default): per-consumer cursor
+// JSON + shared dedup-window JSON under state/subscribers/ (temp+rename,
+// skip-if-identical; dedup window 60s, >1000 entries -> keep-newest-half
+// GC). Stream termination sends a pm_sub_ended frame when the SERVER ends
+// the stream (same-consumer replacement); a client disconnect just cleans
+// up — the persisted cursor makes the resubscribe seamless.
 //
 // Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
 // ledger/sqlite; writes go through maestro CLI (PM-008).
@@ -66,11 +84,11 @@ import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
-import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.6.0'
+const VERSION = '0.7.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -461,6 +479,166 @@ function serveFlow() {
   }
 }
 
+// ---- PM-007: GET /subscribe (SSE event fanout) ----
+// Namespaced component storage (state/dedup + state/watch already belong to
+// other components — watchd etc. — so everything PM-007 owns lives under
+// state/subscribers/).
+const SUB_DIR = `${STATE_DIR}/subscribers`
+const DEDUP_FILE = `${SUB_DIR}/dedup.json`
+const DEDUP_WINDOW_MS = 60_000 // (source,msgid) dedup window
+const DEDUP_MAX = 1000 // >1000 rows -> keep-newest-half GC
+const RING_CAP = 50 // 订阅时快照回放上限
+const RECONCILE_MS = 2_000 // second change-detection channel (inotify is best-effort)
+const PING_MS = 15_000 // SSE comment keepalive
+// Cursor epoch: ring seq is only comparable within one daemon boot, so the
+// cursor records which boot wrote it — a cross-boot cursor replays the full
+// ring instead of comparing against a reset seq counter (no loss, no dup).
+const BOOT_ID = `${startedMs.toString(36)}-${process.pid.toString(36)}`
+
+const seen = new Map() // watch key -> last signature (armed BEFORE any emit)
+const dedup = new Map() // msgid -> acceptedAt(ms), survives restart via DEDUP_FILE
+const eventRing = [] // { t, seq, msgid, source, kind, path }
+let eventSeq = 0
+const subscribers = new Map() // consumer -> { consumer, res, kinds, lastSeq, lastMsgid, file }
+
+const safeName = (s) => s.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 128)
+const fileSig = (p) => { try { const s = statSync(p, { bigint: true }); return `${s.mtimeNs}:${s.size}` } catch { return 'missing' } }
+const ledgerSig = () => `${fileSig(`${ROOT}/maestro/ledger.db`)}|${fileSig(`${ROOT}/maestro/ledger.db-wal`)}`
+const flowDbs = () => { try { return readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort() } catch { return [] } }
+const flowSig = (name) => `${fileSig(`${FLOWS_ROOT}/${name}/state.db`)}|${fileSig(`${FLOWS_ROOT}/${name}/state.db-wal`)}` // WAL: state.db mtime alone can lag writes
+
+function persistDedup() {
+  try { mkdirSync(SUB_DIR, { recursive: true }); writeFileIfChanged(DEDUP_FILE, jsonDoc({ window_ms: DEDUP_WINDOW_MS, cap: DEDUP_MAX, entries: Object.fromEntries(dedup) })) } catch {} // state file write failure never kills the fanout
+}
+
+// (source,msgid) dedup — THE exactly-once gate: fs.watch and the reconcile
+// poll both report the same change, inotify itself double-fires; identical
+// signatures produce identical msgids, and the second sighting dies here.
+function emitEvent(kind, source, msgid, path) {
+  const now = Date.now()
+  if (dedup.has(msgid)) return false
+  for (const [k, ts] of dedup) if (now - ts > DEDUP_WINDOW_MS) dedup.delete(k)
+  dedup.set(msgid, now)
+  if (dedup.size > DEDUP_MAX) {
+    const keep = Math.floor(DEDUP_MAX / 2)
+    const oldest = [...dedup.entries()].sort((a, b) => a[1] - b[1]).slice(0, dedup.size - keep)
+    for (const [k] of oldest) dedup.delete(k)
+  }
+  persistDedup()
+  const ev = { t: 'pm.event', seq: ++eventSeq, msgid, source, kind, path }
+  eventRing.push(ev)
+  if (eventRing.length > RING_CAP) eventRing.splice(0, eventRing.length - RING_CAP)
+  log(`event seq=${ev.seq} kind=${kind} subs=${subscribers.size} msgid=${msgid}`)
+  deliverEvent(ev, false)
+  return true
+}
+
+function writeCursor(sub) { // per-consumer resume point (temp+rename, skip-if-identical)
+  try {
+    mkdirSync(SUB_DIR, { recursive: true })
+    writeFileIfChanged(sub.file, jsonDoc({ consumer: sub.consumer, kinds: [...sub.kinds], lastSeq: sub.lastSeq, lastMsgid: sub.lastMsgid, bootId: BOOT_ID, updatedAt: new Date().toISOString() }))
+  } catch {}
+}
+
+function deliverEvent(ev, replay) {
+  for (const sub of subscribers.values()) {
+    if (sub.kinds.size && !sub.kinds.has(ev.kind)) continue
+    sub.res.write(`data: ${JSON.stringify({ ...ev, replay })}\n\n`)
+    sub.lastSeq = ev.seq
+    sub.lastMsgid = ev.msgid
+    writeCursor(sub)
+  }
+}
+
+// Signature projection over the three data planes. Emits only REAL changes:
+// missing files don't (their sigs stay stable), and the initial seed below
+// guarantees the boot state itself never emits.
+function pollOnce() {
+  const ls = ledgerSig()
+  if (ls !== seen.get('tickets')) { seen.set('tickets', ls); if (ls !== 'missing|missing') emitEvent('tickets', 'ledger', `tickets:ledger.db:${ls}`, 'maestro/ledger.db') }
+  const fsig = fileSig(FLEET_FILE)
+  if (fsig !== seen.get('fleet')) { seen.set('fleet', fsig); if (fsig !== 'missing') emitEvent('fleet', 'fleet', `fleet:fleet.json:${fsig}`, 'maestro/fleet.json') }
+  for (const name of flowDbs()) {
+    const key = `flow:${name}`
+    const sig = flowSig(name)
+    if (sig === seen.get(key)) continue
+    seen.set(key, sig)
+    if (!sig.startsWith('missing')) emitEvent('flow', 'flows', `flow:${name}:state.db:${sig}`, `flows/${name}/state.db`)
+  }
+}
+
+function handleSubscribe(req, res) {
+  const u = new URL(req.url, 'http://127.0.0.1')
+  const consumer = u.searchParams.get('consumer') || ''
+  if (!consumer) {
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'consumer query param required', hint: '/subscribe?consumer=<sessionId>&kinds=tickets,fleet,flow (empty kinds = all)' }))
+    return
+  }
+  const kinds = new Set((u.searchParams.get('kinds') || '').split(',').map((s) => s.trim()).filter(Boolean))
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' })
+  // Same consumer reconnecting: the subscription idempotency key is
+  // (consumer, kinds) — the NEW stream wins, the old one gets pm_sub_ended.
+  const prev = subscribers.get(consumer)
+  if (prev) {
+    try { prev.res.write(`data: ${JSON.stringify({ t: 'pm_sub_ended', consumer, reason: 'replaced' })}\n\n`); prev.res.end() } catch {}
+    subscribers.delete(consumer)
+  }
+  const sub = { consumer, res, kinds, lastSeq: 0, lastMsgid: null, file: `${SUB_DIR}/${safeName(consumer)}.json` }
+  subscribers.set(consumer, sub)
+  // Snapshot replay first: resume after the persisted cursor when it is from
+  // THIS boot; a cross-boot (or missing) cursor replays the whole ring —
+  // msgid dedup on the consumer side stays the no-dup authority either way.
+  let resumed = false
+  try {
+    const c = JSON.parse(readFileSync(sub.file, 'utf8'))
+    if (c.bootId === BOOT_ID && Number.isFinite(c.lastSeq)) { sub.lastSeq = c.lastSeq; sub.lastMsgid = c.lastMsgid ?? null; resumed = true }
+  } catch {}
+  let replayed = 0
+  for (const ev of eventRing) {
+    if (resumed && ev.seq <= sub.lastSeq) continue
+    if (kinds.size && !kinds.has(ev.kind)) continue
+    res.write(`data: ${JSON.stringify({ ...ev, replay: true })}\n\n`)
+    sub.lastSeq = ev.seq
+    sub.lastMsgid = ev.msgid
+    replayed++
+  }
+  writeCursor(sub)
+  log(`subscribe consumer=${consumer} kinds=${kinds.size ? [...kinds].join(',') : 'all'} replayed=${replayed} cursor=${resumed ? 'resume' : 'fresh'}`)
+  req.on('close', () => { if (subscribers.get(consumer) === sub) subscribers.delete(consumer) })
+}
+
+function armFanout() {
+  // Seed the seen-map with the CURRENT state so boot never emits; after this
+  // point any diff is a real change (incl. a brand-new flows/<id>/ dir).
+  seen.set('tickets', ledgerSig())
+  seen.set('fleet', fileSig(FLEET_FILE))
+  for (const name of flowDbs()) seen.set(`flow:${name}`, flowSig(name))
+  try { // restore the dedup window (60s survivors only)
+    const d = JSON.parse(readFileSync(DEDUP_FILE, 'utf8'))
+    if (d && typeof d.entries === 'object') {
+      const now = Date.now()
+      for (const [k, ts] of Object.entries(d.entries)) if (Number.isFinite(ts) && now - ts < DEDUP_WINDOW_MS) dedup.set(k, ts)
+    }
+  } catch {}
+  // Channel 1: fs.watch. The maestro-dir watcher is filename-filtered (my
+  // own writes — state/, logs/, pm.port — must not feed back); the flows
+  // watcher is recursive so state.db / state.db-wal hits both register.
+  for (const [target, opts, filter] of [
+    [`${ROOT}/maestro`, {}, (f) => f === 'ledger.db' || f === 'ledger.db-wal' || f === 'fleet.json'],
+    [FLOWS_ROOT, { recursive: true }, () => true],
+  ]) {
+    try {
+      const w = watch(target, opts, (ev, f) => { if (filter(f)) pollOnce() })
+      w.on('error', () => {}) // a dead watcher never kills the daemon; reconcile still covers it
+    } catch {} // target missing at arm: the reconcile poll picks it up once it exists
+  }
+  // Channel 2: reconcile poll — also the deterministic double-report path.
+  setInterval(pollOnce, RECONCILE_MS)
+  // SSE keepalive comments (ignored by every SSE parser, defeat idle proxies).
+  setInterval(() => { for (const sub of subscribers.values()) { try { sub.res.write(': ping\n\n') } catch {} } }, PING_MS)
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -491,11 +669,12 @@ const server = createServer((req, res) => {
     }
   }
   if (req.url === '/op/flow') return finish(200, serveFlow())
+  if (req.url === '/subscribe' || req.url.startsWith('/subscribe?')) return handleSubscribe(req, res)
   if (req.url === '/op/fleet') {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
   }
-  finish(404, { error: 'not found', service: SERVICE, hint: 'op=subscribe arrives with PM-007' })
+  finish(404, { error: 'not found', service: SERVICE, hint: 'writes go through maestro CLI (PM-008); health/degraded meta is PM-009' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -508,9 +687,10 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow'],
-    note: '幂等键=本文件路径; temp+rename 0600; PM-002 骨架',
+    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>'],
+    note: '幂等键=本文件路径; temp+rename 0600; PM-007 SSE 扇出已上线',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
+  armFanout() // PM-007: watchers + reconcile poll + SSE keepalive
 })
 setInterval(() => log(`heartbeat pid=${process.pid}`), 60_000) // keeps the loop alive

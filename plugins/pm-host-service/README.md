@@ -1,6 +1,6 @@
 # pm-host-service（P0 — PM-001 壳 + PM-002 HTTP 投影骨架）
 
-maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）。op=tickets/fleet/trace/flow、事件扇出、写透传由 PM-003..009 在同一包内续建。
+maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）；PM-003..007 已续建 op=tickets/fleet/trace/flow 读投影与 `/subscribe` SSE 事件扇出；写透传与 health 元端点由 PM-008/009 续建。
 
 ## 形态红线
 
@@ -32,8 +32,18 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 | ⑤ 席位读 | `GET /op/fleet`: `fleet.json` 直读(`bin/fleet-list` CLI 为 fallback 权威) + dsh loopback `POST /api/session.list`(client-request 帧, `DSH_PORT` 缺省 3080, 8s abort) join | **无写盘**(内存 join 实时计算, ADR-007.2: 零状态)。join 仅取身份+存活字段(running/blank/preset/cwd/title), 刻意排除 updatedAt/token 等易变指标 → 同上游重放逐字节一致(sha 相同); 席位按 code 排序。**降级纪律**: dsh 不可达/超时 → 200 + 纯 fleet 视图 + `degraded:true` + note; fleet 源全灭 → 200 + 空态 + note |
 | ⑥ 轨迹读 | `GET /op/trace?sessionId=…&type=&tool=&text=&seqFrom=&seqTo=`: `sessions/<bucket>/<sid>/session.jsonl.zstd` 直读(bucket 扫描 = session-purge findSessionDir 模式; 多帧 zstd 按 magic `28 B5 2F FD` 切分逐帧解压, node 只解首帧; 单槽内存解码缓存按 mtime_ns+size 失效) | **无写盘**(单槽内存缓存)。过滤: type 精确(逗号列表)/tool(`data.name`)/text(原始行子串, 大小写不敏感)/seq 区间(记录显式 `seq`)。**head.compact 折叠**(KG 14 §2.5, ADR-010 JS 语义等价): 过滤负载 >20000 字符 → 旧头部折叠为**单行确定性快照** `trace.compact`(计数/seq 区间/类型直方图/reason:"threshold", 零 LLM), 最近尾部原样保留 → sha 稳定重放。`folded` 语义 = **折叠已应用**: 判定量是实际下发负载的重序列化长度 `matched.payload_chars`(转义可使其高于原始字符和 `matched.chars`), 二者均已暴露。**降级纪律**: sessionId 缺失 400; 目录/文件不可读 → 200 + `degraded:true` + note; 断尾帧截断保留已解部分并标记 `logTruncated` |
 | ⑦ 流程读 | `GET /op/flow`: `flows/<id>/state.db` 逐库 `node:sqlite` **只读连接**(零 npm 依赖), 查 `v_status`/`v_rollup` 视图, `ORDER BY` 稳定输出 | **无写盘**(只读句柄, ADR-002 红线)。**按库降级**: 单库被锁/不可读只标记该 flow(`degraded:true`+note), 其余照常 200, 绝不 5xx; 全部库不可读 → `flowc inspect` CLI 轮询兜底(原样文本, 不解析表格式), 仍败 → 空态+note。锁模拟备注: 库为 WAL, 写者锁不挡读者(SQLite 语义), 不可读(chmod 000)是等价"不可用"模拟, 走同一打开失败路径 |
+| ⑧ 事件扇出 | `GET /subscribe?consumer=<sessionId>&kinds=<csv>` SSE 长连接: fs.watch 三数据面(`maestro/` 目录按文件名过滤 ledger.db / ledger.db-wal / fleet.json; `flows/` 递归) → 签名投影 → 推送; **双通道**第二通道 = 2s reconcile 轮询(inotify 尽力而为, 同时天然构成"同一变更双投递"实测路径) | 订阅幂等键 `(consumer, kinds)`: 同 consumer 再订阅 → 旧流收 `pm_sub_ended` 帧后终止, 新流接管(单 consumer 单活流)。事件幂等键 `(source, msgid)`, msgid 确定性 = `<kind>:<base>:<mtime_ns>:<size>` → 双通道同变更同 msgid, 60s 去重窗只放行一帧(恰好一次)。订阅先快照回放(环形缓冲 ≤50, kinds 过滤, 同 boot 游标后续发)再增量; 跨 boot 游标 → 全环回放(seq 只在单 boot 内可比)。**存储**(ADR-007.2 文件): `state/subscribers/<consumer>.json` 游标 + `state/subscribers/dedup.json` 去重窗(60s, >1000 行截半 GC, 重启恢复 60s 幸存者), 均 temp+rename 内容一致跳过。15s SSE 注释 ping(`: ping`)防代理空闲断连 |
 
-骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；非 GET → 405（只读红线）；其余 → 404（订阅属 PM-007）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；`GET /subscribe?consumer=<sessionId>&kinds=<csv>` → SSE 事件扇出（PM-007）；非 GET → 405（只读红线）；其余 → 404（写透传属 PM-008，health 元端点属 PM-009）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+
+## 网关对齐（PM-007 / GW-002 冻结假设对照）
+
+- 路径/查询：`GET /subscribe?consumer=<sessionId>&kinds=<csv>` —— 与冻结假设一致；`consumer` 缺失 → 400；`kinds` 省略/空 = 订阅全部（`tickets,fleet,flow`）；未知 kind 静默忽略。
+- 事件帧：`data: {"t":"pm.event","seq":N,"msgid":"…","source":"ledger|fleet|flows","kind":"tickets|fleet|flow","path":"…","replay":bool}` —— 服务器侧 msgid 保留；**增量帧额外带 `replay:false`、回放帧 `replay:true`**（加性字段，供网关区分快照/增量，不改变帧型）。
+- 快照先行：订阅建立即回放环形缓冲（≤50 条, kinds 过滤），随后增量。
+- 终止帧：服务器主动终结流时发 `{"t":"pm_sub_ended","consumer":…,"reason":"replaced"}`（同 consumer 重订阅顶替旧流）；客户端主动断开不发帧，仅清理——重连由持久游标兜底。
+- 保活：每 15s 一行 SSE 注释 `: ping`（任何 SSE 解析器均忽略）。
+- **已声偏差**：① 每 consumer 单活流——幂等键虽为 `(consumer,kinds)`，同 consumer 换 kinds 订阅同样顶替旧流而非并存；② 跨 daemon 重启 seq 归零——游标按 bootId 判代，跨 boot 一律全环回放（≤50），无重无漏由 msgid 去重兜底；③ 帧内无 wall-clock 字段（时间只在磁盘游标文件里），网关侧计时自行打点。
 
 ## unit 要点
 
@@ -71,6 +81,8 @@ PM-004（spec §PM-004）：op=fleet join 活跃（sessionJoined:true）；幂�
 PM-005（spec §PM-005）：合成大 session（>20k 字符）折叠生效（`trace.compact` 快照行 + 尾部保留，after ≤ 预算）；过滤参数重放 sha 一致；真实 session 直读折叠 + text 过滤重放；回归：PM-001..004 全部门绿。
 
 PM-006（spec §PM-006）：op=flow SQL 自走（只读并发连接交叉核对行数一致）；state.db 不可读 → 该库降级不 5xx、其余库照常；回归：PM-001..005 全部门绿。
+
+PM-007（spec §PM-007）：同一变更双投递（watch + reconcile 双通道同触一次 touch）→ 消费端恰一帧（按 msgid 计数=1）；断线重连（首连收 E1/E2 → 断线 → E3 落环 → 重连回放 E3 `replay:true` 不含 E1/E2 → 增量 E4 `replay:false`，四 msgid 全局各恰一帧 = 无重无漏）；同 consumer 二次订阅 → 旧流收 `pm_sub_ended`、新流不受扰；缺 `consumer` → 400；回归：PM-001..006 全部门绿。
 
 ## 边界
 
