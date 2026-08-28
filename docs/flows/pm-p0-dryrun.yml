@@ -1,0 +1,20 @@
+# d8-pm-p0-dryrun — P0 三波依赖 dry-run(flowc 第二实测;伪执行:轻动词验证 DAG/触发器/AND 门,不派发真 worker)
+# 真实票源: dsh-pm/docs/specs/ PM-001..009 · GW-001..002 · TK-001..004
+# 波结构: 服务波(壳→端口) → 读面波(四源并行→AND 门扇出) → 客户端波(gw 菱形→tk 三 tab 并行→收口)
+id: d8-pm-p0-dryrun
+entry: pm-001
+nodes:
+  pm-001: {verb: status, title: "服务波: 插件壳+自举 systemd(spec PM-001)"}
+  pm-002: {verb: status, deps: [pm-001], title: "服务波: HTTP 投影骨架+port 文件(spec PM-002)"}
+  pm-003: {verb: status, deps: [pm-002], title: "读面: 票面 API(spec PM-003)"}
+  pm-004: {verb: status, deps: [pm-002], title: "读面: 席位 API(spec PM-004)"}
+  pm-005: {verb: status, deps: [pm-002], title: "读面: 轨迹 API(spec PM-005)"}
+  pm-006: {verb: status, deps: [pm-002], title: "读面: 流程 API(spec PM-006)"}
+  pm-007: {verb: status, deps: [pm-003, pm-004, pm-005, pm-006], title: "读面: 事件扇出(spec PM-007;AND 门四依赖)"}
+  gw-001: {verb: status, deps: [pm-002], title: "网关: pm.req 透传(spec GW-001)"}
+  gw-002: {verb: status, deps: [pm-007], title: "网关: pm.event 回流(spec GW-002)"}
+  tk-001: {verb: status, deps: [gw-001, gw-002], title: "客户端: tk 协议接入(spec TK-001;菱形汇合)"}
+  tk-002: {verb: status, deps: [tk-001], title: "客户端: 票板 tab(spec TK-002)"}
+  tk-003: {verb: status, deps: [tk-001], title: "客户端: 席位舰 tab(spec TK-003)"}
+  tk-004: {verb: status, deps: [tk-001], title: "客户端: 轨迹 tab(spec TK-004)"}
+  rollup:  {verb: rollup, deps: [tk-002, tk-003, tk-004], title: "P0 全链汇总(G1 收口门)"}
