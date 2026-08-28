@@ -81,33 +81,40 @@ maestro/
 ├── preset.yml            # 名字/描述(官方 schema: name/description[/order],本包不设 order → 排在官方集之后)
 ├── agent.cordis.yml      # 组合文件: persona(编排纪律)+ 每插件一行的注册表(路径相对本目录、写到精确 .js)
 ├── plugins/              # 插件(每个 = 一个 ESM 入口,export inject + apply(ctx, config))
-│   ├── orca-callback/    #   文件桥泵 v3.6: fs.watch 桥 inbox → at-least-once 投递(多消费者寻址/去重/死信/轮转)
-│   ├── message-bridge/   #   HTTP 直发 v1.3: 127.0.0.1 随机端口 POST /callback(addr 精确路由 + 端口代际校验)
+│   ├── callback-bridge/  #   回调统一内核 v4(Sources→Codec→内核→Sink;文件桥 at-least-once + HTTP 直发双通道共享语义;含测试;已吸收早期 orca-callback/message-bridge)
 │   ├── host-callback-bridge/  # host lane: 宿主 boot 承载回调链路(受理即持久,sessionId 跨重启路由)
-│   ├── callback-bridge/  #   统一内核抽象(Sources→Codec→内核→Sink,双通道共享语义;含测试)
+│   ├── a2a-profile-server/    # 孵化池插件(独立守护 :8790;cordis polyfill lane,非 polyfill.patch.yml 注册)
+│   ├── persona-axis/     #   会话级人格轴(host half):人格与 preset 正交,A2A 池注入遮蔽,RPC=/persona-axis/rpc
+│   ├── _narrow-waist/    #   窄腰共享库桶导出(信封/dedup/词汇表单一物理源,零逻辑零副作用)
 │   ├── workspace-unarchive/  # 会话归档恢复(活体 registry 走 setState 同路径)
 │   └── session-purge/    #   按需删除会话(RPC 面无 session.delete,补全生命周期)
-├── skills/               # 技能(模型按需加载的操作手册)
-│   ├── orca-bridge/      #   建 pane 桥、watcher、回复署名约定(含可执行脚本)
-│   └── maestro-ledger/   #   账本读写手册(含脚本)
-├── bin/                  # CLI 脚本(14 个;dev-sync 镜像到 ~/.dsh/maestro/bin 作兜底)
-│   ├── session-send      #   跨会话消息直发(DSHMSG 信封 → /api/session.prompt)
-│   ├── session-spawn     #   起新会话并入 fleet(回显 4 位码)
-│   ├── session-purge     #   调 session-purge 插件的 purge 端口
-│   ├── cb-send           #   对端回调投递(ACK/DONE 握手;HTTP 优先,文件桥兜底;HTTP 200≠送达,见 USAGE §3.3)
-│   ├── fleet-probe       #   Orca 终端准入探测(termid 回报验证后才入编排列表)
-│   ├── fleet-touch       #   fleet 心跳 + 属主租约(claim/heartbeat/release/sweep)
-│   ├── flowc             #   编排编译器 v2(flow.yml → 状态机,十动词监督面)
+├── bin/                  # CLI 脚本(26 项;dev-sync 镜像到 ~/.dsh/maestro/bin 作兜底)
 │   ├── ledger            #   账本助手(node/event/review/status/ticket,替代手写 SQL)
 │   ├── dispatch-ticket   #   票派发一体化: 读票→组契约→terminal send→落账
-│   ├── event-watchd      #   回合外常驻事件守护(声明式四类看守面)
+│   ├── flowc             #   编排编译器 v2(flow.yml → 状态机,十动词监督面)
+│   ├── event-watchd      #   回合外常驻事件守护(声明式四类看守面;systemd: maestro-watchd.service)
 │   ├── wave-checkpoint   #   波次检查点机读 JSONL(原子追加)
-│   ├── msg-dedup         #   收方回合首动作去重(信封 v2,60s 窗口)
 │   ├── verify-report     #   审查助手: 重跑验证门 + 解析回报 → A/B/C 判定草稿
-│   └── dev-sync.sh       #   开发同步: 正向 / --reverse 回流 / --verify 漂移报告
+│   ├── session-send      #   跨会话消息直发(DSHMSG 信封 → /api/session.prompt;另有 v3 窄腰信封变体)
+│   ├── session-spawn     #   起新会话并入 fleet(回显 4 位码)
+│   ├── session-purge     #   调 session-purge 插件的 purge 端口
+│   ├── cb-send           #   对端回调投递(ACK/DONE 握手;HTTP 优先,文件桥兜底;HTTP 200≠送达,见 USAGE §3.3;另有 v2 变体)
+│   ├── msg-dedup         #   收方回合首动作去重(信封 v2,60s 窗口)
+│   ├── orca-send         #   DSH→Orca 窄腰 adapter(orchestration send Run mailbox 优先)
+│   ├── bridge-rearm      #   桥 registry 卫生一条命令(清死条目/重注册/验活)
+│   ├── fleet-probe       #   Orca 终端准入探测(termid 回报验证后才入编排列表)
+│   ├── fleet-touch       #   fleet 心跳 + 属主租约(claim/heartbeat/release/sweep)
+│   ├── fleet-list        #   列出 fleet.json 在册席位(读侧,零写入)
+│   ├── fleet-release     #   席位释放原语(摘条目+可选归档会话+清 liaison 绑定)
+│   ├── liaison-state     #   读网关 liaison 绑定状态(读侧,零写入)
+│   ├── session-archived  #   判定 sessionId/code 是否已在归档集(读侧,零写入)
+│   ├── worker-up         #   dais 编排面 worker 供给一体化(开 pane→绑定→起 harness→派任务)
+│   ├── dev-sync.sh       #   开发同步: 正向 / --reverse 回流 / --verify 漂移报告
+│   └── rebuild-host-packages.sh / release-check.sh / githooks  # 宿主包重建与发布检查
 ├── shared/               # 对端共享 skill(镜像到 ~/.agents/skills,供其他 harness 的 agent 发现)
-│   ├── maestro-bridge/   #   冷执行回调手册(身份自查/cb-send/消息语义/红线/排查)
-│   └── skills/dais-orchestration/  # dais 平面 v2 命令面 + 别名透明代理契约
+│   ├── maestro-orch/     #   编排者总入口(三平面契约模板/回调语义/红线;Orca 桥 pane 手册在此)
+│   ├── cb-send/          #   worker 侧回调手册(一条命令回报;触发词冷发现)
+│   └── dais-orchestration/  # dais 平面 v2 命令面 + 别名透明代理契约
 ├── tests/                # 自测(cb-send 降级链 + OF-001..010 加固波自测)
 ├── docs/                 # 设计文档(DESIGN / callback-bridge 抽象 / orch-loop / fleet 约定 / PACKAGING)
 ├── host/                 # 独立分发面①: 装点自研插件(host/install.sh 统一安装,dev-sync 不碰)
@@ -127,6 +134,7 @@ maestro/
 | `~/.dsh/maestro/fleet.json` | 会话 fleet 码表(session-send/spawn 读写) |
 | `~/.dsh/maestro/ledger.db` | SQLite 账本 |
 | `~/.dsh/maestro/bin/` | bin/ 镜像(cb-send 兜底安装点,dev-sync 维护)+ 换代交接简报 `handoff-*.md` |
+| `~/.dsh/maestro/flows/` | flowc v2 编译产物(state.db 状态机 + triggers.sql + nodes/),每流程一目录 |
 
 ## 环境变量
 
@@ -145,7 +153,7 @@ maestro/
 ## 快速开始(装完后第一个会话)
 
 1. 会话开场注册回调身份——host-lane 部署(USAGE §3.4)**不在会话内 arm**,`POST /register {"sessionId","alias"}` 到 `bridge/http.port` 所记端口(host lane 持有 HTTP 通道);裸 preset 部署单次 `bridge_arm {alias}`(file 桥;`bridge_http_status` 为 deprecated 别名)。回执给出规范签名 `<alias>@<sessionId>`
-2. 按 `shared/orca-bridge/SKILL.md` 建 Orca 桥 pane(一次性)
+2. 按 `shared/maestro-orch/SKILL.md` 建 Orca 桥 pane(一次性)
 3. Orca 终端入编: `MAESTRO_ORCH_SIGNATURE=<签名> bin/fleet-probe <termid>`,回报匹配入 `verified` 后才可派发(见 USAGE §5)
 4. 之后外部 agent 的回调经桥自动驱动本会话回合;对外发消息用 `bin/session-send`
 
