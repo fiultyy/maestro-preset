@@ -1,0 +1,37 @@
+# pm-p0 — P0 生产流程(d8 dry-run 全绿后的真执行版)
+# 票源: dsh-pm/docs/specs/ PM-001..009 · GW-001..002 · TK-001..004(P0 范围=PM-001..007 + GW + TK;PM-008/009 属 P1)
+# 每票拆 dispatch(-d 真派发 worker-up)/callback(-c 验证门≥2绿+幂等复验后收口)对;依赖改挂上游 -c 节点
+# 承载: PM-005/PM-007 大票 long-task 纵深(prompt 嵌 continuable 纪律);其余标准 omp-dais
+# 跨仓: PM 实现=maestro-preset plugins/pm-host-service;GW/TK 实现=pipecat-poc(rt_gateway.py 扩展)
+# 门: G1=pm 服务波+读面收口后回报验收;G2=tk 三 tab 派发前人判协议冻结(硬门);G3=异常 cb-send ask
+# 已知缺口(用户裁决不修): advance 无入向 deps 门禁 → 手动拓扑序推进,每节点收口前幂等复验
+id: pm-p0
+entry: pm-001-d
+nodes:
+  pm-001-d: {verb: dispatch, title: "服务波: 插件壳+自举 systemd(PM-001)", payload: {ticket: PM-001, repo: maestro-preset}}
+  pm-001-c: {verb: callback, deps: [pm-001-d], title: "PM-001 验证门×2: is-active 绿; kill→Restart≤10s; 重复 apply 零变更"}
+  pm-002-d: {verb: dispatch, deps: [pm-001-c], title: "服务波: HTTP 投影骨架+port 文件(PM-002)", payload: {ticket: PM-002, repo: maestro-preset}}
+  pm-002-c: {verb: callback, deps: [pm-002-d], title: "PM-002 验证门×2: 重启端口文件更新旧端口失效; flock 单实例"}
+  pm-003-d: {verb: dispatch, deps: [pm-002-c], title: "读面: 票面 API op=tickets(PM-003)", payload: {ticket: PM-003, repo: maestro-preset}}
+  pm-003-c: {verb: callback, deps: [pm-003-d], title: "PM-003 验证门×2: ledger 停走→降级空态不 5xx; 缓存签名重放零重复"}
+  pm-004-d: {verb: dispatch, deps: [pm-002-c], title: "读面: 席位 API op=fleet(PM-004)", payload: {ticket: PM-004, repo: maestro-preset}}
+  pm-004-c: {verb: callback, deps: [pm-004-d], title: "PM-004 验证门×2: dsh API 死→纯 fleet 视图 degraded:true; 重放同输出"}
+  pm-005-d: {verb: dispatch, deps: [pm-002-c], title: "读面: 轨迹 API op=trace(PM-005;long-task 纵深)", payload: {ticket: PM-005, repo: maestro-preset, preset: long-task}}
+  pm-005-c: {verb: callback, deps: [pm-005-d], title: "PM-005 验证门×2: >20k 字符 head.compact 折叠; 过滤参数重放同输出"}
+  pm-006-d: {verb: dispatch, deps: [pm-002-c], title: "读面: 流程 API op=flow(PM-006)", payload: {ticket: PM-006, repo: maestro-preset}}
+  pm-006-c: {verb: callback, deps: [pm-006-d], title: "PM-006 验证门×2: 编排者不在场 SQL 照常读; state.db 锁→降级"}
+  pm-007-d: {verb: dispatch, deps: [pm-003-c, pm-004-c, pm-005-c, pm-006-c], title: "读面: 事件扇出 op=subscribe(PM-007;AND 门四依赖;long-task 纵深)", payload: {ticket: PM-007, repo: maestro-preset, preset: long-task}}
+  pm-007-c: {verb: callback, deps: [pm-007-d], title: "PM-007 验证门×2: 双投递恰一效果; 断线重连快照+增量无缝"}
+  gw-001-d: {verb: dispatch, deps: [pm-002-c], title: "网关: pm.req 透传+id 去重(GW-001)", payload: {ticket: GW-001, repo: pipecat-poc}}
+  gw-001-c: {verb: callback, deps: [gw-001-d], title: "GW-001 验证门×2: pm-host 死→error 帧不断连; 同 id 去重"}
+  gw-002-d: {verb: dispatch, deps: [pm-007-c], title: "网关: pm.event 订阅回流(GW-002)", payload: {ticket: GW-002, repo: pipecat-poc}}
+  gw-002-c: {verb: callback, deps: [gw-002-d], title: "GW-002 验证门×2: 订阅建立/取消干净; 事件转发不丢序"}
+  tk-001-d: {verb: dispatch, deps: [gw-001-c, gw-002-c], title: "客户端: tk 协议接入+断线重订阅(TK-001;菱形汇合;G2 人判后放行)", payload: {ticket: TK-001, repo: pipecat-poc}}
+  tk-001-c: {verb: callback, deps: [tk-001-d], title: "TK-001 验证门×2: 网关重启→重订阅恢复; 降级横幅"}
+  tk-002-d: {verb: dispatch, deps: [tk-001-c], title: "客户端: 票板 tab ≤1s 事件更新(TK-002)", payload: {ticket: TK-002, repo: pipecat-poc}}
+  tk-002-c: {verb: callback, deps: [tk-002-d], title: "TK-002 验证门×2: 事件更新≤1s; 空态渲染"}
+  tk-003-d: {verb: dispatch, deps: [tk-001-c], title: "客户端: 席位舰 tab(TK-003)", payload: {ticket: TK-003, repo: pipecat-poc}}
+  tk-003-c: {verb: callback, deps: [tk-003-d], title: "TK-003 验证门×2: 席位快照+增量一致; 降级标记透出"}
+  tk-004-d: {verb: dispatch, deps: [tk-001-c], title: "客户端: 轨迹 tab 20k 字符流畅(TK-004)", payload: {ticket: TK-004, repo: pipecat-poc}}
+  tk-004-c: {verb: callback, deps: [tk-004-d], title: "TK-004 验证门×2: 20k 字符滚动流畅; 折叠摘要行可展开"}
+  rollup: {verb: rollup, deps: [tk-002-c, tk-003-c, tk-004-c], title: "P0 全链汇总(G1 终态收口)"}

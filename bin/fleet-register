@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""fleet-register — dais pane worker 席位登记: fleet.json 出生/补登记(2026-08-29 席位舰裁决)
+
+裁决背景: PM 席位视图以 fleet.json 为唯一事实源——agent session 可幂等重发,
+run/pane 视图不可重放(会双重计数)。dais worker(pane+harness)不经 session-spawn
+出生,故派发后由编排者本工具补登记,确保席位舰与实际 worker 一致。
+
+用法:
+  fleet-register <code> --session <pane_session> --node <票ref> --preset <harness> [--status active]
+  fleet-register --selftest          # temp 副本自测,不动真实 fleet.json
+
+机制:
+  - 条目 schema 与 session-spawn 出生登记完全一致(sessionId/role/node/preset/
+    spawnedAt/status),键 = 4 位短码;同键重复登记 = 覆盖写(幂等重发,不双计)
+  - 锁范本同 fleet-touch/session-spawn: LOCK_EX flock($MAESTRO_STATE/<basename>.lock)
+    包住 读-改-写(temp+os.replace);并发双写不丢失
+  - 实现直接 import session-spawn 的 register_fleet_entry/default_fleet_path/now_iso,
+    单一登记原语,不另立 schema
+
+环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json) · MAESTRO_STATE(锁文件落此)
+退出码: 0 = 成功(含幂等重登) · 2 = 用法错 · 3 = fleet.json 缺失/损坏
+"""
+
+import argparse
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import json
+import os
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_spawn_module():
+    path = os.path.join(HERE, 'session-spawn')
+    loader = SourceFileLoader('session_spawn', path)
+    spec = importlib.util.spec_from_loader('session_spawn', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def selftest(spawn) -> int:
+    with tempfile.TemporaryDirectory() as td:
+        fleet = os.path.join(td, 'fleet.json')
+        with open(fleet, 'w') as fh:
+            json.dump({'port': '3080', 'fleet': {}}, fh)
+        os.environ['MAESTRO_STATE'] = td
+        entry = {'sessionId': 'session_x', 'role': 'worker', 'node': 't-1',
+                 'preset': 'omp-dais', 'spawnedAt': spawn.now_iso(), 'status': 'active'}
+        spawn.register_fleet_entry(fleet, 'aa01', entry)
+        spawn.register_fleet_entry(fleet, 'aa01', dict(entry, status='active'))  # 幂等重发
+        data = json.load(open(fleet))
+        assert len(data['fleet']) == 1, '幂等重发不得新增条目'
+        assert data['fleet']['aa01']['sessionId'] == 'session_x'
+        print('fleet-register: selftest ok(登记+幂等重发 1 条目)')
+        return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('code', nargs='?', help='席位短码(如 ctx 前 4 位 hex)')
+    ap.add_argument('--session', help='pane session handle(session_…)')
+    ap.add_argument('--node', help='票 ref(如 pm-001)')
+    ap.add_argument('--preset', help='harness(如 omp-dais)')
+    ap.add_argument('--status', default='active')
+    ap.add_argument('--selftest', action='store_true')
+    args = ap.parse_args()
+
+    spawn = load_spawn_module()
+    if args.selftest:
+        return selftest(spawn)
+    if not (args.code and args.session and args.node and args.preset):
+        print('用法: fleet-register <code> --session <pane> --node <ref> --preset <harness>',
+              file=sys.stderr)
+        return 2
+    entry = {'sessionId': args.session, 'role': 'worker', 'node': args.node,
+             'preset': args.preset, 'spawnedAt': spawn.now_iso(), 'status': args.status}
+    spawn.register_fleet_entry(spawn.default_fleet_path(), args.code, entry)
+    print(f'fleet-register: {args.code} -> {args.session} node={args.node} preset={args.preset}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
