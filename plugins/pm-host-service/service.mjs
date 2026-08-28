@@ -38,16 +38,30 @@
 // preset/cwd/title) — deliberately NO updatedAt/tokens, so the payload is
 // deterministic for same-upstream replays. dsh unreachable/timeout ->
 // 200 + pure fleet view + degraded:true + note, never 5xx.
+// PM-005 (trace read projection, op=trace): direct read of the session
+// event log ~/.dsh/sessions/<bucket>/<sid>/session.jsonl.zstd (bucket scan
+// = session-purge findSessionDir pattern; NO disk writes, one in-memory
+// decode cache keyed by file mtime_ns+size). The log is APPENDED as
+// separate zstd frames — node's decoder stops at the first frame, so we
+// split on the frame magic 28 B5 2F FD and inflate frame-by-frame.
+// Filters: type (exact, comma list) / tool (data.name) / text (raw-line
+// substring, case-insensitive) / seqFrom..seqTo (record.seq). Fold:
+// head.compact semantic-equivalent (KG 14 §2.5 via ADR-010) — when the
+// filtered payload exceeds 20k chars the OLDER entries collapse into ONE
+// deterministic single-line snapshot (type trace.compact: counts, seq
+// range, type histogram, reason:"threshold") and the most recent tail
+// stays verbatim; zero LLM, content-derived only -> sha-stable replays.
 //
 // Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
 // ledger/sqlite; writes go through maestro CLI (PM-008).
 import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { zstdDecompressSync } from 'node:zlib'
+import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -62,6 +76,10 @@ const CURSOR_FILE = `${STATE_DIR}/tickets.cursor.json`
 const FLEET_FILE = process.env.MAESTRO_FLEET ?? `${ROOT}/maestro/fleet.json`
 const FLEET_LIST_BIN = process.env.PM_HOST_SERVICE_FLEET_LIST ?? `${ROOT}/maestro/bin/fleet-list`
 const DSH_PORT = process.env.DSH_PORT ?? '3080'
+const SESSIONS_ROOT = process.env.DSH_SESSIONS_ROOT ?? `${ROOT}/sessions`
+const TRACE_BUDGET_CHARS = 20_000 // head.compact threshold (KG 14 §2.5 default)
+const TRACE_KEEP_MAX_ENTRIES = 500
+const TRACE_FILE_MAX_BYTES = 64 * 1024 * 1024
 const TOKEN = process.env.PM_HOST_SERVICE_TOKEN ?? '' // ADR-005: default OFF
 
 mkdirSync(LOG_DIR, { recursive: true }) // idempotent (PM-001 side effect ③)
@@ -252,6 +270,135 @@ async function serveFleet() {
   }
 }
 
+// ---- PM-005: op=trace (trace read projection; JSONL direct read, no writes) ----
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+const traceCache = { path: '', sig: '', lines: null }
+
+function findSessionDir(sid) { // session-purge findSessionDir pattern: bucket scan
+  try {
+    for (const bucket of readdirSync(SESSIONS_ROOT)) {
+      const cand = `${SESSIONS_ROOT}/${bucket}/${sid}`
+      try { if (statSync(cand).isDirectory()) return cand } catch {}
+    }
+  } catch {}
+  return null
+}
+
+function loadTraceLines(dir) {
+  const file = `${dir}/session.jsonl.zstd`
+  const st = statSync(file, { bigint: true })
+  if (st.size > TRACE_FILE_MAX_BYTES) throw new Error(`session log too large (${st.size} bytes)`)
+  const sig = `${st.mtimeNs}:${st.size}`
+  if (traceCache.path === file && traceCache.sig === sig) return { lines: traceCache.lines, sig, file }
+  const buf = readFileSync(file)
+  const offs = []
+  let i = 0
+  while ((i = buf.indexOf(ZSTD_MAGIC, i)) !== -1) { offs.push(i); i += 4 }
+  if (!offs.length) throw new Error('not a zstd session log')
+  let text = ''
+  let truncated = false
+  for (let k = 0; k < offs.length; k++) {
+    const part = buf.subarray(offs[k], k + 1 < offs.length ? offs[k + 1] : buf.length)
+    try { text += zstdDecompressSync(part).toString('utf8') } catch { truncated = true; break } // torn tail frame: keep what we have
+  }
+  const lines = text.split('\n').filter((l) => l.length > 0)
+  traceCache.path = file; traceCache.sig = sig; traceCache.lines = lines
+  return { lines, sig, file, truncated }
+}
+
+function serveTrace(q) {
+  const sid = q.get('sessionId')
+  const dir = findSessionDir(sid)
+  if (!dir) return { op: 'trace', sessionId: sid, status: 'miss', entries: [], note: `no session dir under ${SESSIONS_ROOT}/*/${sid}` }
+  const { lines, sig, truncated } = loadTraceLines(dir)
+
+  const typeParam = q.get('type')
+  const typeSet = typeParam ? new Set(typeParam.split(',').map((s) => s.trim()).filter(Boolean)) : null
+  const tool = q.get('tool')
+  const text = q.get('text')
+  const intParam = (name) => { const v = q.get(name); if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null }
+  const seqFrom = intParam('seqFrom')
+  const seqTo = intParam('seqTo')
+  const needle = text ? text.toLowerCase() : null
+
+  const entries = []
+  const histogram = {}
+  let parseFailures = 0
+  let matchedChars = 0
+  let minSeq = null
+  let maxSeq = null
+  for (const raw of lines) {
+    let rec
+    try { rec = JSON.parse(raw) } catch { parseFailures++; continue }
+    const t = rec.type ?? '_unknown'
+    histogram[t] = (histogram[t] || 0) + 1
+    if (typeSet && !typeSet.has(t)) continue
+    if (tool) { const tn = rec.data?.name ?? rec.data?.toolName ?? rec.data?.tool?.name; if (tn !== tool) continue }
+    if (seqFrom != null && !(typeof rec.seq === 'number' && rec.seq >= seqFrom)) continue
+    if (seqTo != null && !(typeof rec.seq === 'number' && rec.seq <= seqTo)) continue
+    if (needle && !raw.toLowerCase().includes(needle)) continue
+    entries.push(rec)
+    matchedChars += raw.length + 1
+    if (typeof rec.seq === 'number') {
+      if (minSeq == null || rec.seq < minSeq) minSeq = rec.seq
+      if (maxSeq == null || rec.seq > maxSeq) maxSeq = rec.seq
+    }
+  }
+
+  // head.compact fold (KG 14 §2.5; JS semantic-equivalent per ADR-010):
+  // over-budget filtered payload -> the older (head) entries collapse into
+  // ONE deterministic single-line snapshot, the recent tail stays verbatim.
+  let folded = false
+  let outEntries = entries
+  let droppedEntries = 0
+  let droppedChars = 0
+  const droppedHistogram = {}
+  if (JSON.stringify(entries).length > TRACE_BUDGET_CHARS) {
+    folded = true
+    const keepBudget = Math.floor(TRACE_BUDGET_CHARS * 0.6)
+    let keptChars = 0
+    let count = 0
+    let cut = 0
+    for (let k = entries.length - 1; k >= 0; k--) {
+      const c = JSON.stringify(entries[k]).length + 1
+      if (count >= TRACE_KEEP_MAX_ENTRIES || keptChars + c > keepBudget) { cut = k + 1; break }
+      keptChars += c
+      count++
+      if (k === 0) cut = 0
+    }
+    const droppedList = entries.slice(0, cut)
+    const keptList = entries.slice(cut)
+    droppedEntries = droppedList.length
+    droppedChars = droppedList.reduce((a, r) => a + JSON.stringify(r).length + 1, 0)
+    for (const r of droppedList) { const t = r.type ?? '_unknown'; droppedHistogram[t] = (droppedHistogram[t] || 0) + 1 }
+    const summary = {
+      type: 'trace.compact',
+      reason: 'threshold',
+      algorithm: 'head.compact (KG 14 §2.5; JS semantic-equivalent, ADR-010)',
+      threshold: TRACE_BUDGET_CHARS,
+      dropped: { entries: droppedEntries, chars: droppedChars, type_histogram: droppedHistogram },
+      kept: { entries: keptList.length, chars: keptChars },
+      seq_range: [minSeq, maxSeq],
+    }
+    outEntries = [summary, ...keptList]
+  }
+
+  return {
+    op: 'trace',
+    sessionId: sid,
+    signature: sig,
+    totalLines: lines.length,
+    parseFailures,
+    logTruncated: !!truncated,
+    filter: { type: typeParam || null, tool: tool || null, text: text || null, seqFrom, seqTo },
+    matched: { entries: entries.length, chars: matchedChars, seq_range: [minSeq, maxSeq], type_histogram: histogram },
+    folded,
+    budget: TRACE_BUDGET_CHARS,
+    dropped: folded ? { entries: droppedEntries, chars: droppedChars } : { entries: 0, chars: 0 },
+    entries: outEntries,
+  }
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -273,6 +420,14 @@ const server = createServer((req, res) => {
     })
   }
   if (req.url === '/op/tickets') return finish(200, serveTickets())
+  if (req.url.startsWith('/op/trace?') || req.url === '/op/trace') {
+    const u = new URL(req.url, 'http://127.0.0.1')
+    if (!u.searchParams.get('sessionId')) return finish(400, { error: 'sessionId query param required', hint: 'op=trace?sessionId=session-…&type=&tool=&text=&seqFrom=&seqTo=' })
+    try { return finish(200, serveTrace(u.searchParams)) } catch (e) {
+      log(`op=trace DEGRADED ${String(e?.message ?? e).slice(0, 140)}`)
+      return finish(200, { op: 'trace', sessionId: u.searchParams.get('sessionId'), degraded: true, entries: [], note: `trace unavailable: ${String(e?.message ?? e).slice(0, 140)}` })
+    }
+  }
   if (req.url === '/op/fleet') {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
@@ -290,7 +445,7 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet'],
+    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace'],
     note: '幂等键=本文件路径; temp+rename 0600; PM-002 骨架',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
