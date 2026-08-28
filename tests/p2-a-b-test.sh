@@ -39,11 +39,11 @@ const s = createServer((req, res) => {
   req.on('end', () => {
     appendFileSync(process.env.STUB_WIRES, b + '\n')
     res.setHeader('content-type', 'application/json')
-    // FB 相: msgid fb-old/fb-new 的 steer POST 回 steer-unavailable(dsh rpc.ts 契约),驱动回落验证
+    // FB 相: msgid fb-old/fb-new 的 steer POST 回 agent-busy(镜像 dsh prompt 路径 catch-all),驱动回落验证
     // (v2 json.dumps 键值带空格,故用正则容差匹配 mode)
     const failSteer = (b.includes('fb-old') || b.includes('fb-new')) && /"mode":\s*"steer"/.test(b)
     res.end(JSON.stringify(failSteer
-      ? { result: { ok: false, error: { code: 'steer-unavailable', message: 'current turn no longer accepts steering', details: { itemId: 'fb-probe' } } } }
+      ? { result: { ok: false, error: { code: 'agent-busy', message: 'prompt rejected', details: { reason: 'stub: idle steer' } } } }
       : { result: { ok: true, value: { accepted: true } } }))
   })
 })
@@ -308,7 +308,7 @@ while IFS= read -r line; do echo "[FAIL] ${line#F }"; done < <(grep '^F ' "$WORK
 if [ "$GFAIL" = 0 ]; then ok G7 "双写行结构一致(键集/键序/值)"; ok G8 "reason 四值枚举全覆盖×两路"; else bad G7 "见上"; bad G8 "见上"; fi
 
 # ---- FB: steer-unavailable 回落 queue(用户裁决 2026-08-29;编排消息 steer 打断优先) ----
-# 复用主 stub:msgid fb-* 的 steer POST 回 steer-unavailable → 期望旧/新双路各自 steer→queue 两跳
+# 复用主 stub:msgid fb-* 的 steer POST 回 agent-busy → 期望旧/新双路各自 steer→queue 两跳
 # G 系列改写了 fleet.json(3333 fixture),先 base_fleet 恢复才有 1111 可解析
 base_fleet
 W0="$(wc -l < "$STUB_WIRES" | tr -d ' ')"
@@ -318,7 +318,7 @@ FB_TAIL="$(tail -n +$((W0 + 1)) "$STUB_WIRES")"
 FB_N="$(printf '%s\n' "$FB_TAIL" | grep -c .)"
 FB_M="$(printf '%s\n' "$FB_TAIL" | sed -n 's/.*"mode":\s*"\([a-z]*\)".*/\1/p' | paste -sd, -)"
 if [ "$FB_RO" = 0 ] && [ "$FB_RN" = 0 ] && [ "$FB_N" = 4 ] && [ "$FB_M" = "steer,queue,steer,queue" ]; then
-  ok FB "steer-unavailable → 回落 queue(旧/新各 steer→queue 两跳)"
+  ok FB "steer 被拒(agent-busy)→ 回落 queue(旧/新各 steer→queue 两跳)"
 else
   bad FB "rc=$FB_RO/$FB_RN wires=$FB_N modes=$FB_M errO=[$(head -c 200 "$WORK/fb-old.err" 2>/dev/null)] errN=[$(head -c 200 "$WORK/fb-new.err" 2>/dev/null)]"
 fi

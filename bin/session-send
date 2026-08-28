@@ -172,10 +172,11 @@ def main() -> None:
             return json.loads(resp.read())['result']
 
     # 编排消息默认 steer 打断:时效性第一,历史仍冻结进 session log(用户裁决 2026-08-29 01:18)
-    # steer-unavailable(idle/turn 边界)→ 回落 queue;idle 会话 queue 即开新 turn
+    # steer 被拒即回落 queue(idle 时 dsh prompt 路径 catch-all 返 agent-busy;steer-unavailable 仅 dock action 有)
+    # idle 会话 queue 即开新 turn;queue 再失败则 surfaced 为最终错误
     mode = 'steer'
     result = _post(mode)
-    if not result.get('ok') and (result.get('error') or {}).get('code') == 'steer-unavailable':
+    if not result.get('ok'):
         mode = 'queue'
         result = _post(mode)
     if not result.get('ok'):
