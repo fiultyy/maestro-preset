@@ -563,6 +563,11 @@ const startedAt = new Date().toISOString()
   const { zstdDecompressSync } = await import('node:zlib')
   const { DatabaseSync } = await import('node:sqlite')
   ok('HF-015 runtime exposes node:zlib zstd + node:sqlite unflagged', typeof zstdDecompressSync === 'function' && typeof DatabaseSync === 'function', process.version)
+  // HF-018: declared deviation ② closed by wording — the consumer-side msgid
+  // dedup obligation must stay documented (cross-boot ring replay bypasses
+  // the server dedup window by design).
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  ok('HF-018 deviation ② documents consumer msgid-dedup obligation', /跨 boot 一律全环回放/.test(readme) && /消费端按 `msgid` 去重/.test(readme) && /不经服务端 60s 去重窗/.test(readme))
 }
 await sb1()
 await sb2()

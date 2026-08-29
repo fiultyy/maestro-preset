@@ -78,7 +78,7 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 - 快照先行：订阅建立即回放环形缓冲（≤50 条, kinds 过滤），随后增量。
 - 终止帧：服务器主动终结流时发 `{"t":"pm_sub_ended","consumer":…,"reason":"replaced"}`（同 consumer 重订阅顶替旧流）；客户端主动断开不发帧，仅清理——重连由持久游标兜底。
 - 保活：每 15s 一行 SSE 注释 `: ping`（任何 SSE 解析器均忽略）。
-- **已声偏差**：① 每 consumer 单活流——幂等键虽为 `(consumer,kinds)`，同 consumer 换 kinds 订阅同样顶替旧流而非并存；② 跨 daemon 重启 seq 归零——游标按 bootId 判代，跨 boot 一律全环回放（≤50），无重无漏由 msgid 去重兜底；③ 帧内无 wall-clock 字段（时间只在磁盘游标文件里），网关侧计时自行打点。
+- **已声偏差**：① 每 consumer 单活流——幂等键虽为 `(consumer,kinds)`，同 consumer 换 kinds 订阅同样顶替旧流而非并存；② 跨 daemon 重启 seq 归零——游标按 bootId 判代，跨 boot 一律全环回放（≤50 帧 `replay:true`）。该回放**直写流、不经服务端 60s 去重窗**，故**消费端按 `msgid` 去重是无重语义的最终义务**（HF-018 表述固化）：`(source,msgid)` 全局判重、同 msgid 重复帧一律丢弃——环内 msgid 含 `mtime_ns+size`，同一变更跨 boot 稳定不变，消费端判重即无重无漏；③ 帧内无 wall-clock 字段（时间只在磁盘游标文件里），网关侧计时自行打点。
 
 ## unit 要点
 
