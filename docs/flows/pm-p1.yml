@@ -1,0 +1,13 @@
+# pm-p1 — P1 波(pm-p0 27/27 终态后 oneshot): PM-008 写透传 + PM-009 健康元端点
+# 外部依赖已在 pm-p0 满足(PM-008←PM-007✓, PM-009←PM-002✓); 本流程内两票独立链+rollup
+# 执行面: 单车道串行派发(两票同仓同插件 plugins/pm-host-service, 双 worker 同文件面必撞, 编排裁量); fleet 全程在册
+# 纪律: 每票验证门×2 编排者独立复验 + advance 前幂等重放预验(done=no-op); 异常走退票自纠/G3 裁决先例
+# 门: p1-final 终态回报 claw-02-pmhub(文件桥)+用户+ledger; commit+push 过闸随 rollup
+id: pm-p1
+entry: pm-008-d
+nodes:
+  pm-008-d: {verb: dispatch, title: "写透传: op=act(PM-008;P1)", payload: {ticket: PM-008, repo: maestro-preset}}
+  pm-008-c: {verb: callback, deps: [pm-008-d], title: "PM-008 验证门×2: 同ref重放零二次CLI; CLI死亡必报(tripwire); 审计写失败主链续"}
+  pm-009-d: {verb: dispatch, deps: [pm-008-c], title: "健康元: 全源 live/degraded+版本+自举(PM-009)", payload: {ticket: PM-009, repo: maestro-preset}}
+  pm-009-c: {verb: callback, deps: [pm-009-d], title: "PM-009 验证门×2: 全源挂 health 仍 200+status:degraded"}
+  rollup: {verb: rollup, deps: [pm-008-c, pm-009-c], title: "P1 全链汇总(p1-final 回报+push 过闸)"}
