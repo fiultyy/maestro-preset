@@ -224,10 +224,20 @@ function pullLedgerTickets() {
   return list
 }
 
+// HF-016: light liveness re-probe for the cache-HIT path (zero spawns, zero
+// pulls): CLI executable + ledger.db absent-or-readable (HF-009 semantics).
+// The served content stays pull-time, but `degraded` no longer claims
+// pull-time health forever — it reflects this cheap probe at answer time.
+function ledgerProbeOk() {
+  try { accessSync(LEDGER_BIN, constants.X_OK) } catch { return false }
+  try { closeSync(openSync(`${ROOT}/maestro/ledger.db`, 'r')); return true } catch (e) { return e?.code === 'ENOENT' }
+}
+
 function serveTickets() {
   const sig = mdSignature()
   if (tickets.list !== null && tickets.sig === sig) { // replay: zero cli spawns, zero writes
-    return { op: 'tickets', count: tickets.list.length, tickets: tickets.list, cache: 'hit', degraded: false, note: '', signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
+    const probeOk = ledgerProbeOk() // HF-016: degraded reflects a light probe, not pull-time health forever
+    return { op: 'tickets', count: tickets.list.length, tickets: tickets.list, cache: 'hit', degraded: !probeOk, note: probeOk ? '' : `ledger light-probe failed since last pull (${tickets.pulledAt}) — serving pull-time cache`, signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
   }
   try {
     const list = pullLedgerTickets()

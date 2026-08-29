@@ -399,6 +399,14 @@ async function sb1() {
     const t5 = await req(port, 'GET', '/op/tickets')
     ok('PM-003 recovery -> re-pull healthy again', t5.json?.degraded === false && t5.json?.cache === 'miss' && t5.json?.count === 2, `cache=${t5.json?.cache}`)
 
+    // ---- HF-016: cache-hit degraded = light re-probe (CLI executable), not pull-time forever ----
+    chmodSync(`${sb}/maestro/bin/ledger`, 0o000) // probe fails; signature UNCHANGED -> still the hit path
+    const t6 = await req(port, 'GET', '/op/tickets')
+    ok('HF-016 hit path degrades on light-probe failure without re-pull', t6.status === 200 && t6.json?.cache === 'hit' && t6.json?.degraded === true && /light-probe/.test(t6.json?.note ?? '') && t6.json?.cliSpawns === t5.json?.cliSpawns, `cache=${t6.json?.cache} spawns=${t6.json?.cliSpawns}`)
+    chmodSync(`${sb}/maestro/bin/ledger`, 0o755)
+    const t7 = await req(port, 'GET', '/op/tickets')
+    ok('HF-016 hit path recovers when the probe passes again', t7.json?.cache === 'hit' && t7.json?.degraded === false && t7.json?.cliSpawns === t5.json?.cliSpawns)
+
     // ---- PM-004 dsh API death -> pure fleet view + degraded ----
     await mock.close()
     await sleep(200)
