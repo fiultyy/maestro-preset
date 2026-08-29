@@ -965,6 +965,11 @@ async function serveHealth() {
   })
   guard('sessions', probeSessions) // PM-005 trace root
   guard('flows', probeFlows) // PM-006 per-flow SQL walk
+  guard('singleton', () => ({ // HF-014: flock fail-open made VISIBLE — an unlocked daemon degrades health instead of running silently
+    live: lockState === 'held',
+    state: lockState,
+    note: lockState === 'held' ? 'flock(2) singleton held in-daemon (PM-002)' : 'flock unavailable — SINGLE INSTANCE NOT GUARANTEED; fail-open is now a degraded, visible state (HF-014)',
+  }))
   sources.dsh_api = await probeDsh() // PM-004 join plane (always guarded internally)
   const bootstrap = (() => { try { return probeBootstrap() } catch (e) { return { enabled: 'unknown', active: 'unknown', note: errBrief(e) } } })()
   const degraded = Object.entries(sources).filter(([, s]) => !s?.live).map(([k]) => k)

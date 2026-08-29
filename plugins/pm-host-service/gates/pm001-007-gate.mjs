@@ -30,6 +30,7 @@ import { createServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { dirname } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
 const LABEL = process.argv[2] ?? `manual-${process.pid}`
@@ -475,6 +476,24 @@ async function sb4() {
   }
 }
 
+// ============ SB5: HF-014 flock unavailable -> singleton degraded (fail-open visible) ============
+async function sb5() {
+  const sb = `${BASE}/sb5`
+  buildSandbox(sb)
+  // PATH WITHOUT /usr/bin: spawnSync('flock') ENOENTs -> lockState 'unavailable'
+  // (node itself is spawned by absolute path, so the daemon boots fine).
+  const { child, port } = await startDaemon(sb, { PATH: dirname(process.execPath) })
+  try {
+    console.log(`\n=== SB5 ${sb} (PATH without flock) port=${port} ===`)
+    const h = await req(port, 'GET', '/health')
+    ok('HF-014 daemon still serves /health 200 when flock is missing', h.status === 200)
+    ok('HF-014 singleton source exposed degraded', h.json?.sources?.singleton?.live === false && h.json?.sources?.singleton?.state === 'unavailable', JSON.stringify(h.json?.sources?.singleton))
+    ok('HF-014 fail-open visible: top status degraded + listed', h.json?.status === 'degraded' && (h.json?.degraded ?? []).includes('singleton'), `degraded=[${h.json?.degraded}]`)
+  } finally {
+    await stopDaemon(child)
+  }
+}
+
 // ============ SB2: PM-002 port drift / flock / boot-death empty state ============
 async function sb2() {
   const sb = `${BASE}/sb2`
@@ -484,6 +503,7 @@ async function sb2() {
     console.log(`\n=== SB2 ${sb} port=${port1} ===`)
     const h = await req(port1, 'GET', '/health')
     ok('SB2 boot /health 200 despite missing sources', h.status === 200 && h.json?.version === VERSION)
+    ok('HF-014 control: normal PATH -> singleton held + not in degraded list', h.json?.sources?.singleton?.live === true && h.json?.sources?.singleton?.state === 'held' && !(h.json?.degraded ?? []).includes('singleton'))
 
     // PM-003 boot-time ledger death (no cache yet) -> EMPTY degraded state, not 5xx
     const t = await req(port1, 'GET', '/op/tickets')
@@ -523,6 +543,7 @@ await sb1()
 await sb2()
 await sb3()
 await sb4()
+await sb5()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pm001-007', startedAt, finishedAt: new Date().toISOString(), pass, fail, version: VERSION, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)

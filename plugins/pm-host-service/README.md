@@ -52,7 +52,8 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
     "fleet":      { "live": …, "fleetJson": {…}, "fleetListCli": {…} },                                  // PM-004 源
     "dsh_api":    { "live": …, "url": "127.0.0.1:3080/api/session.list", "note": … },                    // fleet join 面(1s 预算)
     "sessions":   { "live": …, "root": …, "buckets": N },                                                // PM-005 源
-    "flows":      { "live": …, "total": N, "readable": N, "flows": [{"flow","live","note"}], "degradedFlows": […] } // PM-006 逐库 SQL 自走
+    "flows":      { "live": …, "total": N, "readable": N, "flows": [{"flow","live","note"}], "degradedFlows": […] }, // PM-006 逐库 SQL 自走
+    "singleton":  { "live": …, "state": "held|unavailable", "note": "…" }                                // HF-014: flock 单例态(fail-open 可见化)
   },
   "degraded": ["…"],                     // 当前降级源名列表
   "note": "…"
