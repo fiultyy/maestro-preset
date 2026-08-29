@@ -445,6 +445,36 @@ async function sb3() {
   }
 }
 
+// ============ SB4: HF-009 absent-vs-broken health semantics ============
+async function sb4() {
+  const sb = `${BASE}/sb4`
+  buildSandbox(sb)
+  writeFileSync(`${sb}/maestro/bin/ledger`, LEDGER_ALIVE, { mode: 0o755 }) // CLI present, alive
+  // deliberately ABSENT: ledger.db, flows root, sessions root; fleet.json empty map (HF-017 fixture)
+  writeFleet(sb, 0)
+  writeFileSync(`${sb}/maestro/fleet.json`, `${JSON.stringify({ fleet: {} }, null, 2)}\n`)
+  const mock = await startMockDsh()
+  const { child, port } = await startDaemon(sb, { DSH_PORT: String(mock.port) })
+  try {
+    console.log(`\n=== SB4 ${sb} (absent sources + empty fleet map; mock dsh :${mock.port}) port=${port} ===`)
+    let h = await req(port, 'GET', '/health')
+    ok('HF-009 absent ledger.db -> ledger source live (not degraded)', h.json?.sources?.ledger?.live === true, `note=${(h.json?.sources?.ledger?.note ?? '').slice(0, 50)}`)
+    ok('HF-009 absent flows root -> flows source live (not degraded)', h.json?.sources?.flows?.live === true, `note=${(h.json?.sources?.flows?.note ?? '').slice(0, 50)}`)
+    ok('HF-009 flows probe reports total 0 readable 0', h.json?.sources?.flows?.total === 0 && h.json?.sources?.flows?.readable === 0)
+    // broken variants: files exist but unreadable -> degraded
+    writeFileSync(`${sb}/maestro/ledger.db`, 'not-a-db-but-present\n')
+    chmodSync(`${sb}/maestro/ledger.db`, 0o000)
+    writeFlowDb(`${sb}/maestro/flows/hf009-broken/state.db`)
+    chmodSync(`${sb}/maestro/flows/hf009-broken/state.db`, 0o000)
+    h = await req(port, 'GET', '/health')
+    ok('HF-009 unreadable ledger.db -> ledger source degraded', h.json?.sources?.ledger?.live === false)
+    ok('HF-009 unreadable flow db -> flows source degraded (broken != absent)', h.json?.sources?.flows?.live === false && h.json?.sources?.flows?.total === 1, `note=${(h.json?.sources?.flows?.note ?? '').slice(0, 50)}`)
+    await mock.close()
+  } finally {
+    await stopDaemon(child)
+  }
+}
+
 // ============ SB2: PM-002 port drift / flock / boot-death empty state ============
 async function sb2() {
   const sb = `${BASE}/sb2`
@@ -492,6 +522,7 @@ const startedAt = new Date().toISOString()
 await sb1()
 await sb2()
 await sb3()
+await sb4()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pm001-007', startedAt, finishedAt: new Date().toISOString(), pass, fail, version: VERSION, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)

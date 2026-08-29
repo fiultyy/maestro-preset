@@ -892,7 +892,15 @@ function probeSessions() {
 
 function probeFlows() { // SQL self-walk: a flow is live only if its state.db opens read-only AND v_status answers
   let names = []
-  try { names = readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort() } catch (e) { return { live: false, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], note: `flows root unavailable: ${errBrief(e)}` } }
+  try {
+    const st = statSync(FLOWS_ROOT)
+    if (!st.isDirectory()) return { live: false, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], degradedFlows: [], note: 'flows root is not a directory' }
+    names = readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort()
+  } catch (e) {
+    if (e?.code === 'ENOENT') return { live: true, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], degradedFlows: [], note: 'absent: flows root does not exist yet — healthy empty state (HF-009: absent != broken)' }
+    return { live: false, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], degradedFlows: [], note: `flows root unavailable: ${errBrief(e)}` }
+  }
+  if (names.length === 0) return { live: true, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], degradedFlows: [], note: 'empty: no flow dirs — healthy empty state (HF-009: absent != broken)' }
   const flows = names.map((name) => {
     const dbPath = `${FLOWS_ROOT}/${name}/state.db`
     try {
@@ -943,10 +951,11 @@ function probeBootstrap() { // G3: unit file + systemctl --user is-enabled / is-
 async function serveHealth() {
   const sources = {}
   const guard = (name, fn) => { try { sources[name] = fn() } catch (e) { sources[name] = { live: false, note: `probe failed: ${errBrief(e)}` } } }
-  guard('ledger', () => { // PM-003 tickets source: ledger.db readable + pull CLI executable
+  guard('ledger', () => { // PM-003 tickets source; HF-009: absent ledger.db is NOT broken (fresh system — the pull plane is the CLI)
     const db = probeFile(`${ROOT}/maestro/ledger.db`)
     const cli = probeExec(LEDGER_BIN)
-    return { live: db.exists && db.readable && cli.executable, ledgerDb: db, ledgerCli: cli }
+    const live = cli.executable && (!db.exists || db.readable)
+    return { live, ledgerDb: db, ledgerCli: cli, note: db.exists ? '' : 'ledger.db absent — healthy fresh state (HF-009: absent != broken; tickets pull plane is the CLI)' }
   })
   guard('tickets_md', () => { const f = probeFile(TICKETS_MD); return { live: f.exists && f.readable, file: f } }) // signature plane
   guard('fleet', () => { // PM-004: fleet.json primary + fleet-list fallback CLI

@@ -59,7 +59,7 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 }
 ```
 
-探针纪律：全部只读（文件 stat+open 探可读，chmod 000 = exists 但不可读 → 降级；flows 逐库 `node:sqlite` readOnly 连接真跑 `SELECT COUNT(*) FROM v_status`；dsh_api 复用 fleet join 的 loopback RPC，1s abort）；`systemctl --user is-enabled/is-active` 结果缓存 5s，自举字段**可见即可见性契约**，不参与顶层 status 判定；探针各自 try/catch，单个探针崩溃只降级该源。
+探针纪律：全部只读（文件 stat+open 探可读，chmod 000 = exists 但不可读 → 降级；flows 逐库 `node:sqlite` readOnly 连接真跑 `SELECT COUNT(*) FROM v_status`；dsh_api 复用 fleet join 的 loopback RPC，1s abort）；**absent ≠ broken（HF-009）**：`ledger.db` 缺席（fresh 系统，票面拉取面是 CLI）与 flows 根缺席/空目录均判 `live:true` 健康空态，只有"存在但不可读"才降级；`systemctl --user is-enabled/is-active` 结果缓存 5s，自举字段**可见即可见性契约**，不参与顶层 status 判定；探针各自 try/catch，单个探针崩溃只降级该源。
 
 ## 网关对齐（PM-008 / 写透传冻结假设对照）
 
