@@ -122,6 +122,12 @@ PM-008（spec §PM-008）：G1 同 ref 重放 → 零二次 CLI 调用（fixture
 
 PM-009（spec §PM-009）：G1 正常态 → 全源 `live:true` + `version` 可见 + 顶层 `status:"ok"`；G2 逐源挂（chmod 000 ledger.db / 移走 tickets.md / chmod 000 fleet.json / chmod 000 flows/*/state.db / chmod 000 sessions root / 断 dsh_api）→ 逐源 `live:false` 顶层 `status:"degraded"` 且恒 HTTP 200，全源齐挂仍 200+degraded，恢复后自愈回 ok；G3 自举状态可见（`bootstrap.enabled/active/unitFile` 字段在场；live 上 `enabled=="enabled" && active=="active"`）；回归：PM-001..008 全部门绿（0.8.0 基线含 op=act）。
 
+## 门证据留存与回归脚本入库（HF-013）
+
+- **回归脚本入库**（随票演进）：`gates/pm001-007-gate.mjs` + `gates/pm001-007-regression.sh`（PM-001..007 全子句：live 部分 PM-001 systemd 三门 + PM-002 端口漂移/活锁 + 读面冒烟；沙箱部分逐条断言 ledger 降级 / dsh 死 / 折叠+过滤 / db 不可读 / exactly-once+断线重连）、`gates/pm008-regression.sh`、`gates/pm009-regression.sh`。脚本运行时把版本钉在**本仓 package.json**（unit ExecStart 指向本仓 checkout，`try-restart` 即部署）——版本号升不破回归。
+- **留存策略（②，不落 /tmp）**：一切回归/门产物固定落 `$PM_HOST_SERVICE_GATES_DIR/<label>/<run>/`（默认 `~/.dsh/maestro/logs/pm-host-service/gates`，`PM_HOST_SERVICE_GATES_DIR` 可整体重定向）：regression.log、SSE 临时帧、沙箱树（pm.port/游标/登记表/daemon.log）与 manifest.json 全部留档。
+- **重跑纪律（ADR-007.1 证据链）**：收口 = 新回归脚本 live ×2 全绿 + pm008/pm009 既有回归复跑绿，证据目录实测在册（`gates/pm001-007/`、`gates/pm008/`、`gates/pm009/`）。
+
 ## 边界
 
 - 只读投影（ADR-002）：不直写任何 sqlite 账本；写侧一律透传 maestro CLI（PM-008 已交付：`POST /op/act`，本进程零账本写入）
