@@ -77,18 +77,36 @@
 // GC). Stream termination sends a pm_sub_ended frame when the SERVER ends
 // the stream (same-consumer replacement); a client disconnect just cleans
 // up — the persisted cursor makes the resubscribe seamless.
+// PM-008 (write passthrough, POST /op/act): the write-side of ADR-002 —
+// this daemon NEVER implements ledger writes and NEVER opens a sqlite for
+// writing; every write action is passed through to an allowlisted maestro
+// CLI binary (naturally idempotent verbs, ADR-007) spawned async. Per
+// action a ref `vh-<8hex>` is minted (node:crypto) or taken from the
+// client's retry key; the phase-1 HTTP receipt returns immediately
+// {accepted,ref} and settlement flows back through the PM-007 fanout as
+// kind 'act' events carrying the ref (additive frame fields). State per
+// ADR-007.2 (files): state/act/registry.json = in-flight + terminal
+// entries (temp+rename; a same-ref replay answers from the registry with
+// ZERO second CLI spawn — this ticket's idempotency gate),
+// state/act/audit.jsonl = append-only audit (accept + settle lines; an
+// audit write failure logs a warning and NEVER blocks the main chain).
+// CLI death is a tripwire: spawn error, non-zero exit or timeout all
+// settle as status=error WITH the error event still emitted. A daemon
+// restart mid-flight marks orphaned 'flying' entries 'interrupted'
+// (replay reports it; a fresh ref resubmits).
 //
-// Zero npm deps; node:* ESM only. Read-side only (ADR-002): never touches a
-// ledger/sqlite; writes go through maestro CLI (PM-008).
+// Zero npm deps; node:* ESM only. Read projections only (ADR-002): never
+// opens a ledger/sqlite for writing; writes go through maestro CLI (PM-008).
 import { createServer } from 'node:http'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
 import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.7.0'
+const VERSION = '0.8.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -514,7 +532,9 @@ function persistDedup() {
 // (source,msgid) dedup — THE exactly-once gate: fs.watch and the reconcile
 // poll both report the same change, inotify itself double-fires; identical
 // signatures produce identical msgids, and the second sighting dies here.
-function emitEvent(kind, source, msgid, path) {
+// `extra` (PM-008) merges additive fields into the frame (act settlement
+// payloads); without it frames are byte-identical to PM-007's shape.
+function emitEvent(kind, source, msgid, path, extra) {
   const now = Date.now()
   if (dedup.has(msgid)) return false
   for (const [k, ts] of dedup) if (now - ts > DEDUP_WINDOW_MS) dedup.delete(k)
@@ -525,7 +545,7 @@ function emitEvent(kind, source, msgid, path) {
     for (const [k] of oldest) dedup.delete(k)
   }
   persistDedup()
-  const ev = { t: 'pm.event', seq: ++eventSeq, msgid, source, kind, path }
+  const ev = { t: 'pm.event', seq: ++eventSeq, msgid, source, kind, path, ...(extra ?? {}) }
   eventRing.push(ev)
   if (eventRing.length > RING_CAP) eventRing.splice(0, eventRing.length - RING_CAP)
   log(`event seq=${ev.seq} kind=${kind} subs=${subscribers.size} msgid=${msgid}`)
@@ -639,6 +659,188 @@ function armFanout() {
   setInterval(() => { for (const sub of subscribers.values()) { try { sub.res.write(': ping\n\n') } catch {} } }, PING_MS)
 }
 
+// ---- PM-008: POST /op/act (write passthrough; P1) ----
+// Namespaced under state/act/ per the PM-007 storage precedent.
+const ACT_DIR = `${STATE_DIR}/act`
+const ACT_REGISTRY_FILE = `${ACT_DIR}/registry.json`
+const ACT_AUDIT_FILE = `${ACT_DIR}/audit.jsonl`
+const ACT_REF_RE = /^vh-[0-9a-f]{8}$/
+const ACT_REGISTRY_MAX = 1000 // terminal entries cap; flying entries are never GC'd
+const ACT_TIMEOUT_MS = 30_000 // CLI lifetime budget -> SIGKILL + error settle
+const ACT_OUT_CAP = 8_192 // stdout/stderr captured per action (bytes, in-memory)
+const ACT_BODY_MAX = 16 * 1024 // POST body cap
+// Write-tool allowlist: name -> binary. These are the maestro CLIs whose
+// verbs are naturally idempotent (ADR-007); the endpoint itself never
+// writes any ledger/sqlite (ADR-002 P0 red line) — passthrough ONLY.
+const ACT_TOOLS = { ledger: LEDGER_BIN, flowc: FLOWC_BIN }
+
+const acts = new Map() // ref -> entry; mirrors registry.json, boot loads it
+let actCliSpawns = 0 // global counter (gate G1 evidence surface)
+
+const newRef = () => `vh-${randomBytes(4).toString('hex')}`
+
+function persistRegistry() {
+  try {
+    mkdirSync(ACT_DIR, { recursive: true })
+    writeFileIfChanged(ACT_REGISTRY_FILE, jsonDoc({ version: 1, cap: ACT_REGISTRY_MAX, entries: Object.fromEntries(acts) }))
+  } catch (e) {
+    log(`act registry persist failed: ${String(e?.message ?? e).slice(0, 140)} (in-memory map stays authoritative this boot)`)
+  }
+}
+
+// Audit is append-only JSONL; per spec its failure is WARN-ONLY — the main
+// chain (receipt -> CLI -> settle event) must keep flowing regardless.
+function appendAudit(rec) {
+  try {
+    mkdirSync(ACT_DIR, { recursive: true })
+    appendFileSync(ACT_AUDIT_FILE, `${JSON.stringify(rec)}\n`)
+    return true
+  } catch (e) {
+    log(`act AUDIT WRITE FAILED (${String(e?.message ?? e).slice(0, 120)}) — warn only, main chain continues: ${rec.t} ref=${rec.ref}`)
+    return false
+  }
+}
+
+// Boot recovery: an entry still 'flying' at load time lost its daemon (and
+// its child) mid-flight. Mark it 'interrupted' — a replay reports the
+// outcome honestly and the client resubmits under a fresh ref.
+function loadRegistry() {
+  try {
+    const d = JSON.parse(readFileSync(ACT_REGISTRY_FILE, 'utf8'))
+    const entries = d?.entries && typeof d.entries === 'object' ? d.entries : {}
+    let interrupted = 0
+    for (const [ref, raw] of Object.entries(entries)) {
+      const e = { exitCode: null, error: null, cliSpawns: 0, stdoutTail: '', stderrTail: '', ...raw }
+      if (e.status === 'flying') {
+        e.status = 'interrupted'
+        e.error = 'daemon restart mid-flight; resubmit under a new ref'
+        e.finishedAt = new Date().toISOString()
+        interrupted++
+      }
+      acts.set(ref, e)
+    }
+    if (interrupted > 0) { log(`act boot recovery: ${interrupted} flying -> interrupted`); persistRegistry() }
+  } catch {} // missing/corrupt registry = fresh map; audit.jsonl stays the trail
+}
+
+function gcRegistry() { // bounded registry: drop OLDEST TERMINAL entries only
+  if (acts.size <= ACT_REGISTRY_MAX) return
+  const terminal = [...acts.entries()].filter(([, e]) => e.status !== 'flying').sort((a, b) => (a[1].submittedMs ?? 0) - (b[1].submittedMs ?? 0))
+  const drop = acts.size - Math.floor(ACT_REGISTRY_MAX / 2)
+  for (let i = 0; i < Math.min(drop, terminal.length); i++) acts.delete(terminal[i][0])
+}
+
+function finishAct(ref) { // single settle path: registry + audit + fanout event
+  const e = acts.get(ref)
+  if (!e || e.status === 'flying') return // still flying = nothing to settle
+  e.finishedAt = new Date().toISOString()
+  e.stdoutTail = (e.stdoutTail ?? '').slice(-256)
+  e.stderrTail = (e.stderrTail ?? '').slice(-256)
+  const ms = Date.now() - e.submittedMs
+  gcRegistry()
+  persistRegistry()
+  appendAudit({ t: 'act.settle', ts: e.finishedAt, ref, tool: e.tool, status: e.status, exitCode: e.exitCode, ms, err: e.error })
+  log(`op=act settle ref=${ref} status=${e.status} exit=${e.exitCode ?? '-'} ms=${ms}`)
+  // Settlement event (kinds 扩 'act'): carries the ref back to subscribers.
+  emitEvent('act', 'act', `act:${ref}:${e.status}:${Date.now()}`, `act/${ref}`, { ref, tool: e.tool, args: e.args, status: e.status, exitCode: e.exitCode, ms, err: e.error })
+}
+
+function spawnAct(ref, e) {
+  actCliSpawns++
+  e.cliSpawns++
+  let child
+  try {
+    child = spawn(ACT_TOOLS[e.tool], e.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (err) { // sync spawn throw — same tripwire as the async error path
+    e.status = 'error'
+    e.error = `spawn failed: ${err?.message ?? err}`
+    finishAct(ref)
+    return
+  }
+  child.stdout?.on('data', (d) => { if ((e.stdoutTail ?? '').length < ACT_OUT_CAP) e.stdoutTail = (e.stdoutTail ?? '') + d.toString() })
+  child.stderr?.on('data', (d) => { if ((e.stderrTail ?? '').length < ACT_OUT_CAP) e.stderrTail = (e.stderrTail ?? '') + d.toString() })
+  const timer = setTimeout(() => {
+    e.error = `timeout after ${ACT_TIMEOUT_MS}ms (SIGKILL)`
+    try { child.kill('SIGKILL') } catch {} // close handler settles as error
+  }, ACT_TIMEOUT_MS)
+  child.on('error', (err) => { // ENOENT / shebang interp gone (PATH-removal sim) -> tripwire
+    clearTimeout(timer)
+    if (e.status !== 'flying') return
+    e.status = 'error'
+    e.exitCode = null
+    e.error = `spawn failed: ${err?.message ?? err}`
+    finishAct(ref)
+  })
+  child.on('close', (code) => {
+    clearTimeout(timer)
+    if (e.status !== 'flying') return // settle exactly once (error already fired)
+    e.exitCode = code
+    if (code === 0) e.status = 'ok'
+    else {
+      e.status = 'error'
+      if (!e.error) e.error = `exit ${code}: ${(e.stderrTail || e.stdoutTail || '').trim().slice(0, 200)}`
+    }
+    finishAct(ref)
+  })
+}
+
+function acceptAct({ tool, args, ref }) {
+  const known = ref != null ? acts.get(ref) : null
+  if (known) { // G1: same-ref replay -> answered from the registry, NO second spawn
+    log(`op=act accept ref=${ref} tool=${known.tool} replay=true status=${known.status} — zero second CLI spawn`)
+    return { op: 'act', accepted: true, ref, replay: true, status: known.status, tool: known.tool, submittedAt: known.submittedAt, finishedAt: known.finishedAt ?? null, exitCode: known.exitCode, note: 'ref already registered: no second CLI spawn (idempotency replay)' }
+  }
+  const finalRef = ref ?? newRef()
+  const now = new Date()
+  const entry = { ref: finalRef, tool, args, status: 'flying', submittedAt: now.toISOString(), submittedMs: Date.now(), finishedAt: null, exitCode: null, error: null, cliSpawns: 0, stdoutTail: '', stderrTail: '' }
+  acts.set(finalRef, entry)
+  persistRegistry() // registered BEFORE spawn: a crash still leaves the trail
+  appendAudit({ t: 'act.accept', ts: entry.submittedAt, ref: finalRef, tool, args })
+  spawnAct(finalRef, entry)
+  log(`op=act accept ref=${finalRef} tool=${tool} argv=${args.length} replay=false`)
+  return { op: 'act', accepted: true, ref: finalRef, replay: false, status: 'flying', tool, registry: ACT_REGISTRY_FILE, audit: ACT_AUDIT_FILE, note: 'phase-1 receipt; settlement flows back as a kind=act fanout event carrying this ref' }
+}
+
+function serveActStatus(q) { // GET /op/act?ref=… (single) | GET /op/act (summary)
+  const ref = q.get('ref')
+  if (ref) {
+    const e = acts.get(ref)
+    if (!e) return { op: 'act', ref, found: false }
+    return { op: 'act', ref, found: true, entry: e }
+  }
+  const counts = { flying: 0, ok: 0, error: 0, interrupted: 0 }
+  for (const e of acts.values()) { if (counts[e.status] != null) counts[e.status]++ }
+  return { op: 'act', summary: true, counts: { ...counts, total: acts.size }, cliSpawns: actCliSpawns, tools: Object.keys(ACT_TOOLS), registry: ACT_REGISTRY_FILE, audit: ACT_AUDIT_FILE, hint: 'POST /op/act {"tool":"ledger","args":["ticket","list"],"ref":"vh-<8hex>"?} — ref is the retry key; replay = zero second CLI spawn' }
+}
+
+function handleActPost(req, res) {
+  const finish = (code, obj) => {
+    try { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) } catch {}
+  }
+  const chunks = []
+  let size = 0
+  let oversize = false
+  req.on('data', (d) => {
+    size += d.length
+    if (size > ACT_BODY_MAX) { oversize = true; try { req.destroy() } catch {}; return }
+    chunks.push(d)
+  })
+  req.on('error', () => { try { finish(413, { error: `body exceeds ${ACT_BODY_MAX} bytes` }) } catch {} })
+  req.on('end', () => {
+    if (oversize) return finish(413, { error: `body exceeds ${ACT_BODY_MAX} bytes` })
+    let body
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { return finish(400, { error: 'body must be JSON', hint: '{"tool":"ledger","args":["ticket","list"],"ref":"vh-<8hex>(optional retry key)"}' }) }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return finish(400, { error: 'body must be a JSON object' })
+    const { tool, args, ref } = body
+    if (!ACT_TOOLS[tool]) return finish(400, { error: `unknown tool ${JSON.stringify(tool)}`, allowlist: Object.keys(ACT_TOOLS) })
+    if (!Array.isArray(args) || args.length > 64 || !args.every((a) => typeof a === 'string' && a.length <= 1024)) return finish(400, { error: 'args must be an array of <=64 strings (<=1024 chars each)' })
+    if (ref != null && !(typeof ref === 'string' && ACT_REF_RE.test(ref))) return finish(400, { error: 'ref must match ^vh-[0-9a-f]{8}$ (or be omitted to get a minted one)' })
+    return finish(200, acceptAct({ tool, args, ref: ref ?? null }))
+  })
+}
+
+loadRegistry() // PM-008 boot recovery (flying -> interrupted) before serving
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -647,7 +849,8 @@ const server = createServer((req, res) => {
   if (TOKEN !== '') { // optional placeholder path; default deployments never hit this
     if (req.headers.authorization !== `Bearer ${TOKEN}`) return finish(403, { error: 'bad token' })
   }
-  if (req.method !== 'GET') return finish(405, { error: 'read-side only (ADR-002); writes go through maestro CLI (PM-008)' })
+  if (req.method === 'POST' && (req.url === '/op/act' || req.url.startsWith('/op/act?'))) return handleActPost(req, res) // PM-008: the single write path
+  if (req.method !== 'GET') return finish(405, { error: 'read-side only (ADR-002); the single write path is POST /op/act (PM-008 maestro CLI passthrough)' })
   if (req.url === '/health') {
     return finish(200, {
       status: 'ok',
@@ -669,12 +872,16 @@ const server = createServer((req, res) => {
     }
   }
   if (req.url === '/op/flow') return finish(200, serveFlow())
+  if (req.url === '/op/act' || req.url.startsWith('/op/act?')) {
+    const u = new URL(req.url, 'http://127.0.0.1')
+    return finish(200, serveActStatus(u.searchParams)) // PM-008 read-back: entry by ref / summary
+  }
   if (req.url === '/subscribe' || req.url.startsWith('/subscribe?')) return handleSubscribe(req, res)
   if (req.url === '/op/fleet') {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
   }
-  finish(404, { error: 'not found', service: SERVICE, hint: 'writes go through maestro CLI (PM-008); health/degraded meta is PM-009' })
+  finish(404, { error: 'not found', service: SERVICE, hint: 'write passthrough = POST /op/act; health/degraded meta is PM-009' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -687,8 +894,8 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>'],
-    note: '幂等键=本文件路径; temp+rename 0600; PM-007 SSE 扇出已上线',
+    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
+    note: '幂等键=本文件路径; temp+rename 0600; PM-007 SSE 扇出 + PM-008 写透传已上线',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
   armFanout() // PM-007: watchers + reconcile poll + SSE keepalive

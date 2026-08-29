@@ -1,6 +1,6 @@
 # pm-host-service（P0 — PM-001 壳 + PM-002 HTTP 投影骨架）
 
-maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）；PM-003..007 已续建 op=tickets/fleet/trace/flow 读投影与 `/subscribe` SSE 事件扇出；写透传与 health 元端点由 PM-008/009 续建。
+maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）；PM-003..007 已续建 op=tickets/fleet/trace/flow 读投影与 `/subscribe` SSE 事件扇出；PM-008 已交付写透传 `POST /op/act`；health 元端点由 PM-009 续建。
 
 ## 形态红线
 
@@ -33,8 +33,18 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 | ⑥ 轨迹读 | `GET /op/trace?sessionId=…&type=&tool=&text=&seqFrom=&seqTo=`: `sessions/<bucket>/<sid>/session.jsonl.zstd` 直读(bucket 扫描 = session-purge findSessionDir 模式; 多帧 zstd 按 magic `28 B5 2F FD` 切分逐帧解压, node 只解首帧; 单槽内存解码缓存按 mtime_ns+size 失效) | **无写盘**(单槽内存缓存)。过滤: type 精确(逗号列表)/tool(`data.name`)/text(原始行子串, 大小写不敏感)/seq 区间(记录显式 `seq`)。**head.compact 折叠**(KG 14 §2.5, ADR-010 JS 语义等价): 过滤负载 >20000 字符 → 旧头部折叠为**单行确定性快照** `trace.compact`(计数/seq 区间/类型直方图/reason:"threshold", 零 LLM), 最近尾部原样保留 → sha 稳定重放。`folded` 语义 = **折叠已应用**: 判定量是实际下发负载的重序列化长度 `matched.payload_chars`(转义可使其高于原始字符和 `matched.chars`), 二者均已暴露。**降级纪律**: sessionId 缺失 400; 目录/文件不可读 → 200 + `degraded:true` + note; 断尾帧截断保留已解部分并标记 `logTruncated` |
 | ⑦ 流程读 | `GET /op/flow`: `flows/<id>/state.db` 逐库 `node:sqlite` **只读连接**(零 npm 依赖), 查 `v_status`/`v_rollup` 视图, `ORDER BY` 稳定输出 | **无写盘**(只读句柄, ADR-002 红线)。**按库降级**: 单库被锁/不可读只标记该 flow(`degraded:true`+note), 其余照常 200, 绝不 5xx; 全部库不可读 → `flowc inspect` CLI 轮询兜底(原样文本, 不解析表格式), 仍败 → 空态+note。锁模拟备注: 库为 WAL, 写者锁不挡读者(SQLite 语义), 不可读(chmod 000)是等价"不可用"模拟, 走同一打开失败路径 |
 | ⑧ 事件扇出 | `GET /subscribe?consumer=<sessionId>&kinds=<csv>` SSE 长连接: fs.watch 三数据面(`maestro/` 目录按文件名过滤 ledger.db / ledger.db-wal / fleet.json; `flows/` 递归) → 签名投影 → 推送; **双通道**第二通道 = 2s reconcile 轮询(inotify 尽力而为, 同时天然构成"同一变更双投递"实测路径) | 订阅幂等键 `(consumer, kinds)`: 同 consumer 再订阅 → 旧流收 `pm_sub_ended` 帧后终止, 新流接管(单 consumer 单活流)。事件幂等键 `(source, msgid)`, msgid 确定性 = `<kind>:<base>:<mtime_ns>:<size>` → 双通道同变更同 msgid, 60s 去重窗只放行一帧(恰好一次)。订阅先快照回放(环形缓冲 ≤50, kinds 过滤, 同 boot 游标后续发)再增量; 跨 boot 游标 → 全环回放(seq 只在单 boot 内可比)。**存储**(ADR-007.2 文件): `state/subscribers/<consumer>.json` 游标 + `state/subscribers/dedup.json` 去重窗(60s, >1000 行截半 GC, 重启恢复 60s 幸存者), 均 temp+rename 内容一致跳过。15s SSE 注释 ping(`: ping`)防代理空闲断连 |
+| ⑨ 写透传 | `POST /op/act` body `{"tool":"ledger\|flowc","args":[…],"ref":"vh-<8hex>"?}`: **本进程绝不实现账本写入、绝不打开 sqlite 写句柄**(ADR-002 P0 红线)——写动作一律 spawn 白名单 maestro CLI 透传(调用方按 ADR-007 只选天然幂等动词), 异步 spawn, 立即回 phase-1 回执 `{accepted,ref}` | 幂等键 = 每动作 `ref`(`vh-<8hex>`, `node:crypto` 铸造; 客户端重试可自带同格式 ref): **同 ref 重放 → 查登记表直答(replay:true), 零二次 CLI 调用**。CLI 完成(含死亡: spawn 失败/非零退出/30s 超时 SIGKILL)→ 经 PM-007 扇出 kind=`act` 事件带 ref 回流(tripwire: error 必达)。**存储**(ADR-007.2 文件): `state/act/registry.json` 在飞+终态登记表(temp+rename; 终态 >1000 条截半 GC, 只 GC 终态; boot 时孤儿 flying → `interrupted`, 重放如实上报, 换新 ref 重投) + `state/act/audit.jsonl` 审计(append-only, accept+settle 各一行; **写失败仅告警不阻断主链**)。读回: `GET /op/act?ref=` 单条 / `GET /op/act` 汇总(cliSpawns 计数为门证据面) |
 
-骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；`GET /subscribe?consumer=<sessionId>&kinds=<csv>` → SSE 事件扇出（PM-007）；非 GET → 405（只读红线）；其余 → 404（写透传属 PM-008，health 元端点属 PM-009）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；`GET /subscribe?consumer=<sessionId>&kinds=<csv>` → SSE 事件扇出（PM-007）；`POST /op/act` → 写透传（PM-008，唯一写路径）；`GET /op/act?ref=<vh-hex8>` → 动作读回；非 GET 且非 `/op/act` → 405（只读红线）；其余 → 404（health 元端点属 PM-009）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+
+## 网关对齐（PM-008 / 写透传冻结假设对照）
+
+- 请求：`POST /op/act`，body `{"tool":"ledger|flowc","args":["…"],"ref":"vh-<8hex>"?}`；`ref` 可省（服务端铸造 `vh-<8hex>`）；tool 白名单外/args 非字符串数组/ref 格式非法/body >16KB → 400（allowlist 随错误返回）。
+- phase-1 回执（立即）：`{op:"act",accepted:true,ref,replay:false,status:"flying",tool,…}`——同步等待只到"已受理+已登记+已 spawn"，不等 CLI。
+- 同 ref 重放：`{accepted:true,ref,replay:true,status:<flying|ok|error|interrupted>,…}`——登记表直答，**零二次 CLI 调用**；`interrupted` = 上个 daemon 中途死亡（换新 ref 重投）。
+- 完成回流：PM-007 扇出 kind=`act` 事件帧（加性字段）：`data: {"t":"pm.event","seq":N,"msgid":"act:<ref>:<status>:<ms>","source":"act","kind":"act","path":"act/<ref>","ref":…,"tool":…,"args":[…],"status":"ok|error","exitCode":N|null,"ms":N,"err":…,"replay":bool}`——**error 事件必达**（spawn 失败/非零退出/超时均 settle 为 error 并照常扇出 = tripwire）。
+- 审计：`state/act/audit.jsonl` 每动作两行（`act.accept` / `act.settle`），append-only；写失败仅 daemon.log 告警，主链路（回执→CLI→settle 事件）不受阻。
+- 安全边界：端点自身零账本写入（ADR-002）；动词幂等性由调用方按 ADR-007 选用天然幂等动词（如 `ledger ticket state`、`flowc advance`）。
 
 ## 网关对齐（PM-007 / GW-002 冻结假设对照）
 
@@ -84,7 +94,9 @@ PM-006（spec §PM-006）：op=flow SQL 自走（只读并发连接交叉核对�
 
 PM-007（spec §PM-007）：同一变更双投递（watch + reconcile 双通道同触一次 touch）→ 消费端恰一帧（按 msgid 计数=1）；断线重连（首连收 E1/E2 → 断线 → E3 落环 → 重连回放 E3 `replay:true` 不含 E1/E2 → 增量 E4 `replay:false`，四 msgid 全局各恰一帧 = 无重无漏）；同 consumer 二次订阅 → 旧流收 `pm_sub_ended`、新流不受扰；缺 `consumer` → 400；回归：PM-001..006 全部门绿。
 
+PM-008（spec §PM-008）：G1 同 ref 重放 → 零二次 CLI 调用（fixture CLI 调用日志恰一行 + 汇总 `cliSpawns` 不增 + `replay:true`，受理态与终态两相位均验）；G2 CLI 死亡 → tripwire 必报（shebang 失效 spawn 失败 / 非零退出两路均 settle `status:error` 且 kind=act error 事件必达，daemon /health 仍 200）；G3 审计写失败（chmod 000 audit.jsonl）→ phase-1 回执照发、CLI 照跑、settle 事件照达、登记表照更新，daemon.log 出现 AUDIT WRITE FAILED 告警，恢复权限后审计续写；回归：PM-001..007 全部门绿（0.7.0 基线）。
+
 ## 边界
 
-- 只读投影（ADR-002）：不直写任何 sqlite 账本；写侧一律透传 maestro CLI（P1，PM-008）
-- 禁 npm 依赖、禁外发文件；op=fleet/trace/flow 与订阅属 PM-004..009
+- 只读投影（ADR-002）：不直写任何 sqlite 账本；写侧一律透传 maestro CLI（PM-008 已交付：`POST /op/act`，本进程零账本写入）
+- 禁 npm 依赖、禁外发文件；health 元端点属 PM-009
