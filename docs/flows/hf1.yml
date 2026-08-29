@@ -1,0 +1,19 @@
+# hf1 — HF 修复波 oneshot: HF-002..018 共 17 张(2 major + 15 minor)
+# 编排: major 首波并行(HF-002 pipecat-poc / HF-013 maestro-preset 双仓无撞) → minor 三片并行
+# 分片按文件面: W1=pipecat-poc(HF-002→003..006); W2=maestro 服务面(HF-013→007..010+014..018); W3=meta 面(011..012)
+# 每票: fix→commit(票号前缀)→验证门(针对性+回归)×2 编排者独立复验→幂等 advance; 双仓零无关改动
+# 门: rollup → commit+dev-sync+push 过闸 → hf1-final 回报 claw-02-pmhub
+id: hf1
+entry: hf-002-d
+nodes:
+  hf-002-d: {verb: dispatch, title: "HF-002 major: tk004 门席位硬钉改参化可重跑", payload: {ticket: HF-002, repo: pipecat-poc}}
+  hf-002-c: {verb: callback, deps: [hf-002-d], title: "HF-002 门: 重跑×2 绿(ADR-007 恢复)+tk001..003 回归"}
+  hf-013-d: {verb: dispatch, title: "HF-013 major: P0 门证据链补全(回归子句+日志留存)", payload: {ticket: HF-013, repo: maestro-preset}}
+  hf-013-c: {verb: callback, deps: [hf-013-d], title: "HF-013 门: 扩展回归×2 绿+留存策略落地"}
+  hf-w1-d: {verb: dispatch, deps: [hf-002-c], title: "W1 minor 片: HF-003..006(pipecat-poc)", payload: {tickets: HF-003..006, lane: W1}}
+  hf-w1-c: {verb: callback, deps: [hf-w1-d], title: "W1 门: 逐票×2 复验+全门回归"}
+  hf-w2-d: {verb: dispatch, deps: [hf-013-c], title: "W2 minor 片: HF-007..010+014..018(服务面)", payload: {tickets: 8张, lane: W2}}
+  hf-w2-c: {verb: callback, deps: [hf-w2-d], title: "W2 门: 逐票×2 复验+PM-001..009 回归"}
+  hf-w3-d: {verb: dispatch, deps: [hf-002-c, hf-013-c], title: "W3 meta 片: HF-011..012", payload: {tickets: HF-011..012, lane: W3}}
+  hf-w3-c: {verb: callback, deps: [hf-w3-d], title: "W3 门: ×2 复验"}
+  rollup: {verb: rollup, deps: [hf-w1-c, hf-w2-c, hf-w3-c], title: "hf1 汇总+push 过闸+hf1-final 回报"}
