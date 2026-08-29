@@ -539,6 +539,16 @@ async function sb2() {
 
 mkdirSync(BASE, { recursive: true })
 const startedAt = new Date().toISOString()
+// HF-015: engines floor must match the real API floor (node:zlib zstd landed
+// v23.8.0, node:sqlite unflagged v23.4.0 -> 23.8.0) AND the running node
+// must actually expose both — measured, not remembered.
+{
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  ok('HF-015 engines floor = >=23.8.0 (measured API floor)', pkg.engines?.node === '>=23.8.0', `engines=${pkg.engines?.node}`)
+  const { zstdDecompressSync } = await import('node:zlib')
+  const { DatabaseSync } = await import('node:sqlite')
+  ok('HF-015 runtime exposes node:zlib zstd + node:sqlite unflagged', typeof zstdDecompressSync === 'function' && typeof DatabaseSync === 'function', process.version)
+}
 await sb1()
 await sb2()
 await sb3()
