@@ -111,7 +111,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
-import { accessSync, appendFileSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
+import { accessSync, appendFileSync, chmodSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
@@ -699,10 +699,14 @@ function persistRegistry() {
 
 // Audit is append-only JSONL; per spec its failure is WARN-ONLY — the main
 // chain (receipt -> CLI -> settle event) must keep flowing regardless.
+// HF-007: the file is secret-material-adjacent state — created 0600 (mode on
+// first append) and re-chmodded after every append so pre-existing 0644/0664
+// files heal to 0600 (aligned with registry.json), never silently wider.
 function appendAudit(rec) {
   try {
     mkdirSync(ACT_DIR, { recursive: true })
-    appendFileSync(ACT_AUDIT_FILE, `${JSON.stringify(rec)}\n`)
+    appendFileSync(ACT_AUDIT_FILE, `${JSON.stringify(rec)}\n`, { mode: 0o600 })
+    try { chmodSync(ACT_AUDIT_FILE, 0o600) } catch {} // heal legacy wider modes; failure is not audit failure
     return true
   } catch (e) {
     log(`act AUDIT WRITE FAILED (${String(e?.message ?? e).slice(0, 120)}) — warn only, main chain continues: ${rec.t} ref=${rec.ref}`)

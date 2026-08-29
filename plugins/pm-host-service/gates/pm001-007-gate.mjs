@@ -404,6 +404,17 @@ async function sb1() {
     const f3 = await req(port, 'GET', '/op/fleet')
     ok('PM-004 dsh death -> 200 + degraded:true + sessionJoined:false', f3.status === 200 && f3.json?.degraded === true && f3.json?.sessionJoined === false)
     ok('PM-004 pure fleet view still served with note', f3.json?.count === 2 && /unreachable/.test(f3.json?.note ?? '') && f3.json?.seats?.every((s) => s.session == null), `note=${(f3.json?.note ?? '').slice(0, 70)}`)
+
+    // ---- HF-007: audit.jsonl must be 0600 (fresh create + legacy heal) ----
+    const auditFile = `${sb}/maestro/state/act/audit.jsonl`
+    const auditMode = () => { try { return (statSync(auditFile).mode & 0o777).toString(8) } catch { return 'missing' } }
+    const a7 = await req(port, 'POST', '/op/act', { tool: 'ledger', args: ['ticket', 'list'] })
+    await sleep(800)
+    ok('HF-007 audit.jsonl created 0600', a7.status === 200 && auditMode() === '600', `mode=${auditMode()}`)
+    chmodSync(auditFile, 0o664) // simulate the legacy wider mode found on live
+    const a7b = await req(port, 'POST', '/op/act', { tool: 'ledger', args: ['ticket', 'list'] })
+    await sleep(800)
+    ok('HF-007 legacy 0664 audit heals to 0600 on next append', a7b.status === 200 && auditMode() === '600', `mode=${auditMode()}`)
   } finally {
     await stopDaemon(child)
   }
