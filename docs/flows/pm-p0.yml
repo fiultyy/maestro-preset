@@ -4,7 +4,7 @@
 # 承载: PM-005/PM-007 大票 long-task 纵深(prompt 嵌 continuable 纪律);其余标准 omp-dais
 # 跨仓: PM 实现=maestro-preset plugins/pm-host-service;GW/TK 实现=pipecat-poc(rt_gateway.py 扩展)
 # 门: G1=pm 服务波+读面收口后回报验收;G2=tk 三 tab 派发前人判协议冻结(硬门);G3=异常 cb-send ask
-# 已知缺口(用户裁决不修): advance 无入向 deps 门禁 → 手动拓扑序推进,每节点收口前幂等复验
+# 入向 deps 门禁(HF-001 已落地): advance done 前置校验全部 dep∈{done,skipped},不满足即拒;--force 旁路并 journal;终态节点重复 advance=幂等 no-op
 id: pm-p0
 entry: pm-001-d
 nodes:
