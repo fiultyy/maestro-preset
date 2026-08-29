@@ -94,6 +94,15 @@
 // settle as status=error WITH the error event still emitted. A daemon
 // restart mid-flight marks orphaned 'flying' entries 'interrupted'
 // (replay reports it; a fresh ref resubmits).
+// PM-009 (health & degraded meta, GET /health): per-source live/degraded
+// probes over EVERY projected source plane (ledger.db + ledger CLI /
+// tickets.md signature / fleet.json + fleet-list / dsh loopback RPC /
+// sessions root / per-flow state.db SQL self-walk), plus version and the
+// systemd bootstrap state (unit file + `systemctl --user is-enabled /
+// is-active`, 5s cache). Probes are read-only and individually guarded: a
+// probe that fails marks ITS source degraded with a note — the endpoint
+// itself NEVER 5xxes; even with every source down it answers 200 +
+// status:"degraded" so tk can render empty states (spec gate).
 //
 // Zero npm deps; node:* ESM only. Read projections only (ADR-002): never
 // opens a ledger/sqlite for writing; writes go through maestro CLI (PM-008).
@@ -102,11 +111,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
-import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
+import { accessSync, appendFileSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.8.0'
+const VERSION = '0.9.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -841,6 +850,119 @@ function handleActPost(req, res) {
 
 loadRegistry() // PM-008 boot recovery (flying -> interrupted) before serving
 
+// ---- PM-009: GET /health (per-source live/degraded + version + bootstrap) ----
+// Cheap read-only probes, each individually guarded: a failing probe
+// degrades ITS source only; the endpoint itself always answers 200.
+const CONFIG_DIR = process.env.XDG_CONFIG_HOME ?? `${homedir()}/.config`
+const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
+const HEALTH_DSH_TIMEOUT_MS = 1_000 // loopback RPC probe budget (health must stay snappy)
+const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
+
+const errBrief = (e) => String(e?.message ?? e).slice(0, 120)
+
+function probeFile(p) { // exists + actually openable (chmod 000 exists but is unreadable)
+  try {
+    const st = statSync(p)
+    let readable = true
+    try { closeSync(openSync(p, 'r')) } catch { readable = false }
+    return { path: p, exists: true, readable, size: Number(st.size), mtime: new Date(st.mtimeMs).toISOString() }
+  } catch (e) {
+    return { path: p, exists: false, readable: false, error: errBrief(e) }
+  }
+}
+
+function probeExec(p) {
+  try { accessSync(p, constants.X_OK); return { path: p, exists: true, executable: true } } catch (e) { return { path: p, exists: false, executable: false, error: errBrief(e) } }
+}
+
+function probeSessions() {
+  try { const buckets = readdirSync(SESSIONS_ROOT); return { live: true, root: SESSIONS_ROOT, buckets: buckets.length } } catch (e) { return { live: false, root: SESSIONS_ROOT, buckets: 0, note: errBrief(e) } }
+}
+
+function probeFlows() { // SQL self-walk: a flow is live only if its state.db opens read-only AND v_status answers
+  let names = []
+  try { names = readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort() } catch (e) { return { live: false, root: FLOWS_ROOT, total: 0, readable: 0, flows: [], note: `flows root unavailable: ${errBrief(e)}` } }
+  const flows = names.map((name) => {
+    const dbPath = `${FLOWS_ROOT}/${name}/state.db`
+    try {
+      const db = new DatabaseSync(dbPath, { readOnly: true }) // read-side red line
+      try { db.prepare('SELECT COUNT(*) AS c FROM v_status').get() } finally { db.close() }
+      return { flow: name, live: true }
+    } catch (e) { return { flow: name, live: false, note: `state.db: ${errBrief(e)}` } }
+  })
+  const readable = flows.filter((f) => f.live).length
+  const dead = flows.filter((f) => !f.live).map((f) => f.flow)
+  return { live: flows.length > 0 && readable === flows.length, root: FLOWS_ROOT, total: flows.length, readable, flows, degradedFlows: dead, note: dead.length ? `unreadable: ${dead.join(',')}` : '' }
+}
+
+async function probeDsh() { // same loopback RPC the fleet join uses, on a 1s budget
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), HEALTH_DSH_TIMEOUT_MS)
+  try {
+    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: 'session.list', payload: {} }),
+      signal: ctl.signal,
+    })
+    if (!res.ok) return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: `http ${res.status}` }
+    const data = await res.json()
+    if (data?.result?.ok !== true) return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: `rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 100)}` }
+    return { live: true, url: `127.0.0.1:${DSH_PORT}/api/session.list` }
+  } catch (e) {
+    return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: errBrief(e) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+let bootCache = { at: 0, enabled: 'unknown', active: 'unknown', systemctl: 'unprobed' }
+function probeBootstrap() { // G3: unit file + systemctl --user is-enabled / is-active (5s cache)
+  const unitFile = probeFile(UNIT_FILE)
+  const now = Date.now()
+  if (now - bootCache.at > BOOT_CACHE_MS) {
+    const run = (args) => { const r = spawnSync('systemctl', ['--user', ...args, SERVICE], { encoding: 'utf8', timeout: 2000 }); return r.error ? null : (r.stdout || '').trim() || (r.status === 0 ? 'unknown' : 'not-found') }
+    const enabled = run(['is-enabled'])
+    const active = run(['is-active'])
+    bootCache = { at: now, enabled: enabled ?? 'unavailable', active: active ?? 'unavailable', systemctl: enabled == null && active == null ? 'missing' : 'ok' }
+  }
+  return { unit: SERVICE, unitFile: { path: unitFile.path, exists: unitFile.exists, readable: unitFile.readable }, enabled: bootCache.enabled, active: bootCache.active, systemctl: bootCache.systemctl, note: `systemctl --user is-enabled/is-active (cache ${BOOT_CACHE_MS}ms); visibility is the contract, values do not gate top status` }
+}
+
+async function serveHealth() {
+  const sources = {}
+  const guard = (name, fn) => { try { sources[name] = fn() } catch (e) { sources[name] = { live: false, note: `probe failed: ${errBrief(e)}` } } }
+  guard('ledger', () => { // PM-003 tickets source: ledger.db readable + pull CLI executable
+    const db = probeFile(`${ROOT}/maestro/ledger.db`)
+    const cli = probeExec(LEDGER_BIN)
+    return { live: db.exists && db.readable && cli.executable, ledgerDb: db, ledgerCli: cli }
+  })
+  guard('tickets_md', () => { const f = probeFile(TICKETS_MD); return { live: f.exists && f.readable, file: f } }) // signature plane
+  guard('fleet', () => { // PM-004: fleet.json primary + fleet-list fallback CLI
+    const f = probeFile(FLEET_FILE)
+    const cli = probeExec(FLEET_LIST_BIN)
+    return { live: f.exists && f.readable, fleetJson: f, fleetListCli: cli }
+  })
+  guard('sessions', probeSessions) // PM-005 trace root
+  guard('flows', probeFlows) // PM-006 per-flow SQL walk
+  sources.dsh_api = await probeDsh() // PM-004 join plane (always guarded internally)
+  const bootstrap = (() => { try { return probeBootstrap() } catch (e) { return { enabled: 'unknown', active: 'unknown', note: errBrief(e) } } })()
+  const degraded = Object.entries(sources).filter(([, s]) => !s?.live).map(([k]) => k)
+  return {
+    status: degraded.length ? 'degraded' : 'ok',
+    service: SERVICE,
+    version: VERSION,
+    pid: process.pid,
+    uptime_s: Math.round((Date.now() - startedMs) / 1000),
+    bootId: BOOT_ID,
+    tokenAuth: TOKEN !== '',
+    bootstrap,
+    sources,
+    degraded,
+    note: 'PM-009 meta: per-source live/degraded + version + systemd bootstrap; always HTTP 200 (tk renders empty states on degraded)',
+  }
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -851,16 +973,10 @@ const server = createServer((req, res) => {
   }
   if (req.method === 'POST' && (req.url === '/op/act' || req.url.startsWith('/op/act?'))) return handleActPost(req, res) // PM-008: the single write path
   if (req.method !== 'GET') return finish(405, { error: 'read-side only (ADR-002); the single write path is POST /op/act (PM-008 maestro CLI passthrough)' })
-  if (req.url === '/health') {
-    return finish(200, {
-      status: 'ok',
-      service: SERVICE,
-      version: VERSION,
-      pid: process.pid,
-      uptime_s: Math.round((Date.now() - startedMs) / 1000),
-      tokenAuth: TOKEN !== '',
-      note: 'PM-002 skeleton; full health/degraded meta endpoint is PM-009',
-    })
+  if (req.url === '/health' || req.url.startsWith('/health?')) {
+    // PM-009: full meta; the catch-all still answers 200+degraded (never 5xx)
+    serveHealth().then((r) => finish(200, r)).catch((e) => finish(200, { status: 'degraded', service: SERVICE, version: VERSION, pid: process.pid, degraded: ['health'], note: `health assembly failed: ${String(e?.message ?? e).slice(0, 160)}` }))
+    return
   }
   if (req.url === '/op/tickets') return finish(200, serveTickets())
   if (req.url.startsWith('/op/trace?') || req.url === '/op/trace') {
@@ -881,7 +997,7 @@ const server = createServer((req, res) => {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
   }
-  finish(404, { error: 'not found', service: SERVICE, hint: 'write passthrough = POST /op/act; health/degraded meta is PM-009' })
+  finish(404, { error: 'not found', service: SERVICE, hint: 'write passthrough = POST /op/act; health meta = GET /health (PM-009)' })
 })
 
 server.listen(0, '127.0.0.1', () => {
@@ -894,8 +1010,8 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
-    note: '幂等键=本文件路径; temp+rename 0600; PM-007 SSE 扇出 + PM-008 写透传已上线',
+    endpoints: ['GET /health (PM-009 meta: per-source live/degraded + bootstrap)', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
+    note: '幂等键=本文件路径; temp+rename 0600; PM-007 扇出 + PM-008 写透传 + PM-009 健康元已上线',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
   armFanout() // PM-007: watchers + reconcile poll + SSE keepalive

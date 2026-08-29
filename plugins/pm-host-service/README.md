@@ -1,6 +1,6 @@
 # pm-host-service（P0 — PM-001 壳 + PM-002 HTTP 投影骨架）
 
-maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）；PM-003..007 已续建 op=tickets/fleet/trace/flow 读投影与 `/subscribe` SSE 事件扇出；PM-008 已交付写透传 `POST /op/act`；health 元端点由 PM-009 续建。
+maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交付插件壳 + 自举 systemd user unit（ADR-003 模式 iii）；PM-002 交付 HTTP 投影 API 骨架（随机端口 / pm.port 端口文件 / 单实例 flock / `GET /health` 桩）；PM-003..007 已续建 op=tickets/fleet/trace/flow 读投影与 `/subscribe` SSE 事件扇出；PM-008 已交付写透传 `POST /op/act`；PM-009 已交付健康元端点（逐源 live/degraded + 版本 + 自举状态）。
 
 ## 形态红线
 
@@ -35,7 +35,31 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 | ⑧ 事件扇出 | `GET /subscribe?consumer=<sessionId>&kinds=<csv>` SSE 长连接: fs.watch 三数据面(`maestro/` 目录按文件名过滤 ledger.db / ledger.db-wal / fleet.json; `flows/` 递归) → 签名投影 → 推送; **双通道**第二通道 = 2s reconcile 轮询(inotify 尽力而为, 同时天然构成"同一变更双投递"实测路径) | 订阅幂等键 `(consumer, kinds)`: 同 consumer 再订阅 → 旧流收 `pm_sub_ended` 帧后终止, 新流接管(单 consumer 单活流)。事件幂等键 `(source, msgid)`, msgid 确定性 = `<kind>:<base>:<mtime_ns>:<size>` → 双通道同变更同 msgid, 60s 去重窗只放行一帧(恰好一次)。订阅先快照回放(环形缓冲 ≤50, kinds 过滤, 同 boot 游标后续发)再增量; 跨 boot 游标 → 全环回放(seq 只在单 boot 内可比)。**存储**(ADR-007.2 文件): `state/subscribers/<consumer>.json` 游标 + `state/subscribers/dedup.json` 去重窗(60s, >1000 行截半 GC, 重启恢复 60s 幸存者), 均 temp+rename 内容一致跳过。15s SSE 注释 ping(`: ping`)防代理空闲断连 |
 | ⑨ 写透传 | `POST /op/act` body `{"tool":"ledger\|flowc","args":[…],"ref":"vh-<8hex>"?}`: **本进程绝不实现账本写入、绝不打开 sqlite 写句柄**(ADR-002 P0 红线)——写动作一律 spawn 白名单 maestro CLI 透传(调用方按 ADR-007 只选天然幂等动词), 异步 spawn, 立即回 phase-1 回执 `{accepted,ref}` | 幂等键 = 每动作 `ref`(`vh-<8hex>`, `node:crypto` 铸造; 客户端重试可自带同格式 ref): **同 ref 重放 → 查登记表直答(replay:true), 零二次 CLI 调用**。CLI 完成(含死亡: spawn 失败/非零退出/30s 超时 SIGKILL)→ 经 PM-007 扇出 kind=`act` 事件带 ref 回流(tripwire: error 必达)。**存储**(ADR-007.2 文件): `state/act/registry.json` 在飞+终态登记表(temp+rename; 终态 >1000 条截半 GC, 只 GC 终态; boot 时孤儿 flying → `interrupted`, 重放如实上报, 换新 ref 重投) + `state/act/audit.jsonl` 审计(append-only, accept+settle 各一行; **写失败仅告警不阻断主链**)。读回: `GET /op/act?ref=` 单条 / `GET /op/act` 汇总(cliSpawns 计数为门证据面) |
 
-骨架路由：`GET /health` → 200 状态桩（完整 health/degraded 元端点属 PM-009）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；`GET /subscribe?consumer=<sessionId>&kinds=<csv>` → SSE 事件扇出（PM-007）；`POST /op/act` → 写透传（PM-008，唯一写路径）；`GET /op/act?ref=<vh-hex8>` → 动作读回；非 GET 且非 `/op/act` → 405（只读红线）；其余 → 404（health 元端点属 PM-009）。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+骨架路由：`GET /health` → 200 健康元端点（PM-009：逐源 live/degraded + 版本 + 自举状态，永不 5xx）；`GET /op/tickets` → 票面读投影（PM-003）；`GET /op/fleet` → 席位读投影（PM-004）；`GET /op/trace` → 轨迹读投影（PM-005）；`GET /op/flow` → 流程读投影（PM-006）；`GET /subscribe?consumer=<sessionId>&kinds=<csv>` → SSE 事件扇出（PM-007）；`POST /op/act` → 写透传（PM-008，唯一写路径）；`GET /op/act?ref=<vh-hex8>` → 动作读回；非 GET 且非 `/op/act` → 405（只读红线）；其余 → 404。stdout/stderr 走 journald；业务日志 `$MAESTRO_HOME/maestro/logs/pm-host-service/daemon.log`（>2MB 滚动）。
+
+## 健康元端点（PM-009）
+
+`GET /health` 恒 200（供 tk 渲染空态；任何探针失败只降级对应源，端点绝不 5xx）：
+
+```json
+{
+  "status": "ok | degraded",            // 任一源 degraded 即 degraded
+  "service": "pm-host-service", "version": "…", "pid": …, "uptime_s": …, "bootId": "…", "tokenAuth": false,
+  "bootstrap": { "unit": "pm-host-service", "unitFile": {"path","exists","readable"}, "enabled": "enabled|disabled|not-found|unavailable", "active": "…", "systemctl": "ok|missing" },
+  "sources": {
+    "ledger":     { "live": …, "ledgerDb": {exists,readable,size,mtime}, "ledgerCli": {executable} },   // PM-003 源
+    "tickets_md": { "live": …, "file": {…} },                                                            // 签名面
+    "fleet":      { "live": …, "fleetJson": {…}, "fleetListCli": {…} },                                  // PM-004 源
+    "dsh_api":    { "live": …, "url": "127.0.0.1:3080/api/session.list", "note": … },                    // fleet join 面(1s 预算)
+    "sessions":   { "live": …, "root": …, "buckets": N },                                                // PM-005 源
+    "flows":      { "live": …, "total": N, "readable": N, "flows": [{"flow","live","note"}], "degradedFlows": […] } // PM-006 逐库 SQL 自走
+  },
+  "degraded": ["…"],                     // 当前降级源名列表
+  "note": "…"
+}
+```
+
+探针纪律：全部只读（文件 stat+open 探可读，chmod 000 = exists 但不可读 → 降级；flows 逐库 `node:sqlite` readOnly 连接真跑 `SELECT COUNT(*) FROM v_status`；dsh_api 复用 fleet join 的 loopback RPC，1s abort）；`systemctl --user is-enabled/is-active` 结果缓存 5s，自举字段**可见即可见性契约**，不参与顶层 status 判定；探针各自 try/catch，单个探针崩溃只降级该源。
 
 ## 网关对齐（PM-008 / 写透传冻结假设对照）
 
@@ -96,7 +120,9 @@ PM-007（spec §PM-007）：同一变更双投递（watch + reconcile 双通道�
 
 PM-008（spec §PM-008）：G1 同 ref 重放 → 零二次 CLI 调用（fixture CLI 调用日志恰一行 + 汇总 `cliSpawns` 不增 + `replay:true`，受理态与终态两相位均验）；G2 CLI 死亡 → tripwire 必报（shebang 失效 spawn 失败 / 非零退出两路均 settle `status:error` 且 kind=act error 事件必达，daemon /health 仍 200）；G3 审计写失败（chmod 000 audit.jsonl）→ phase-1 回执照发、CLI 照跑、settle 事件照达、登记表照更新，daemon.log 出现 AUDIT WRITE FAILED 告警，恢复权限后审计续写；回归：PM-001..007 全部门绿（0.7.0 基线）。
 
+PM-009（spec §PM-009）：G1 正常态 → 全源 `live:true` + `version` 可见 + 顶层 `status:"ok"`；G2 逐源挂（chmod 000 ledger.db / 移走 tickets.md / chmod 000 fleet.json / chmod 000 flows/*/state.db / chmod 000 sessions root / 断 dsh_api）→ 逐源 `live:false` 顶层 `status:"degraded"` 且恒 HTTP 200，全源齐挂仍 200+degraded，恢复后自愈回 ok；G3 自举状态可见（`bootstrap.enabled/active/unitFile` 字段在场；live 上 `enabled=="enabled" && active=="active"`）；回归：PM-001..008 全部门绿（0.8.0 基线含 op=act）。
+
 ## 边界
 
 - 只读投影（ADR-002）：不直写任何 sqlite 账本；写侧一律透传 maestro CLI（PM-008 已交付：`POST /op/act`，本进程零账本写入）
-- 禁 npm 依赖、禁外发文件；health 元端点属 PM-009
+- 禁 npm 依赖、禁外发文件；健康元端点已交付（PM-009，`GET /health`）
