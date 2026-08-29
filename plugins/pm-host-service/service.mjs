@@ -272,10 +272,10 @@ const normSeat = (code, s) => {
 function readSeats() { // fleet.json direct; bin/fleet-list CLI as fallback authority
   try {
     const map = JSON.parse(readFileSync(FLEET_FILE, 'utf8'))?.fleet
-    if (!map || typeof map !== 'object') throw new Error('fleet.json has no fleet map')
-    const seats = Object.entries(map).map(([code, s]) => normSeat(code, s))
-    if (!seats.length) throw new Error('fleet.json fleet map is empty')
-    return seats
+    if (!map || typeof map !== 'object' || Array.isArray(map)) throw new Error('fleet.json has no fleet map')
+    // HF-017: an EMPTY map is structurally valid (zero seats fielded) — empty
+    // != broken; only a missing/malformed map falls to the fallback authority.
+    return Object.entries(map).map(([code, s]) => normSeat(code, s))
   } catch (e1) {
     const r = spawnSync(FLEET_LIST_BIN, [], { encoding: 'utf8', timeout: 8000 })
     if (r.error || r.status !== 0) throw new Error(`fleet.json unreadable (${String(e1?.message ?? e1).slice(0, 100)}) and fleet-list fallback failed`)

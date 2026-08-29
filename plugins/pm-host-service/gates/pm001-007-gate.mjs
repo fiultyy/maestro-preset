@@ -478,6 +478,13 @@ async function sb4() {
     h = await req(port, 'GET', '/health')
     ok('HF-009 unreadable ledger.db -> ledger source degraded', h.json?.sources?.ledger?.live === false)
     ok('HF-009 unreadable flow db -> flows source degraded (broken != absent)', h.json?.sources?.flows?.live === false && h.json?.sources?.flows?.total === 1, `note=${(h.json?.sources?.flows?.note ?? '').slice(0, 50)}`)
+
+    // ---- HF-017: empty fleet map = structurally valid (not degraded) ----
+    const fe = await req(port, 'GET', '/op/fleet')
+    ok('HF-017 empty fleet map -> 200 + count 0 + NOT degraded + join live', fe.status === 200 && fe.json?.count === 0 && fe.json?.degraded === false && Array.isArray(fe.json?.seats) && fe.json?.seats.length === 0 && fe.json?.sessionJoined === true, `count=${fe.json?.count} joined=${fe.json?.sessionJoined}`)
+    writeFileSync(`${sb}/maestro/fleet.json`, '{not-json')
+    const fb = await req(port, 'GET', '/op/fleet')
+    ok('HF-017 malformed fleet.json still degrades (broken != empty)', fb.status === 200 && fb.json?.degraded === true && fb.json?.sessionJoined === false && /fleet sources unavailable/.test(fb.json?.note ?? ''), `note=${(fb.json?.note ?? '').slice(0, 60)}`)
     await mock.close()
   } finally {
     await stopDaemon(child)
