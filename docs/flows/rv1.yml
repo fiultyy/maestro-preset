@@ -1,0 +1,15 @@
+# rv1 — review 轮 oneshot: P0+P1 全量交付物(v0.9.0, a8fab8b..3d037f5)
+# 范围: PM-001..009 + GW-001..002 + TK-001..004 + flows pm-p0/pm-p1
+# 维度: spec 符合性 / 代码质量 / 幂等与降级契约 vs spec / 验证门覆盖真实性 / 回归
+# 三片并行(纯读零改码, 无文件面写冲突); 问题→HF 票集中登记(编排者分配编号, 避免并行抢号)
+# 门: 三片裁决齐(pass/issues+refs) → rollup → review-final 回报 claw-02-pmhub
+id: rv1
+entry: rv-a-d
+nodes:
+  rv-a-d: {verb: dispatch, title: "review 片A: 服务+读面(PM-001..007·maestro-preset)", payload: {shard: A, repo: maestro-preset, tickets: PM-001..007}}
+  rv-a-c: {verb: callback, deps: [rv-a-d], title: "片A 裁决门: issues 抽验+纯读核验(零工作区改动)"}
+  rv-b-d: {verb: dispatch, title: "review 片B: 网关+客户端(GW+TK·pipecat-poc)", payload: {shard: B, repo: pipecat-poc, tickets: GW-001..002+TK-001..004}}
+  rv-b-c: {verb: callback, deps: [rv-b-d], title: "片B 裁决门: issues 抽验+纯读核验"}
+  rv-c-d: {verb: dispatch, title: "review 片C: P1+flows(PM-008..009·flows·台账)", payload: {shard: C, repo: maestro-preset, tickets: PM-008..009+flows}}
+  rv-c-c: {verb: callback, deps: [rv-c-d], title: "片C 裁决门: issues 抽验+纯读核验"}
+  rollup: {verb: rollup, deps: [rv-a-c, rv-b-c, rv-c-c], title: "裁决汇总+HF 票集中登记+review-final 回报"}
