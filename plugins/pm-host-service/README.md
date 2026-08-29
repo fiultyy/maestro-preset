@@ -66,7 +66,7 @@ maestro 编排面的**只读投影服务**（ADR-002）。本目录 PM-001 交�
 - 请求：`POST /op/act`，body `{"tool":"ledger|flowc","args":["…"],"ref":"vh-<8hex>"?}`；`ref` 可省（服务端铸造 `vh-<8hex>`）；tool 白名单外/args 非字符串数组/ref 格式非法/body >16KB → 400（allowlist 随错误返回）。
 - phase-1 回执（立即）：`{op:"act",accepted:true,ref,replay:false,status:"flying",tool,…}`——同步等待只到"已受理+已登记+已 spawn"，不等 CLI。
 - 同 ref 重放：`{accepted:true,ref,replay:true,status:<flying|ok|error|interrupted>,…}`——登记表直答，**零二次 CLI 调用**；`interrupted` = 上个 daemon 中途死亡（换新 ref 重投）。
-- 完成回流：PM-007 扇出 kind=`act` 事件帧（加性字段）：`data: {"t":"pm.event","seq":N,"msgid":"act:<ref>:<status>:<ms>","source":"act","kind":"act","path":"act/<ref>","ref":…,"tool":…,"args":[…],"status":"ok|error","exitCode":N|null,"ms":N,"err":…,"replay":bool}`——**error 事件必达**（spawn 失败/非零退出/超时均 settle 为 error 并照常扇出 = tripwire）。
+- 完成回流：PM-007 扇出 kind=`act` 事件帧（加性字段）：`data: {"t":"pm.event","seq":N,"msgid":"act:<ref>:<status>:<ms>","source":"act","kind":"act","path":"act/<ref>","ref":…,"tool":…,"args":[…],"status":"ok|error","exitCode":N|null,"ms":N,"err":…,"replay":bool}`——**error 事件必达**（spawn 失败/非零退出/超时均 settle 为 error 并照常扇出 = tripwire）。**跨 boot 孤儿（HF-008）**：boot 扫登记表发现 `flying` 遗留 → 置 `interrupted` 并**补落 act.settle(interrupted) 审计行 + kind=act interrupted 扇出事件**（后连订阅者经环回放收到 `replay:true`），tripwire 语义跨 boot 成立。
 - 审计：`state/act/audit.jsonl` 每动作两行（`act.accept` / `act.settle`），append-only，**0600**（创建即 0600；历史 0644/0664 文件在下次追加时治愈回 0600——HF-007，对齐 registry.json）；写失败仅 daemon.log 告警，主链路（回执→CLI→settle 事件）不受阻。
 - 安全边界：端点自身零账本写入（ADR-002）；动词幂等性由调用方按 ADR-007 选用天然幂等动词（如 `ledger ticket state`、`flowc advance`）。
 

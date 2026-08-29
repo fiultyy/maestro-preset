@@ -716,7 +716,10 @@ function appendAudit(rec) {
 
 // Boot recovery: an entry still 'flying' at load time lost its daemon (and
 // its child) mid-flight. Mark it 'interrupted' — a replay reports the
-// outcome honestly and the client resubmits under a fresh ref.
+// outcome honestly and the client resubmits under a fresh ref. HF-008: the
+// recovery itself now settles loudly like any other outcome — one audit
+// line + one kind=act fanout event per orphan (arrives to later subscribers
+// via ring replay; the error-tripwire contract holds across boots too).
 function loadRegistry() {
   try {
     const d = JSON.parse(readFileSync(ACT_REGISTRY_FILE, 'utf8'))
@@ -729,10 +732,14 @@ function loadRegistry() {
         e.error = 'daemon restart mid-flight; resubmit under a new ref'
         e.finishedAt = new Date().toISOString()
         interrupted++
+        acts.set(ref, e)
+        appendAudit({ t: 'act.settle', ts: e.finishedAt, ref, tool: e.tool, status: 'interrupted', exitCode: null, ms: null, err: e.error })
+        emitEvent('act', 'act', `act:${ref}:interrupted:${Date.now()}`, `act/${ref}`, { ref, tool: e.tool, args: e.args, status: 'interrupted', exitCode: null, ms: null, err: e.error })
+        continue
       }
       acts.set(ref, e)
     }
-    if (interrupted > 0) { log(`act boot recovery: ${interrupted} flying -> interrupted`); persistRegistry() }
+    if (interrupted > 0) { log(`act boot recovery: ${interrupted} flying -> interrupted (audit + fanout event each)`); persistRegistry() }
   } catch {} // missing/corrupt registry = fresh map; audit.jsonl stays the trail
 }
 

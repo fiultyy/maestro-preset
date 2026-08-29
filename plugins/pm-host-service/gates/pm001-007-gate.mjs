@@ -420,6 +420,31 @@ async function sb1() {
   }
 }
 
+// ============ SB3: HF-008 boot orphan (flying -> interrupted + event + audit) ============
+async function sb3() {
+  const sb = `${BASE}/sb3`
+  buildSandbox(sb)
+  mkdirSync(`${sb}/maestro/state/act`, { recursive: true })
+  const ORPHAN = 'vh-deadbeef'
+  writeFileSync(`${sb}/maestro/state/act/registry.json`, `${JSON.stringify({ version: 1, cap: 1000, entries: {
+    [ORPHAN]: { ref: ORPHAN, tool: 'ledger', args: ['ticket', 'state', 'T-X', 'done'], status: 'flying', submittedAt: '2026-08-29T00:00:00.000Z', submittedMs: 1, finishedAt: null, exitCode: null, error: null, cliSpawns: 1, stdoutTail: '', stderrTail: '' },
+  } }, null, 2)}\n`)
+  const { child, port } = await startDaemon(sb)
+  try {
+    console.log(`\n=== SB3 ${sb} (pre-seeded flying orphan ${ORPHAN}) port=${port} ===`)
+    const st = await req(port, 'GET', `/op/act?ref=${ORPHAN}`)
+    ok('HF-008 orphan readback status=interrupted', st.status === 200 && st.json?.found === true && st.json?.entry?.status === 'interrupted', JSON.stringify(st.json?.entry?.status))
+    const audit = readFileSync(`${sb}/maestro/state/act/audit.jsonl`, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    ok('HF-008 boot recovery writes act.settle(interrupted) audit line', audit.some((l) => l.t === 'act.settle' && l.ref === ORPHAN && l.status === 'interrupted'), `audit lines=${audit.length}`)
+    const sse = await subscribe(port, 'hf008-sub', 'act') // ring replay flushes headers instantly
+    const f = await waitFrame(sse, (x) => x.kind === 'act' && x.ref === ORPHAN, 3000)
+    ok('HF-008 orphan settles LOUDLY: kind=act SSE frame (ring replay)', f?.status === 'interrupted' && f?.replay === true, `msgid=${f?.msgid?.slice(0, 40)}`)
+    await sse.stop()
+  } finally {
+    await stopDaemon(child)
+  }
+}
+
 // ============ SB2: PM-002 port drift / flock / boot-death empty state ============
 async function sb2() {
   const sb = `${BASE}/sb2`
@@ -466,6 +491,7 @@ mkdirSync(BASE, { recursive: true })
 const startedAt = new Date().toISOString()
 await sb1()
 await sb2()
+await sb3()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pm001-007', startedAt, finishedAt: new Date().toISOString(), pass, fail, version: VERSION, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)
