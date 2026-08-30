@@ -998,6 +998,49 @@ async function serveHealth() {
   }
 }
 
+// ---- PW-001 (pm-web static face): public/ boot snapshot, read-only ----
+// Spec docs/specs/pm-web.md §1: the observability face ships as package
+// files NEXT TO this daemon — same port, same lifecycle (the face lives and
+// dies with the projector on purpose; a face that outlives the projector
+// would render dead data = fake availability). Strict allowlist: ONLY files
+// that existed in public/ at boot are served — request input can NAME a
+// file, never traverse into one (map keys are scanned filenames, so no
+// ../, no absolute paths, no subdirs). Content-Type by extension; a miss
+// falls through to the API routes and the JSON 404 stays the final
+// fallback. Zero npm, zero build: the authored file IS the deploy.
+const PUBLIC_DIR = new URL('./public/', import.meta.url)
+const STATIC_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.woff2': 'font/woff2',
+}
+const staticFace = new Map() // name -> { body, type }
+try {
+  for (const name of readdirSync(PUBLIC_DIR)) {
+    try {
+      const fileUrl = new URL(`./public/${name}`, import.meta.url)
+      if (!statSync(fileUrl).isFile()) continue
+      const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : ''
+      staticFace.set(name, { body: readFileSync(fileUrl), type: STATIC_TYPES[ext] ?? 'application/octet-stream' })
+    } catch {}
+  }
+  log(`pw-001 static face: ${staticFace.size} file(s) from public/ ([${[...staticFace.keys()].join(', ')}])`)
+} catch (e) {
+  log(`pw-001 static face: public/ unreadable (${errBrief(e)}) — face disabled, API unaffected`)
+}
+function serveStatic(rawUrl) { // -> { body, type } | null (miss falls through to API routes)
+  const path = rawUrl.split('?')[0]
+  const name = path === '/' ? 'index.html' : path.replace(/^\/+/, '')
+  return staticFace.get(name) ?? null
+}
+
 const server = createServer((req, res) => {
   const finish = (code, obj) => {
     res.writeHead(code, { 'content-type': 'application/json' })
@@ -1008,6 +1051,14 @@ const server = createServer((req, res) => {
   }
   if (req.method === 'POST' && (req.url === '/op/act' || req.url.startsWith('/op/act?'))) return handleActPost(req, res) // PM-008: the single write path
   if (req.method !== 'GET') return finish(405, { error: 'read-side only (ADR-002); the single write path is POST /op/act (PM-008 maestro CLI passthrough)' })
+  // PW-001 (pm-web): static face FIRST — GET / and package files from the
+  // public/ boot snapshot; a miss falls through to the API routes untouched.
+  const staticHit = serveStatic(req.url)
+  if (staticHit) {
+    res.writeHead(200, { 'content-type': staticHit.type, 'cache-control': 'no-cache' })
+    res.end(staticHit.body)
+    return
+  }
   if (req.url === '/health' || req.url.startsWith('/health?')) {
     // PM-009: full meta; the catch-all still answers 200+degraded (never 5xx)
     serveHealth().then((r) => finish(200, r)).catch((e) => finish(200, { status: 'degraded', service: SERVICE, version: VERSION, pid: process.pid, degraded: ['health'], note: `health assembly failed: ${String(e?.message ?? e).slice(0, 160)}` }))
@@ -1045,7 +1096,7 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET /health (PM-009 meta: per-source live/degraded + bootstrap)', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
+    endpoints: ['GET / (pm-web static face: public/ snapshot)', 'GET /health (PM-009 meta: per-source live/degraded + bootstrap)', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
     note: '幂等键=本文件路径; temp+rename 0600; PM-007 扇出 + PM-008 写透传 + PM-009 健康元已上线',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)

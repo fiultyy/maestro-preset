@@ -1,0 +1,75 @@
+<!doctype html>
+<!-- pm-web — maestro 浏览器观测面 (spec docs/specs/pm-web.md PW-002..005)
+     零 npm / 零构建 / 零第三方 import: 本文件+app.js+style.css 即部署物。
+     数据: GET /op/{tickets,fleet,flow} + /health 30s 轮询 + SSE /subscribe 直连。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pm-web · maestro 观测面</title>
+  <link rel="icon" href="data:,"><!-- 防 favicon 404 噪声 -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>pm-web <span id="svc-meta" class="dim">—</span></h1>
+    <div class="badges">
+      <span id="sse-badge" class="badge unknown">SSE 连接中…</span>
+      <span id="health-badge" class="badge unknown">health 未拉</span>
+    </div>
+  </header>
+
+  <div id="banner" hidden></div>
+
+  <nav id="tabs">
+    <button data-view="tickets" class="active" type="button">票</button>
+    <button data-view="fleet" type="button">席位</button>
+    <button data-view="flow" type="button">流程</button>
+  </nav>
+
+  <div id="layout">
+    <main>
+      <section id="view-tickets" class="view"></section>
+      <section id="view-fleet" class="view" hidden></section>
+      <section id="view-flow" class="view" hidden></section>
+    </main>
+
+    <aside id="act-panel">
+      <h2>写动作 <span class="dim">(POST /op/act 透传)</span></h2>
+      <form id="act-form">
+        <select id="act-tool" aria-label="tool">
+          <option value="ledger">ledger</option>
+          <option value="flowc">flowc</option>
+        </select>
+        <input id="act-args" placeholder='["ticket","list"]' value='["ticket","list"]'
+               aria-label="args (JSON 数组)" spellcheck="false">
+        <button type="submit">提交</button>
+      </form>
+      <p class="dim small">白名单 tool ∈ {ledger, flowc}；一切写透传 maestro CLI（页面零账本写）。
+        示例: <code>["ticket","list"]</code> · <code>["ticket","state","&lt;id&gt;","--to","running"]</code></p>
+      <ul id="act-log"></ul>
+    </aside>
+  </div>
+
+  <footer>
+    <h2 class="dim small">事件流 <span class="dim">(SSE /subscribe · consumer=<span id="consumer-name">—</span>)</span></h2>
+    <ul id="event-log"></ul>
+  </footer>
+
+  <dialog id="act-confirm">
+    <form method="dialog">
+      <h2>确认写动作</h2>
+      <p>将透传执行以下幂等 CLI：</p>
+      <pre id="confirm-cmd"></pre>
+      <p class="small dim">写动作经 pm-host-service → maestro CLI（ADR-002：页面与服务均不直写账本）。
+        phase-1 受理回 <code>{accepted, ref}</code>，完成事件经 SSE 带 ref 回流对账。</p>
+      <menu>
+        <button value="cancel" type="submit">取消</button>
+        <button value="ok" type="submit" class="primary">确认执行</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
