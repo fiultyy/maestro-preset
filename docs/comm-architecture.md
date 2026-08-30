@@ -2,6 +2,7 @@
 
 > 2026-08-25 由四路源码调研汇编。源码:/home/yy/tools/maestro-preset(§行号均指此仓);
 > 运行装点:~/.dsh;隔离沙箱:/home/yy/tools/dsh-comm-sandbox(:3081)。
+> 2026-08-30 增补:fleet-adopt/fleet-tree(parent 结构面)+ watchdog/orch-notify 退役勘正。
 
 ## 0. 全景图
 
@@ -27,10 +28,12 @@ flowchart TB
         SS["session-send"]
         SPAWN["session-spawn"]
         TOUCH["fleet-touch"]
+        ADOPT["fleet-adopt"]
+        TREE["fleet-tree"]
     end
 
     subgraph 登记["fleet.json (MAESTRO_FLEET)"]
-        FLEET["fleet 表: shortcode→session/terminal"]
+        FLEET["fleet 表: shortcode→session/terminal<br/>+ parent 结构字段(编排组树)"]
     end
 
     CBSEND -->|HTTP 优先| HTTP
@@ -43,6 +46,8 @@ flowchart TB
     SS -->|DSHMSG] v2 信封| LOOPRPC
     SPAWN -->|session.create + 登记| FLEET
     TOUCH -->|flock 心跳/租约/sweep| FLEET
+    ADOPT -->|flock 写 parent/flow/lane 挂树| FLEET
+    TREE -->|只读森林渲染| FLEET
     ORCA -.standby 让位.-> HOSTLAN
     MSG -.standby 让位.-> HOSTLAN
 ```
@@ -102,7 +107,7 @@ flowchart TB
 **路径** `~/.dsh/maestro/fleet.json`(env `MAESTRO_FLEET`);顶层 `{port, defaultWorkspaceId, fleet, terminal}`。
 
 两种条目:
-- **session 类**(键=sessionId 前 4 hex):`sessionId/role(worker|orchestrator|supervisor|peer|liaison)/node/preset/spawnedAt/status(active|standby|retired)/mailbox?/project?` + OF-002 租约键(`owner/leaseExpiresAt/heartbeatAt/leaseTtlMin`,claim 后)
+- **session 类**(键=sessionId 前 4 hex):`sessionId/role(worker|orchestrator|supervisor|peer|liaison)/node/preset/spawnedAt/status(active|standby|retired)/mailbox?/project?` + OF-002 租约键(`owner/leaseExpiresAt/heartbeatAt/leaseTtlMin`,claim 后) + **结构面字段**(`parent` 编排者签名或父席位码、`flow?` 波 id、`lane?` 车道——编排组树,fleet-adopt 写/fleet-tree 读,与租约闸正交)
 - **orca-terminal 类**(键=terminal handle):`kind:"orca-terminal"/handle/status(probing|verified|mismatch|stale|inactive|released)/probedAt/verifiedAt/lastSeenAt/alias/note`
 
 **生命周期写入者**(全部 flock 串行或 tmp+rename 原子):
@@ -113,8 +118,11 @@ flowchart TB
 | 建 terminal | fleet-probe(upsert_probing,:85-94) |
 | 建 a2a 孵化 | a2a-profile-server/registry.js(updateEntry→writeFleet,:62-69) |
 | 心跳/租约/sweep | fleet-touch(touch/claim/heartbeat/release/sweep,:125-218) |
+| 结构认领/解除 | fleet-adopt(flock 写 parent/flow/lane,幂等,--clear 解除) |
 | 状态迁移 | a2a registry.transition('retired') 同步落 fleet |
 | 删 | session-purge(HTTP /purge→fleet 移除,:48-55) |
+
+只读消费者:fleet-list(席位清单)、fleet-tree(编排组森林,循环引用降级/unattached 计数)。
 
 **关键关系**:fleet 管"**谁存在**"(会话/终端元数据),registry.json 管"**桥投给谁**"(消费者路由)——两者正交;host-callback-bridge 不读写 fleet(仅 loopback-sink 读它的 `port` 字段做 apiPort 回退);orca-callback 完全不碰 fleet。
 
@@ -132,10 +140,10 @@ flowchart TB
 ## 4. 其余角色
 
 - **a2a-profile-server**(:8790):A2A HTTP 面 + profile 孵化库;读 fleet 做 reattach/心跳,retired 同步写回;`agents/send` 轻载走 session-send、重载走 dais mailbox(http-server.js:152-166)
-- **event-watchd**:回合外看守,flock 单实例,session-list 轮询→session-send notify
-- **orch-notify.sh**:orchestration.db outbox→cb-send→编排者回合(硬链路 v2)
+- ~~event-watchd~~:**已退役**(2026-08-30 gapfix;bin 留档无单元在跑)——回合外看守职能并入编排者自巡
+- ~~orch-notify.sh~~:**已退役**(ADR-011,orch-hardlink 退役;单元归档 `logs/orch-hardlink-retire/`,orchestration.db 仍活用于 memory/diag 线)
 - **ledger**(SQLite):项目状态账本,与桥/fleet 无直接耦合,终态票单向投影 longtask-carryover.md(OF-010)
-- **锁文件真相**:无 `maestro.lock`;实际锁是 `state/fleet.json.lock`、`ledger.db.lock`、`watch/watchd.lock`、`hooks/orch-notify.lock`
+- **锁文件真相**:无 `maestro.lock`;现行实锁 = `state/fleet.json.lock`(spawn/touch/adopt 共用哨兵)、`ledger.db.lock`;watch/hooks 旧锁随单元退役消亡
 
 ## 5. env 重定向矩阵(沙箱隔离依据)
 
