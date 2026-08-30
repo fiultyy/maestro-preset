@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""fleet-adopt — 编排者认领席位为下属(写 parent 树关系, fleet.json)
+
+用法:
+  fleet-adopt <code> <parent> [--flow <flowId>] [--lane <lane>] [--clear]
+              [--fleet <fleet.json>] [--selftest]
+  <code>   席位 4 位码或完整 sessionId(fleet 表键解析)
+  <parent> 编排者完整签名(orch-<x>@session-…);或另一席位码(嵌套下属)
+  --flow   可选, 关联流程 id(波标识, 便于 fleet-tree 分组展示)
+  --lane   可选, 车道标签(如 W1/读面/写面)
+  --clear  解除认领(抹掉 parent/flow/lane, 与 <parent> 互斥出现)
+
+语义(orch-fleet-conventions.md §编排组树):
+  席位条目新增/更新 "parent"(+可选 "flow"/"lane")字段——编排者为根的下属树。
+  属主契约(steer 闸 OF-002)仍是执行面互斥; parent 是**结构面**标注, 供 fleet-tree
+  查完整编排组结构, 不参与 steer 判定(两域正交, 互不替代)。
+
+锁: 与 session-spawn/fleet-touch 同款 flock 哨兵锁(LOCK_EX 阻塞于
+    MAESTRO_STATE/<fleet basename>.lock, 独立 inode 抗 os.replace;
+    重读→改→temp+os.replace), 并发认领不丢更新。
+幂等: 同 code+parent 重复 adopt = 字段刷新(no-op 等价)。
+
+环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json) · MAESTRO_STATE(默认 ~/.dsh/maestro/state)
+退出码: 0 成功 · 2 用法错 · 3 fleet.json 缺失/席位不存在 · 4 selftest 失败
+"""
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+
+def resolve_key(fleet, ident):
+    """码/完整 sessionId → fleet 表键; 找不到返回 None。"""
+    if ident in fleet:
+        return ident
+    for k in fleet:
+        if fleet[k].get('sessionId') == ident:
+            return k
+    return None
+
+
+def adopted_lock(state, path):
+    os.makedirs(state, exist_ok=True)
+    lock_path = os.path.join(state, os.path.basename(os.path.abspath(path)) + '.lock')
+    return lock_path
+
+
+def do_adopt(path, ident, parent, flow, lane, clear):
+    with open(path, encoding='utf-8') as f:
+        doc = json.load(f)
+    fleet = doc.get('fleet', {})
+    key = resolve_key(fleet, ident)
+    if key is None:
+        print(f'fleet-adopt: 席位不存在: {ident}', file=sys.stderr)
+        return 3
+    entry = fleet[key]
+    if clear:
+        for fld in ('parent', 'flow', 'lane'):
+            entry.pop(fld, None)
+    else:
+        entry['parent'] = parent
+        if flow:
+            entry['flow'] = flow
+        if lane:
+            entry['lane'] = lane
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.fleet-adopt-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    verb = 'cleared' if clear else \
+        f"parent={parent}" + (f" flow={flow}" if flow else '') + (f" lane={lane}" if lane else '')
+    print(json.dumps({'ok': True, 'code': key, 'verb': verb}, ensure_ascii=False))
+    return 0
+
+
+def run_locked(path, state, ident, parent, flow, lane, clear):
+    lock_path = adopted_lock(state, path)
+    fh = open(lock_path, 'a+', encoding='utf-8')
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return do_adopt(path, ident, parent, flow, lane, clear)
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def selftest():
+    d = tempfile.mkdtemp(prefix='fleet-adopt-selftest-')
+    fp = os.path.join(d, 'fleet.json')
+    seed = {'port': 3080, 'defaultWorkspaceId': 'x', 'fleet': {
+        'aa01': {'sessionId': 'session-aa01ffff', 'role': 'worker', 'node': 't1', 'status': 'active'},
+        'bb02': {'sessionId': 'session-bb02ffff', 'role': 'worker', 'node': 't2', 'status': 'active'},
+    }}
+    with open(fp, 'w', encoding='utf-8') as f:
+        json.dump(seed, f)
+    state = os.path.join(d, 'state')
+    rc1 = run_locked(fp, state, 'aa01', 'orch-x@session-cccc', 'w1', 'W1', False)
+    doc = json.load(open(fp))
+    ok1 = (doc['fleet']['aa01'].get('parent') == 'orch-x@session-cccc'
+           and doc['fleet']['aa01'].get('flow') == 'w1' and doc['fleet']['aa01'].get('lane') == 'W1')
+    rc2 = run_locked(fp, state, 'session-bb02ffff', 'aa01', None, None, False)  # 嵌套: 全 sid + 父=另一席位码
+    doc = json.load(open(fp))
+    ok2 = doc['fleet']['bb02'].get('parent') == 'aa01'
+    rc3 = run_locked(fp, state, 'aa01', None, None, None, True)
+    ok3 = 'parent' not in json.load(open(fp))['fleet']['aa01']
+    rc4 = run_locked(fp, state, 'zz99', 'x', None, None, False)
+    ok4 = rc4 == 3 and 'zz99' not in json.load(open(fp))['fleet']
+    ok = ok1 and ok2 and ok3 and ok4 and rc1 == 0 and rc2 == 0 and rc3 == 0
+    print(f"fleet-adopt selftest: {'PASS' if ok else 'FAIL'} (adopt={ok1} nested={ok2} clear={ok3} missing={ok4})")
+    shutil.rmtree(d, ignore_errors=True)
+    return 0 if ok else 4
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('ident', nargs='?')
+    ap.add_argument('parent', nargs='?')
+    ap.add_argument('--flow')
+    ap.add_argument('--lane')
+    ap.add_argument('--clear', action='store_true')
+    ap.add_argument('--fleet')
+    ap.add_argument('--selftest', action='store_true')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.ident or (not a.parent and not a.clear) or (a.parent and a.clear):
+        print(__doc__.splitlines()[2].strip(), file=sys.stderr)
+        sys.exit(2)
+    path = a.fleet or os.environ.get('MAESTRO_FLEET') or os.path.expanduser('~/.dsh/maestro/fleet.json')
+    if not os.path.exists(path):
+        print(f'fleet-adopt: fleet.json 缺失: {path}', file=sys.stderr)
+        sys.exit(3)
+    home = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+    state = os.environ.get('MAESTRO_STATE') or os.path.join(home, 'maestro', 'state')
+    sys.exit(run_locked(path, state, a.ident, a.parent, a.flow, a.lane, a.clear))
+
+
+if __name__ == '__main__':
+    main()

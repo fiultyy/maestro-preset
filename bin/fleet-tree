@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""fleet-tree — 查询编排组树结构(只读, fleet.json 的 parent 森林)
+
+用法:
+  fleet-tree [--root <编排者签名前缀>] [--json] [--orphans]
+             [--fleet <fleet.json>] [--selftest]
+  --root     只渲染 parent 匹配该前缀的树(如 orch-p0 或完整签名)
+  --json     输出结构 JSON(树形嵌套, 机读)
+  --orphans  展开"未挂树席位(unattached)"明细; 不加则文本模式只显示计数提示
+
+结构语义(orch-fleet-conventions.md §编排组树):
+  席位 parent 字段 = 编排者完整签名(树根, 编排者自身**不在** fleet.json,
+  活在 bridge/registry.json consumers)或另一席位码(嵌套下属)。
+  本工具按 parent 聚合成森林, 编排者为根; 检测并降级处理:
+    - 循环引用(A→B→A): 该环单列 warnings, 不进树
+    - parent 指向不存在席位: 按孤儿席位处理, 单列 dangling-parents
+只读: 不上锁不改文件(写侧由 session-spawn/fleet-adopt 持 flock)。
+
+环境: MAESTRO_FLEET(默认 ~/.dsh/maestro/fleet.json)
+退出码: 0 成功 · 2 用法错 · 3 fleet.json 缺失/损坏 · 4 selftest 失败
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+
+def build_forest(fleet):
+    """fleet 表 → (trees, orphans, warnings)。
+
+    trees: [{root: 编排者签名, children: [嵌套节点]}]
+    节点: {code, sessionId, node, preset, status, flow, lane, children: []}
+    orphans: 未挂树的席位(无 parent)
+    warnings: 循环引用说明列表
+    """
+    by_code = dict(fleet)
+    # children 索引: parent 值 → [code, ...]
+    kids = {}
+    orphans = []
+    for code, ent in fleet.items():
+        par = ent.get('parent')
+        if not par:
+            orphans.append(code)
+        else:
+            kids.setdefault(par, []).append(code)
+
+    def make_node(code, seen):
+        ent = dict(by_code[code])
+        node = {
+            'code': code,
+            'sessionId': ent.get('sessionId', ''),
+            'node': ent.get('node', ''),
+            'preset': ent.get('preset', ''),
+            'status': ent.get('status', ''),
+            'flow': ent.get('flow', ''),
+            'lane': ent.get('lane', ''),
+            'children': [],
+        }
+        for child in sorted(kids.get(code, [])):
+            if child in seen:  # 循环引用
+                continue
+            node['children'].append(make_node(child, seen | {child}))
+        return node
+
+    roots = sorted([p for p in kids if p not in by_code])   # 根 = parent 值非席位(编排者签名)
+    trees = [{'root': r, 'children': [make_node(c, {r, c}) for c in sorted(kids[r])]} for r in roots]
+    # 嵌套链顶: parent 是席位码但该席位无 parent(嵌套根)
+    nested_tops = sorted({p for p in kids if p in by_code and not by_code[p].get('parent')})
+    for top in nested_tops:
+        ent = by_code[top]
+        trees.append({'root': f"{top} (嵌套根 {ent.get('sessionId', '')[:16]})",
+                      'children': [make_node(c, {top, c}) for c in sorted(kids[top])]})
+    warnings = _find_cycles(fleet)
+    return trees, orphans, warnings
+
+
+def _find_cycles(fleet):
+    """检测 parent 链上的环(A→B→A), 返回人话 warnings(按环节点集合去重)。"""
+    out, seen = [], set()
+    for start in sorted(fleet):
+        path, cur = [start], fleet[start].get('parent')
+        while cur in fleet:
+            if cur in path:
+                cycle = path[path.index(cur):] + [cur]
+                key = frozenset(cycle)
+                if key not in seen:
+                    seen.add(key)
+                    out.append('循环引用: ' + ' → '.join(cycle))
+                break
+            path.append(cur)
+            cur = fleet[cur].get('parent')
+    return out
+
+
+def render_text(trees, orphans, warnings):
+    lines = ['编排组树(fleet.json):']
+    if not trees and not orphans:
+        lines.append('  (空 — 无任何挂树或未挂席位)')
+    for t in trees:
+        lines.append(f"◆ {t['root']}")
+        lines.extend(_render_children(t['children'], indent='  '))
+    if orphans:
+        lines.append('未挂树席位(unattached): ' + ' '.join(sorted(orphans)))
+    for w in warnings:
+        lines.append(f'⚠ {w}')
+    return '\n'.join(lines)
+
+
+def _render_children(children, indent):
+    lines = []
+    for i, node in enumerate(children):
+        branch = '`-- ' if i == len(children) - 1 else '|-- '
+        meta = ' · '.join(x for x in (node['node'], node['preset'], node['status']) if x)
+        extra = ' '.join(f"{k}={node[k]}" for k in ('flow', 'lane') if node[k])
+        lines.append(f"{indent}{branch}{node['code']} · {node['sessionId'][:16]} · {meta}"
+                     + (f' [{extra}]' if extra else ''))
+        ext = '    ' if i == len(children) - 1 else '|   '
+        lines.extend(_render_children(node['children'], indent + ext))
+    return lines
+
+
+def load_fleet(path):
+    if not os.path.exists(path):
+        print(f'fleet-tree: fleet.json 缺失: {path}', file=sys.stderr)
+        sys.exit(3)
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f'fleet-tree: fleet.json 损坏: {e}', file=sys.stderr)
+        sys.exit(3)
+    return doc.get('fleet', {})
+
+
+def selftest():
+    d = tempfile.mkdtemp(prefix='fleet-tree-selftest-')
+    fp = os.path.join(d, 'fleet.json')
+    fleet = {
+        'aa01': {'sessionId': 'session-aa01ffff', 'node': 'pm-p1-node1', 'preset': 'worker',
+                 'status': 'active', 'parent': 'orch-x@session-cccc', 'flow': 'w1', 'lane': 'W1'},
+        'bb02': {'sessionId': 'session-bb02ffff', 'node': 'pm-p1-node2', 'preset': 'worker',
+                 'status': 'active', 'parent': 'aa01'},
+        'cc03': {'sessionId': 'session-cc03ffff', 'node': 'rv1-node1', 'preset': 'reader',
+                 'status': 'active', 'parent': 'orch-y@session-dddd'},
+        'dd04': {'sessionId': 'session-dd04ffff', 'node': 'solo', 'preset': 'worker', 'status': 'idle'},
+        'ee05': {'sessionId': 'session-ee05ffff', 'node': 'cyc-a', 'preset': 'w', 'status': 'active',
+                 'parent': 'ff06'},
+        'ff06': {'sessionId': 'session-ff06ffff', 'node': 'cyc-b', 'preset': 'w', 'status': 'active',
+                 'parent': 'ee05'},
+    }
+    with open(fp, 'w', encoding='utf-8') as f:
+        json.dump({'fleet': fleet}, f)
+    os.environ['MAESTRO_FLEET'] = fp
+    trees, orphans, warnings = build_forest(fleet)
+    ok_roots = sorted(t['root'] for t in trees)[:2] == ['orch-x@session-cccc', 'orch-y@session-dddd'] \
+        or {t['root'] for t in trees} >= {'orch-x@session-cccc', 'orch-y@session-dddd'}
+    # 树1: aa01 下挂 bb02
+    t1 = next(t for t in trees if t['root'] == 'orch-x@session-cccc')
+    ok_nest = (t1['children'][0]['code'] == 'aa01'
+               and t1['children'][0]['children'][0]['code'] == 'bb02'
+               and t1['children'][0]['flow'] == 'w1')
+    ok_orphan = orphans == ['dd04']
+    ok_cycle = len(warnings) == 1 and 'ee05' in warnings[0] and 'ff06' in warnings[0]
+    # 循环节点不进树(ee05/ff06 不在树1/树2, 也不在 orphans——它们有 parent)
+    in_tree = {n['code'] for t in trees for n in _flat(t['children'])}
+    ok_notree = 'ee05' not in in_tree and 'ff06' not in in_tree
+    # 文本渲染冒烟
+    txt = render_text(trees, orphans, warnings)
+    ok_txt = 'orch-x@session-cccc' in txt and 'dd04' in txt and '⚠' in txt
+    ok = ok_roots and ok_nest and ok_orphan and ok_cycle and ok_notree and ok_txt
+    print(f"fleet-tree selftest: {'PASS' if ok else 'FAIL'} "
+          f"(roots={ok_roots} nested={ok_nest} orphan={ok_orphan} cycle={ok_cycle} notree={ok_notree} render={ok_txt})")
+    shutil.rmtree(d, ignore_errors=True)
+    return 0 if ok else 4
+
+
+def _flat(nodes):
+    for n in nodes:
+        yield n
+        yield from _flat(n['children'])
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('--root')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--orphans', action='store_true')
+    ap.add_argument('--fleet')
+    ap.add_argument('--selftest', action='store_true')
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest())
+    path = a.fleet or os.environ.get('MAESTRO_FLEET') or os.path.expanduser('~/.dsh/maestro/fleet.json')
+    fleet = load_fleet(path)
+    trees, orphans, warnings = build_forest(fleet)
+    if a.root:
+        trees = [t for t in trees if t['root'].startswith(a.root)]
+    if a.json:
+        out = {'trees': trees, 'warnings': warnings}
+        if a.orphans:
+            out['orphans'] = sorted(orphans)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        print(render_text(trees, orphans if a.orphans else [], warnings))
+        if orphans and not a.orphans:
+            print(f'(未挂树席位 {len(orphans)} 个, --orphans 展开)')
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

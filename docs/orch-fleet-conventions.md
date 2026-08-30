@@ -115,3 +115,43 @@ RPC 面 46 方法**无 session.delete**(唯一 delete 是 workspace.delete)。�
 |---|---|---|
 | session-243750f0 | 2437-pump-v35-b2 · code · pump v3.5实现(done,可复用) | 在册可见 |
 | session-a409b2c9 | a409-main-to-main-loopback · minimal · B→A回环验证(done) | 已恢复可见 ✅ |
+
+## 多编排者并存纪律(2026-08-30)
+
+四层隔离(steer 属主租约 / 按 to 寻址回调 / ledger flock+状态机 / per-flow state.db)已覆盖执行面互斥;残余共享面靠以下纪律兜底:
+
+1. **ID 命名空间前缀**:flow/node/ref ID 带编排者+波前缀(如 `pm-p1-*`、`rv1-*`、`hf1-*`),杜绝跨编排者撞 key;裸名(w1/step1)只许在单编排者独占期使用。
+2. **同仓串行**:同一 repo 的 worktree 写入车道串行——两个编排者派 worker 进同一 repo 时,后到者等前波 close(先例:P1 单车道推进);纯读车道可并行(先例:rv1 三分片)。
+3. **ticket 全限定**:ticket 归属写全(repo+编号),跨编排者不复用同一 ticket key;`lease_owner` 天然互斥,但认知面要能一眼分属。
+4. **结构面归属见下节**:席位挂谁的树,fleet-tree 一眼可查——不靠翻 steer 日志反推。
+
+## 编排组树:parent 结构面(2026-08-30)
+
+fleet.json 席位条目新增**结构字段**(与 status/role 等执行字段正交):
+
+```
+"<code>": { ..., "parent": "<编排者完整签名|父席位码>", "flow": "<波id>", "lane": "<车道标签>" }
+```
+
+- **根不在 fleet.json**:编排者活在 bridge/registry.json consumers,fleet.json 只存被编排侧;树根 = parent 值为编排者签名(如 `orch-p0@session-…`)的串,不要求根席位在册。
+- **嵌套**:parent 也可指向另一席位码(分组/子树),fleet-tree 按嵌套根渲染。
+- **与属主契约正交**:OF-002 steer 租约是**执行面**互斥;parent 是**结构面**标注,不参与 steer 判定——查得出"谁在谁的组里",不代表"谁此刻有权派活"。
+- **解除认领**:`fleet-adopt --clear` 抹掉 parent/flow/lane。
+
+工具(preset `bin/`,dev-sync 落地):
+
+```
+fleet-adopt <code> <parent> [--flow F] [--lane L] [--clear] [--fleet <path>]   # flock 写,幂等
+fleet-tree  [--root <签名前缀>] [--json] [--orphans] [--fleet <path>]          # 只读森林渲染
+```
+
+- fleet-adopt:锁与 session-spawn 同款(LOCK_EX 哨兵于 `MAESTRO_STATE/<basename>.lock`,重读→改→temp+os.replace);认领时机 = 编排者派发首个 steer 之前,同波席位同 parent,`--flow/--lane` 标注波与车道。
+- fleet-tree:按 parent 聚合成森林;循环引用单列 ⚠ 不进树;无 parent 席位列 unattached(计数提示,`--orphans` 展开);`--root orch-p0` 只看本编排组。
+- 两工具均带 `--selftest`(临时 fixture,零真实状态触碰)。
+
+派发协议插一步(第 3.5 步,spawn 之后 steer 之前):
+
+```
+spawn → 验席位 → fleet-adopt 认领挂树 → steer 派发(内嵌 cb-send 契约)
+      → 独立验证闸 ×2 → ledger → flowc advance(幂等预检)
+```
