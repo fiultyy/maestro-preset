@@ -71,6 +71,7 @@ if [ "$SYSTEMD" = 1 ]; then
   echo "== 5. systemd user unit → ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/"
   NODE_BIN="$(command -v node)"
   [ -n "$NODE_BIN" ] || { echo "node 不在 PATH,无法生成 unit" >&2; exit 1; }
+  NODE_BIN_DIR="$(dirname "$(readlink -f "$NODE_BIN")")"
   UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   UNIT="$UNIT_DIR/a2a-profile-daemon.service"
   run mkdir -p "$UNIT_DIR"
@@ -85,6 +86,23 @@ if [ "$SYSTEMD" = 1 ]; then
   run systemctl --user daemon-reload
   run systemctl --user enable a2a-profile-daemon
   echo "   已 enable。在役 daemon 不打断;改代码后手动: systemctl --user restart a2a-profile-daemon"
+
+  # dsh-web(宿主+web GUI) — 插件同发布装点: 模板渲染, 在役不打断
+  UNIT="$UNIT_DIR/dsh-web.service"
+  if [ -f "$DSH/run-web.sh" ]; then
+    if [ "$DRY" = 1 ]; then
+      echo "dry: sed 模板渲染 → $UNIT"
+    else
+      sed -e "s|__DSH__|$DSH|g" \
+          -e "s|__NODE_BIN_DIR__|$NODE_BIN_DIR|g" \
+          "$ROOT/host/systemd/dsh-web.service.in" > "$UNIT"
+    fi
+    run systemctl --user daemon-reload
+    run systemctl --user enable dsh-web
+    echo "   dsh-web 已 enable(在役不打断; 绑定地址由 ${DSH}/cordis.patch.yml webserver 行管)"
+  else
+    echo "   跳过 dsh-web: ${DSH}/run-web.sh 不存在(先按 host/README.md 人工步骤落 run-web.sh)"
+  fi
 fi
 
 echo "== 完成。剩余人工步骤(凭据/组合行): host/README.md"

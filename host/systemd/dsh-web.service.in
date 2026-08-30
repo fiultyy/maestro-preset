@@ -1,0 +1,25 @@
+# host/systemd/dsh-web.service.in — dsh 宿主+web GUI 的 systemd user unit 模板
+#
+# 由 host/install.sh --systemd 生成(占位符替换)到 ~/.config/systemd/user/。
+# 占位符(仅 Service 段): DSH_HOME 目录 / node 实体 bin 目录(经 readlink -f 解软链,供 PATH)
+# 语义: dsh-web 属 maestro-preset 插件同发布装点(host/install.sh 分发体系 §5);
+#       Restart=always 宿主自愈; NoNewPrivileges=true 硬化(提权面关闭);
+#       绑定地址不在此单元——live 于 ${DSH}/cordis.patch.yml webserver 行(现 127.0.0.1:3080)。
+# 在役服务不打断: install 只 daemon-reload+enable, 不 restart。
+[Unit]
+Description=DSH host+web (DeepSeek Harness web profile on 127.0.0.1:3080)
+Documentation=https://github.com/anthropics/deepseek-harness
+
+[Service]
+Type=simple
+ExecStart=__DSH__/run-web.sh
+WorkingDirectory=__DSH__
+# run-web.sh calls bare `dsh` (nvm-installed); user managers do not inherit shell PATH.
+Environment=PATH=__NODE_BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=5
+# Hardened-ish but permissive for a node app binding loopback:3080.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
