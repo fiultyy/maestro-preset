@@ -231,6 +231,19 @@ function renderFlow() {
 
 /* ---- 渲染：health 横幅 (PW-004, 30s 轮询) ---- */
 
+// PMW1-4(c): 按源给准确影响说明——/health 的 source 是探测面，不是每个
+// 都兑现为"视图空态"（如 tickets_md 仅签名面；dsh_api 只影响席位 join）。
+// 视图是否空态/stale 以各视图自身 note 为准（降级优先，mvp-plan §6.5）。
+const SRC_EFFECT = {
+  ledger: '票面拉取面(CLI)降级 → 票视图 stale/空态+note',
+  tickets_md: 'tickets.md 签名面降级 → 不影响数据新鲜度（缓存键已对齐 ledger.db，PMW1-4）',
+  fleet: '席位源降级 → 席位视图空态+note',
+  sessions: 'session 根降级 → 影响轨迹源（pm-web 未挂轨迹视图）',
+  flows: '流程源降级 → 流程视图空态+note',
+  dsh_api: 'dsh RPC 不可达 → 席位 join 退化为纯席位表',
+  singleton: '单实例锁失效 → 可能双实例（HF-014 可视降级态）',
+}
+
 function renderHealth() {
   const badge = $('#health-badge')
   const banner = $('#banner')
@@ -253,8 +266,9 @@ function renderHealth() {
   badge.textContent = `health degraded`
   badge.className = 'badge warn'
   const dead = Array.isArray(d.degraded) ? d.degraded : []
+  const effects = dead.map((s) => SRC_EFFECT[s]).filter(Boolean)
   banner.hidden = false
-  banner.textContent = `⚠ 降级源：${dead.join(', ')} —— 对应视图呈空态+note（降级优先，mvp-plan §6.5）`
+  banner.textContent = `⚠ 降级源：${dead.join(', ')}。${effects.join('；')} —— 视图是否空态以各视图自身 note 为准（降级优先，mvp-plan §6.5）`
 }
 
 /* ---- 事件流日志 ---- */

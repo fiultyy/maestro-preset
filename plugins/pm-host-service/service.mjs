@@ -203,11 +203,20 @@ function publishTokenDoc() {
 publishTokenDoc()
 
 // ---- PM-003: op=tickets (read-side projection, naturally idempotent) ----
-// In-memory cache is the serving plane; the ledger CLI is the pull plane;
-// the tickets.md signature (mtime_ns+size) is the change detector. No
-// wide-table cache (ADR-007.2: R1/R3 not triggered); the cursor file only
-// records the served signature (temp+rename, skip-if-identical).
-const tickets = { list: null, sig: null, pulledAt: null, cliSpawns: 0 }
+// In-memory cache is the serving plane; the ledger CLI is the pull plane.
+// PMW1-4 (E3 fix): cache validity keys on the SAME signature the event
+// fanout keys tickets events on — ledgerSig() = ledger.db(+wal) — with the
+// tickets.md signature kept as a legacy co-key. Before this, a CLI db
+// write (add/state do NOT render md) fired the SSE event that made the
+// page refetch, only for the md-keyed cache to HIT stale data; and a later
+// manual `ticket render` refreshed the cache with no event to make the
+// page refetch — two correct halves, structurally stale together
+// (gates/pm009/pmw1-3-acceptance.md E3). db sig = freshness authority
+// (ADR-002: the CLI/db IS the truth); md sig = render-observable co-key
+// (a manual md edit also re-pulls from the authority). No wide-table
+// cache (ADR-007.2: R1/R3 not triggered); the cursor file records the
+// served signatures (temp+rename, skip-if-identical).
+const tickets = { list: null, sig: null, dbSig: null, pulledAt: null, cliSpawns: 0 }
 
 const mdSignature = () => {
   try { const s = statSync(TICKETS_MD, { bigint: true }); return `${s.mtimeNs}:${s.size}` } catch { return 'missing' }
@@ -235,29 +244,32 @@ function ledgerProbeOk() {
 
 function serveTickets() {
   const sig = mdSignature()
-  if (tickets.list !== null && tickets.sig === sig) { // replay: zero cli spawns, zero writes
+  const dbSig = ledgerSig() // PMW1-4: the event plane's tickets key — db OR md sig drift forces a fresh pull
+  if (tickets.list !== null && tickets.sig === sig && tickets.dbSig === dbSig) { // replay: zero cli spawns, zero writes
     const probeOk = ledgerProbeOk() // HF-016: degraded reflects a light probe, not pull-time health forever
-    return { op: 'tickets', count: tickets.list.length, tickets: tickets.list, cache: 'hit', degraded: !probeOk, note: probeOk ? '' : `ledger light-probe failed since last pull (${tickets.pulledAt}) — serving pull-time cache`, signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
+    return { op: 'tickets', count: tickets.list.length, tickets: tickets.list, cache: 'hit', degraded: !probeOk, note: probeOk ? '' : `ledger light-probe failed since last pull (${tickets.pulledAt}) — serving pull-time cache`, signature: sig, dbSignature: dbSig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
   }
   try {
     const list = pullLedgerTickets()
     tickets.list = list
     tickets.sig = sig
+    tickets.dbSig = dbSig // recorded only on success: a failed pull keeps missing (retry next serve)
     tickets.pulledAt = new Date().toISOString()
     mkdirSync(STATE_DIR, { recursive: true })
     const cursorAction = writeFileIfChanged(CURSOR_FILE, jsonDoc({
       signature: sig,
+      dbSignature: dbSig,
       ticketCount: list.length,
       pulledAt: tickets.pulledAt,
       version: VERSION,
     }))
     log(`op=tickets pull ok count=${list.length} sig=${sig} cursor=${cursorAction}`)
-    return { op: 'tickets', count: list.length, tickets: list, cache: 'miss', degraded: false, note: '', signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt, cursor: cursorAction }
+    return { op: 'tickets', count: list.length, tickets: list, cache: 'miss', degraded: false, note: '', signature: sig, dbSignature: dbSig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt, cursor: cursorAction }
   } catch (e) {
     const have = tickets.list !== null
     const note = `ledger unavailable: ${String(e?.message ?? e).slice(0, 220)}`
     log(`op=tickets DEGRADED ${note} (serving ${have ? 'stale cache' : 'empty list'})`)
-    return { op: 'tickets', count: have ? tickets.list.length : 0, tickets: have ? tickets.list : [], cache: have ? 'stale' : 'empty', degraded: true, note, signature: sig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
+    return { op: 'tickets', count: have ? tickets.list.length : 0, tickets: have ? tickets.list : [], cache: have ? 'stale' : 'empty', degraded: true, note, signature: sig, dbSignature: dbSig, cliSpawns: tickets.cliSpawns, pulledAt: tickets.pulledAt }
   }
 }
 
