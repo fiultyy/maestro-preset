@@ -447,3 +447,53 @@ dialog button.primary {
 .cv-lane-block ul, .cv-edge-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
 .cv-lane-block li, .cv-edge-list li { padding: 1px 0; border-bottom: 1px dashed #212a36; }
 .cv-note { color: var(--dim); }
+
+/* ---- PMW2-3: 节点抽屉 + 过门 act ---- */
+#cv-drawer {
+  position: absolute; top: 12px; right: 12px; bottom: 12px; width: 320px;
+  background: #10161f; border: 1px solid #2a3547; border-radius: 10px;
+  display: flex; flex-direction: column; overflow: hidden; z-index: 30;
+  box-shadow: -8px 0 24px #00000055;
+}
+.cv-drawer-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #2a3547; }
+.cv-drawer-head strong { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#cv-drawer-close { background: none; border: 1px solid #2a3547; color: var(--dim); border-radius: 6px; width: 24px; height: 24px; cursor: pointer; }
+#cv-drawer-close:hover { color: var(--fg); border-color: var(--accent); }
+#cv-drawer-body { padding: 10px 12px; overflow: auto; }
+.cv-frow { display: flex; gap: 8px; padding: 3px 0; font-size: 12.5px; align-items: baseline; }
+.cv-fkey { color: var(--dim); min-width: 108px; flex: none; }
+.cv-fval { overflow-wrap: anywhere; }
+.cv-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1.5px solid var(--st, #7f8da0); color: var(--st, #7f8da0); }
+.cv-chip { display: inline-block; padding: 1px 7px; margin: 1px 2px; border-radius: 6px; font-size: 11px; background: #1a2331; border: 1px solid #2a3547; font-family: var(--mono, monospace); }
+button.cv-chip { cursor: pointer; color: var(--accent); }
+button.cv-chip:hover { border-color: var(--accent); }
+.cv-acts { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #2a3547; }
+.cv-acts h5, .cv-hist-wrap h5 { margin: 0 0 6px; font-size: 12px; color: var(--fg); }
+.cv-act-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.cv-act-btn { background: #16202e; color: var(--fg); border: 1px solid #33445c; border-radius: 7px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+.cv-act-btn:hover { border-color: var(--accent); color: var(--accent); }
+.cv-act-btn.warn { border-color: #7a4a44; color: #e8a29a; }
+.cv-act-btn.warn:hover { border-color: #e06c5f; color: #e06c5f; }
+.cv-hist-wrap { border-top: 1px solid #2a3547; padding: 8px 12px; overflow: auto; max-height: 40%; }
+#cv-drawer-hist { list-style: none; margin: 0; padding: 0; }
+#cv-drawer-hist li { padding: 6px 0; border-bottom: 1px dashed #212a36; }
+.cv-hist-head { display: flex; gap: 8px; align-items: center; font-size: 11.5px; }
+.cv-hist-item .mono { font-size: 11.5px; }
+.cv-hist-err { color: #e06c5f; }
+#cv-act-confirm { background: #10161f; color: var(--fg); border: 1px solid #2a3547; border-radius: 12px; padding: 16px 18px; min-width: 380px; max-width: 520px; }
+#cv-act-confirm::backdrop { background: #000000aa; }
+#cv-act-confirm h4 { margin: 0 0 8px; }
+#cv-act-cmd { background: #0b1017; border: 1px solid #2a3547; border-radius: 8px; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 8px; }
+#cv-act-target { margin: 4px 0 10px; }
+.cv-irrev { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: #e8a29a; background: #1d1416; border: 1px solid #7a4a44; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; cursor: pointer; }
+.cv-dlg-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.cv-dlg-row button { background: #16202e; color: var(--fg); border: 1px solid #33445c; border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+.cv-dlg-row #cv-act-ok { background: #1c3a2c; border-color: #2f6a4d; }
+.cv-dlg-row #cv-act-ok:disabled { opacity: 0.45; cursor: not-allowed; }
+.cv-dlg-row button:hover:not(:disabled) { border-color: var(--accent); }
+#cv-toast {
+  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  background: #0b1017ee; border: 1px solid #2a3547; color: var(--fg);
+  padding: 6px 14px; border-radius: 999px; font-size: 12px; z-index: 40; max-width: 80%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

@@ -6,7 +6,9 @@
 // 400ms 去抖 refetch → 按 id diff → 受影响泳道重排 → 节点/边 300ms 位移过渡);
 // SSE 断 (pm:sse-state open:false) → 30s 轮询, 恢复即回事件驱动。
 // 交互只读: wheel 缩放 (指针为锚, 0.5×–2×) + 空白拖拽平移 + 节点 hover/点击
-// 高亮关联边 (点击钉住, 空白点击取消)。无编辑无拖动无抽屉无回放 (§4 明确禁止)。
+// 高亮关联边 (点击钉住, 空白点击取消)。PMW2-3 增量: 点节点开右侧抽屉 (四型明细)
+// + 抽屉内过门快捷动作 (唯一写路径仍是既有 POST /op/act 透传, 确认弹层把门,
+// 不可逆转移双确认); §4 其余禁令 (节点拖动/编辑/右键/hover 抽屉/回放) 保持。
 'use strict'
 
 const $ = (s) => document.querySelector(s)
@@ -29,6 +31,27 @@ const EDGE_STYLE = { // §1.2 样式列照抄: 实线/虚线(6 4)/点线(2 4), d
   callback: { color: '#9d7cd8', dash: '6 4', width: 1.5, arrow: false },
   'cb-send': { color: '#e0a93e', dash: '2 4', width: 1.5, arrow: false },
 }
+
+// PMW2-3 动作面: 快捷动作仅两类, 均走既有 POST /op/act (服务端零改动)。
+// flow-node → `flowc advance <flow> <node> --result done|failed`;
+// ticket    → `ledger ticket state <id> <合法转移>` (迁移表镜像自 ledger CLI)。
+// 不可逆类 (blocked/rejected/merged/rolled-back) 双确认: 勾选 checkbox 后才可提交。
+const TICKET_TRANSITIONS = { // ledger 状态机合法迁移表 (只读镜像)
+  dispatched: ['running', 'rejected'],
+  running: ['blocked', 'done', 'rejected'],
+  blocked: ['running', 'done', 'rejected'],
+  done: ['running', 'merged', 'rejected'],
+  merged: ['rolled-back'],
+  rejected: [],
+  'rolled-back': [],
+}
+const IRREV = new Set(['blocked', 'rejected', 'merged', 'rolled-back'])
+const actCmdFor = {
+  'flow-node': (n, result) => ({ tool: 'flowc', args: ['advance', n.flow, n.nodeId, '--result', result] }),
+  ticket: (n, state) => ({ tool: 'ledger', args: ['ticket', 'state', n.ticketId, state] }),
+}
+const VERB_SHAPE = { status: '矩形', dispatch: '平行四边形', callback: '圆角矩形' }
+const argvText = (tool, args) => `${tool} ${args.map((a) => (/^[\w./:@=-]+$/.test(a) ? a : JSON.stringify(a))).join(' ')}`
 
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const svgEl = (tag, attrs = {}) => {
@@ -61,6 +84,9 @@ const C = {
   pollTimer: 0,
   lastRefetchAt: 0,
   refetching: false,
+  drawerNode: null, // PMW2-3: 抽屉当前节点 id (null = 关)
+  actHist: new Map(), // nodeId -> [ {ts, ref, action, status, exitCode, ms, err} ] (页内内存审计)
+  pending: new Map(), // ref -> {nodeId, entry, timer} 在途 act (轮询 + SSE 双路对账)
 }
 
 const stage = () => $('#cv-stage')
@@ -161,6 +187,7 @@ async function refetchGraph() {
     if (!C.nodeEls.size || [...C.nodeEls.keys()].some((id) => !newNodes.has(id))) await buildScene(changedLanes)
     else await updateScene(changedLanes)
     renderCounts(degradedNote)
+    syncDrawer() // PMW2-3: 抽屉开着时随数据回显 (节点消失则自动关)
   } catch (e) {
     bannerShow(`/op/graph 不可达 —— 保留上一帧渲染 (${String(e?.message ?? e).slice(0, 80)})`, true)
   } finally {
@@ -479,8 +506,12 @@ function wireStage() {
   const up = (e) => {
     if (!pan) return
     st.classList.remove('cv-panning')
-    if (pan.node && !pan.moved) { C.selected = C.selected === pan.node ? null : pan.node; applyHighlight() } // 点击选中/取消
-    else if (!pan.node && !pan.moved) { C.selected = null; applyHighlight() } // 空白点击取消
+    if (pan.node && !pan.moved) { // 点击选中/取消 + PMW2-3: 选中即开抽屉, 取消即关
+      const next = C.selected === pan.node ? null : pan.node
+      C.selected = next
+      applyHighlight()
+      next ? openDrawer(next) : closeDrawer()
+    } else if (!pan.node && !pan.moved) { C.selected = null; applyHighlight(); closeDrawer() } // 空白点击取消
     pan = null
   }
   s.addEventListener('pointerup', up)
@@ -492,6 +523,242 @@ function wireStage() {
   s.addEventListener('mouseout', (e) => {
     if (e.target.closest?.('.cv-node')) { C.hover = null; applyHighlight() }
   })
+}
+
+// ---- PMW2-3: 节点抽屉 (四型明细) + 过门 act ----
+const hist = (nodeId) => {
+  if (!C.actHist.has(nodeId)) C.actHist.set(nodeId, [])
+  return C.actHist.get(nodeId)
+}
+const fieldRow = (k, v) => `<div class="cv-frow"><span class="cv-fkey">${esc(k)}</span><span class="cv-fval">${v}</span></div>`
+const stateBadge = (s) => s == null ? '<span class="dim">—</span>' : `<span class="cv-badge" style="--st:${colorOf(s)}">${esc(s)}</span>`
+const jumpChip = (id, label) => C.nodes.has(id)
+  ? `<button class="cv-chip cv-jump" data-jump="${esc(id)}" title="${esc(id)}">${esc(label ?? id)}</button>`
+  : `<span class="cv-chip dim">${esc(label ?? id)}</span>`
+const looksPath = (r) => /^\/|^\.\//.test(r) || (r.includes('/') && !/\s/.test(r))
+const refChip = (r) => looksPath(r)
+  ? `<button class="cv-chip cv-ref" data-ref="${esc(r)}" title="点击复制路径">${esc(r)}</button>`
+  : `<span class="cv-chip" title="${esc(r)}">${esc(r)}</span>`
+const verbShape = (v) => VERB_SHAPE[v] ?? '六边形'
+
+function relatedTickets(fn) { // 经席位桥: dispatch(st→fn) 的席位 ∩ lease(dispatch st→tk) 的票
+  const seats = new Set([...C.edges.values()].filter((e) => e.kind === 'dispatch' && e.to === fn.id).map((e) => e.from))
+  if (!seats.size) return []
+  return [...C.nodes.values()].filter((n) => n.type === 'ticket'
+    && [...C.edges.values()].some((e) => e.kind === 'dispatch' && seats.has(e.from) && e.to === n.id))
+}
+
+function drawerBodyHtml(n) {
+  if (n.type === 'flow-node') {
+    const rel = relatedTickets(n)
+    return `
+      ${fieldRow('verb / 形制', `${esc(n.verb ?? '—')} · ${esc(verbShape(n.verb))}`)}
+      ${fieldRow('state', stateBadge(n.state))}
+      ${fieldRow('所属 flow', `<span class="mono">${esc(n.flow)}</span>`)}
+      ${fieldRow('attempts / events', `${n.attempts ?? 0} / ${n.events ?? 0}`)}
+      ${fieldRow('关联票', rel.length ? rel.map((t) => jumpChip(t.id, t.ticketId)).join(' ') : '<span class="dim">无 (席位 lease/dispatch 桥未关联)</span>')}
+      <div class="cv-acts">
+        <h5>快捷动作 <span class="dim">flowc advance · POST /op/act</span></h5>
+        <button class="cv-act-btn" data-act="flow:done">--result done</button>
+        <button class="cv-act-btn warn" data-act="flow:failed">--result failed</button>
+      </div>`
+  }
+  if (n.type === 'ticket') {
+    const legal = TICKET_TRANSITIONS[n.state] ?? null
+    const legalHtml = legal == null ? '<span class="dim">未知状态</span>'
+      : legal.length === 0 ? '<span class="dim">终态 · 无可用转移</span>'
+        : legal.map((s) => `<button class="cv-act-btn${IRREV.has(s) ? ' warn' : ''}" data-act="ticket:${esc(s)}">${esc(s)}${IRREV.has(s) ? ' ⚠' : ''}</button>`).join('')
+    return `
+      ${fieldRow('state', stateBadge(n.state))}
+      ${fieldRow('leaseOwner', esc(n.leaseOwner ?? '—'))}
+      ${fieldRow('deps', (n.deps ?? []).length ? n.deps.map((d) => jumpChip(`tk:${d}`, d)).join(' ') : '<span class="dim">无</span>')}
+      ${fieldRow('refs 证据链', (n.refs ?? []).length ? n.refs.map((r) => refChip(r)).join(' ') : '<span class="dim">无</span>')}
+      <div class="cv-acts">
+        <h5>合法转移 <span class="dim">ledger ticket state · POST /op/act</span></h5>
+        <div class="cv-act-row">${legalHtml}</div>
+        <p class="dim small">⚠ 不可逆转移需二次确认 (勾选)</p>
+      </div>`
+  }
+  if (n.type === 'seat') {
+    const ses = n.sessionId ? [...C.nodes.values()].find((m) => m.type === 'session' && m.sessionId === n.sessionId) : null
+    return `
+      ${fieldRow('role / node', `${esc(n.role ?? '—')} / ${esc(n.node ?? '—')}`)}
+      ${fieldRow('preset / status', `${esc(n.preset ?? '—')} · ${stateBadge(n.status)}`)}
+      ${fieldRow('会话态 join', ses
+        ? `${jumpChip(ses.id, ses.label)} <span class="dim small">${ses.running ? 'running' : 'idle'}${ses.cwd ? ' · ' + esc(ses.cwd) : ''}</span>`
+        : `<span class="mono small dim">${esc(n.sessionId ?? '—')}</span>`)}
+      <p class="dim small">席位无快捷动作 (动作面仅 flow-node / ticket 两类)</p>`
+  }
+  const seats = [...C.nodes.values()].filter((m) => m.type === 'seat' && m.sessionId === n.sessionId)
+  return `
+    ${fieldRow('running', String(!!n.running))}
+    ${fieldRow('title', `<span class="small">${esc(n.title ?? '—')}</span>`)}
+    ${fieldRow('cwd', `<span class="mono small">${esc(n.cwd ?? '—')}</span>`)}
+    ${fieldRow('挂靠席位', seats.length ? seats.map((s) => jumpChip(s.id, s.code)).join(' ') : '<span class="dim">无</span>')}
+    <p class="dim small">会话无快捷动作 (动作面仅 flow-node / ticket 两类)</p>`
+}
+
+function renderDrawer() {
+  const n = C.drawerNode && C.nodes.get(C.drawerNode)
+  if (!n) return
+  const kind = $('#cv-drawer-kind')
+  kind.textContent = n.type
+  kind.style.setProperty('--st', colorOf(n.state ?? n.status))
+  $('#cv-drawer-title').textContent = n.label ?? n.id
+  $('#cv-drawer-body').innerHTML = drawerBodyHtml(n)
+  const h = hist(n.id)
+  $('#cv-drawer-hist').innerHTML = h.length ? h.map((e) => `
+    <li class="cv-hist-item">
+      <div class="cv-hist-head"><span class="mono">${esc(e.ref)}</span> ${stateBadge(e.status)} <span class="dim small">${new Date(e.ts).toLocaleTimeString()}</span></div>
+      <div class="mono small">${esc(e.action)}</div>
+      ${e.err ? `<div class="small cv-hist-err">${esc(String(e.err).slice(0, 160))}</div>` : ''}
+      ${e.exitCode != null ? `<div class="dim small">exit ${e.exitCode}${e.ms != null ? ` · ${e.ms}ms` : ''}</div>` : ''}
+    </li>`).join('') : '<li class="dim small">本节点尚无动作历史</li>'
+}
+function openDrawer(id) {
+  if (!C.nodes.has(id)) return
+  C.drawerNode = id
+  renderDrawer()
+  $('#cv-drawer').hidden = false
+  introspect()
+}
+function closeDrawer() {
+  C.drawerNode = null
+  const d = $('#cv-drawer')
+  if (d) d.hidden = true
+  introspect()
+}
+function syncDrawer() { // refetch 后回显: 节点仍在 → 重绘; 消失 → 关
+  if (!C.drawerNode) return
+  if (!C.nodes.has(C.drawerNode)) return closeDrawer()
+  renderDrawer()
+}
+
+// ---- 确认门: 动作全文 + 影响节点; 不可逆类 checkbox 双确认 ----
+function askAct(node, cmd) {
+  const dlg = $('#cv-act-confirm')
+  $('#cv-act-cmd').textContent = argvText(cmd.tool, cmd.args)
+  $('#cv-act-target').textContent = `${node.id} · ${node.label ?? ''} · ${node.type}`
+  $('#cv-act-irrev').hidden = !cmd.irrev
+  $('#cv-act-ok').disabled = !!cmd.irrev // 双确认: 勾选后才可点确认
+  dlg._job = { node, cmd }
+  dlg.showModal()
+}
+
+function wireDrawer() {
+  $('#cv-drawer-close').addEventListener('click', closeDrawer)
+  const body = $('#cv-drawer-body')
+  body.addEventListener('click', (e) => {
+    const j = e.target.closest?.('[data-jump]')
+    if (j) { C.selected = j.dataset.jump; applyHighlight(); openDrawer(j.dataset.jump); return }
+    const r = e.target.closest?.('[data-ref]')
+    if (r) return void copyText(r.dataset.ref)
+    const a = e.target.closest?.('[data-act]')
+    if (!a) return
+    const n = C.nodes.get(C.drawerNode)
+    if (!n) return
+    const [kind, val] = String(a.dataset.act).split(':')
+    const cmd = kind === 'flow'
+      ? { ...actCmdFor['flow-node'](n, val), irrev: false }
+      : { ...actCmdFor.ticket(n, val), irrev: IRREV.has(val) }
+    askAct(n, cmd)
+  })
+  const dlg = $('#cv-act-confirm')
+  const chk = $('#cv-act-irrev-chk')
+  chk.addEventListener('change', () => { $('#cv-act-ok').disabled = !chk.checked })
+  $('#cv-act-cancel').addEventListener('click', () => dlg.close('cancel'))
+  $('#cv-act-ok').addEventListener('click', () => dlg.close('ok'))
+  dlg.addEventListener('close', () => {
+    const job = dlg._job
+    dlg._job = null
+    chk.checked = false
+    $('#cv-act-ok').disabled = false
+    if (!job) return
+    if (dlg.returnValue !== 'ok') { toast('已取消 —— 未提交任何动作'); return }
+    submitAct(job.node, job.cmd)
+  })
+}
+
+// ---- act 提交 + 双路对账 (SSE act 事件快路径, GET /op/act?ref 轮询兜底仲裁) ----
+async function submitAct(node, cmd) {
+  const entry = { ts: Date.now(), ref: '—', action: argvText(cmd.tool, cmd.args), status: 'flying', exitCode: null, ms: null, err: null }
+  hist(node.id).push(entry)
+  renderDrawer()
+  try {
+    const res = await fetch('/op/act', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tool: cmd.tool, args: cmd.args }),
+    })
+    const d = await res.json().catch(() => null)
+    if (!res.ok || !d?.accepted) {
+      entry.status = 'error'
+      entry.ref = d?.ref ?? '—'
+      entry.err = d?.error ?? `http ${res.status}`
+      toast(`提交被拒: ${entry.err}`)
+    } else {
+      entry.ref = d.ref
+      if (d.replay) { entry.status = d.status ?? 'ok'; entry.exitCode = d.exitCode ?? null; entry.err = d.error ?? null }
+      else pollAct(d.ref, node.id, entry)
+    }
+  } catch (e) {
+    entry.status = 'error'
+    entry.err = String(e?.message ?? e)
+    toast(`提交失败: ${entry.err}`)
+  }
+  renderDrawer()
+}
+function pollAct(ref, nodeId, entry) {
+  C.pending.set(ref, { nodeId, entry, timer: 0 })
+  let tries = 0
+  const tick = async () => {
+    const p = C.pending.get(ref)
+    if (!p) return // SSE 路径已 settle
+    if (++tries > 40) { // ~32s 兜底超时 (服务端 CLI 预算 30s)
+      C.pending.delete(ref)
+      p.entry.status = 'error'
+      p.entry.err = '轮询超时 —— 待 SSE act 事件对账'
+      renderDrawer()
+      return
+    }
+    try {
+      const res = await fetch(`/op/act?ref=${encodeURIComponent(ref)}`)
+      const j = await res.json()
+      if (j?.found && j.entry && j.entry.status !== 'flying') return settleAct(ref, j.entry)
+    } catch {}
+    p.timer = setTimeout(tick, 800)
+  }
+  tick()
+}
+function settleAct(ref, src) {
+  const p = C.pending.get(ref)
+  if (!p) return
+  clearTimeout(p.timer)
+  C.pending.delete(ref)
+  p.entry.status = src.status ?? 'ok'
+  p.entry.exitCode = src.exitCode ?? null
+  p.entry.ms = src.ms ?? null
+  p.entry.err = src.error ?? src.err ?? null
+  renderDrawer()
+  scheduleActRefresh()
+  toast(`act ${ref} → ${p.entry.status}`)
+}
+function scheduleActRefresh() { // SSE 在: 让数据面事件先行, 3s 未刷则直刷兜底; SSE 断: act 响应直刷
+  const at = C.lastRefetchAt
+  setTimeout(() => { if (C.lastRefetchAt === at && !C.refetching) refetchGraph() }, C.sseOpen ? 3000 : 0)
+}
+
+let toastTimer = 0
+function toast(msg) {
+  const t = $('#cv-toast')
+  if (!t) return
+  t.textContent = msg
+  t.hidden = false
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { t.hidden = true }, 2600)
+}
+async function copyText(txt) {
+  try { await navigator.clipboard.writeText(txt); toast(`已复制: ${txt}`) } catch { toast(`evidence: ${txt}`) }
 }
 
 // ---- 列表回退 (spec §5: nodes/edges 清单 + counts, 按泳道分组, 横幅注明) ----
@@ -557,6 +824,10 @@ function renderCounts(degradedNote) {
 window.addEventListener('pm:sse', (e) => {
   const kind = e.detail?.kind
   if (kind === 'tickets' || kind === 'fleet' || kind === 'flow') canvasRefetchDebounced()
+  else if (kind === 'act') { // PMW2-3: act settle 事件对账 (快路径; 轮询为兜底仲裁)
+    const ev = e.detail ?? {}
+    if (ev.ref && C.pending.has(ev.ref)) settleAct(ev.ref, ev)
+  }
 })
 window.addEventListener('pm:sse-state', (e) => {
   C.sseOpen = !!e.detail?.open
@@ -582,6 +853,9 @@ function introspect() {
     view: { ...C.view },
     lastRefetchAt: C.lastRefetchAt,
     sseOpen: C.sseOpen,
+    drawer: C.drawerNode, // PMW2-3 内省 (只读)
+    actHist: [...C.actHist.values()].reduce((a, l) => a + l.length, 0),
+    pendingActs: C.pending.size,
   }
 }
 
@@ -599,14 +873,40 @@ async function boot() {
   $('#view-canvas').innerHTML = `
     <div class="cv-head">
       <span id="cv-counts" class="dim mono">加载中…</span>
-      <span class="dim small">只读画布 · wheel 缩放 / 拖拽平移 / 点击或悬停高亮关联 · 数据 GET /op/graph</span>
+      <span class="dim small">只读画布 · wheel 缩放 / 拖拽平移 / 点击或悬停高亮关联 · 点节点开抽屉 · 数据 GET /op/graph</span>
     </div>
     <div id="cv-banner" class="cv-banner" hidden></div>
     <div class="cv-stage" id="cv-stage">
       <div id="cv-svg-wrap"><svg id="canvas-svg"></svg></div>
       <div id="cv-list" hidden></div>
-    </div>`
+      <aside id="cv-drawer" hidden>
+        <div class="cv-drawer-head">
+          <span id="cv-drawer-kind" class="cv-badge"></span>
+          <strong id="cv-drawer-title"></strong>
+          <button id="cv-drawer-close" title="关闭抽屉">×</button>
+        </div>
+        <div id="cv-drawer-body"></div>
+        <div class="cv-hist-wrap">
+          <h5>动作历史 <span class="dim small">ref + ts + 动作 (页内审计)</span></h5>
+          <ul id="cv-drawer-hist"></ul>
+        </div>
+      </aside>
+    </div>
+    <dialog id="cv-act-confirm">
+      <h4>确认动作</h4>
+      <p class="small dim">动作全文</p>
+      <pre id="cv-act-cmd" class="mono"></pre>
+      <p class="small dim">影响节点</p>
+      <p id="cv-act-target" class="mono small"></p>
+      <label id="cv-act-irrev" class="cv-irrev" hidden><input type="checkbox" id="cv-act-irrev-chk"> 这是不可逆转移, 我已知晓且确认</label>
+      <div class="cv-dlg-row">
+        <button id="cv-act-cancel">取消</button>
+        <button id="cv-act-ok">确认提交</button>
+      </div>
+    </dialog>
+    <div id="cv-toast" hidden></div>`
   wireStage()
+  wireDrawer()
   wireVisibility()
   await refetchGraph()
   if (C.mode === 'canvas' && C.lanes.length) { fitView() }
