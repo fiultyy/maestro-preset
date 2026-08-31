@@ -316,9 +316,9 @@ function readSeats() { // fleet.json direct; bin/fleet-list CLI as fallback auth
 }
 
 let joinSeq = 0
-async function joinSessions(seats) { // dsh loopback RPC; 8s abort -> caller degrades
+async function joinSessions(seats) { // dsh loopback RPC; JOIN_DSH_TIMEOUT_MS abort -> caller degrades (独立注记, 不连坐 dsh_api liveness)
   const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), 8000)
+  const timer = setTimeout(() => ctl.abort(), JOIN_DSH_TIMEOUT_MS)
   try {
     const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
       method: 'POST',
@@ -557,7 +557,7 @@ let graphJoinSeq = 0
 
 async function fetchSessionMap() { // dsh loopback session.list -> Map(sid -> {running,title,cwd}); throws -> caller degrades
   const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), 8000)
+  const timer = setTimeout(() => ctl.abort(), JOIN_DSH_TIMEOUT_MS)
   try {
     const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
       method: 'POST',
@@ -1205,6 +1205,7 @@ loadRegistry() // PM-008 boot recovery (flying -> interrupted) before serving
 const CONFIG_DIR = process.env.XDG_CONFIG_HOME ?? `${homedir()}/.config`
 const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
 const HEALTH_DSH_TIMEOUT_MS = 1_000 // loopback RPC probe budget (health must stay snappy)
+const JOIN_DSH_TIMEOUT_MS = 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness
 const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
 
 const errBrief = (e) => String(e?.message ?? e).slice(0, 120)
@@ -1252,22 +1253,24 @@ function probeFlows() { // SQL self-walk: a flow is live only if its state.db op
   return { live: flows.length > 0 && readable === flows.length, root: FLOWS_ROOT, total: flows.length, readable, flows, degradedFlows: dead, note: dead.length ? `unreadable: ${dead.join(',')}` : '' }
 }
 
-async function probeDsh() { // same loopback RPC the fleet join uses, on a 1s budget
+async function probeDsh() { // PMW2-I: liveness 探针走廉价 workspace.list (同款 RPC wire, ~ms 级); session.list 数百会话全投影 ~5s 曾必超 1s 预算 → abort → 降级横幅间歇闪。只判活, 不取数。
+  const t0 = Date.now()
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), HEALTH_DSH_TIMEOUT_MS)
+  const url = `127.0.0.1:${DSH_PORT}/api/workspace.list`
   try {
-    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+    const res = await fetch(`http://${url}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: 'session.list', payload: {} }),
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: 'workspace.list', payload: {} }),
       signal: ctl.signal,
     })
-    if (!res.ok) return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: `http ${res.status}` }
+    if (!res.ok) return { live: false, url, latency_ms: Date.now() - t0, note: `http ${res.status}` }
     const data = await res.json()
-    if (data?.result?.ok !== true) return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: `rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 100)}` }
-    return { live: true, url: `127.0.0.1:${DSH_PORT}/api/session.list` }
+    if (data?.result?.ok !== true) return { live: false, url, latency_ms: Date.now() - t0, note: `rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 100)}` }
+    return { live: true, url, latency_ms: Date.now() - t0 }
   } catch (e) {
-    return { live: false, url: `127.0.0.1:${DSH_PORT}/api/session.list`, note: errBrief(e) }
+    return { live: false, url, latency_ms: Date.now() - t0, note: errBrief(e) }
   } finally {
     clearTimeout(timer)
   }

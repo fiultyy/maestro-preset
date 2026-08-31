@@ -509,6 +509,68 @@ async function sb5() {
   }
 }
 
+// ============ SB6: PMW2-I dsh_api 探针误靶修复 (liveness=廉价 workspace.list; session.list 慢/坏不连坐) ============
+function startMockDshMode(mode) { // mode: 'ok' | 'err-session' | 'slow-session'; workspace.list 探针恒快答
+  const server = createServer((rq, rs) => {
+    const chunks = []
+    rq.on('data', (d) => chunks.push(d))
+    rq.on('end', () => {
+      const reply = (obj, delay = 0) => setTimeout(() => { rs.writeHead(200, { 'content-type': 'application/json' }); rs.end(JSON.stringify(obj)) }, delay)
+      if (/workspace\.list/.test(rq.url ?? '')) return reply({ result: { ok: true, value: { items: [] } } })
+      if (mode === 'err-session') return reply({ result: { ok: false, error: 'injected: session.list broken (PMW2-I gate)' } })
+      if (mode === 'slow-session') return reply({ result: { ok: true, value: { items: [
+        { sessionId: 'session-x', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/gate', projections: { values: { title: 'gate-mock' } } },
+      ] } } }, 2500)
+      return reply({ result: { ok: true, value: { items: [] } } })
+    })
+  })
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, close: () => new Promise((r) => server.close(r)) })))
+}
+
+async function sb6() {
+  // Phase A: session.list rpc 报错 -> fleet join 独立降级注记(joined:false+原因), dsh_api 探针仍 live (走 workspace.list)
+  {
+    const sb = `${BASE}/sb6a`
+    buildSandbox(sb)
+    writeFleet(sb, 0)
+    const mock = await startMockDshMode('err-session')
+    const { child, port } = await startDaemon(sb, { DSH_PORT: String(mock.port) })
+    try {
+      console.log(`\n=== SB6a ${sb} (session.list broken; mock dsh :${mock.port}) port=${port} ===`)
+      const h = await req(port, 'GET', '/health')
+      const d = h.json?.sources?.dsh_api
+      ok('PMW2-I probe targets cheap workspace.list endpoint', typeof d?.url === 'string' && d.url.includes('workspace.list'), `url=${d?.url}`)
+      ok('PMW2-I dsh_api live despite broken session.list', d?.live === true, JSON.stringify(d))
+      ok('PMW2-I health face exposes latency_ms (number)', typeof d?.latency_ms === 'number' && d.latency_ms >= 0, `latency_ms=${d?.latency_ms}`)
+      const f = await req(port, 'GET', '/op/fleet')
+      ok('PMW2-I broken session.list -> fleet join degraded note honest (joined:false + reason)', f.status === 200 && f.json?.degraded === true && f.json?.sessionJoined === false && /rpc error|session\.list/.test(f.json?.note ?? ''), `note=${(f.json?.note ?? '').slice(0, 90)}`)
+      ok('PMW2-I pure fleet view still served (seats present, 200)', f.json?.count > 0 && Array.isArray(f.json?.seats), `count=${f.json?.count}`)
+    } finally {
+      await stopDaemon(child)
+      await mock.close()
+    }
+  }
+  // Phase B: session.list 慢 2.5s (> 旧 1s 健康预算, < 10s join 预算) -> join 照常成功 + dsh_api 仍 live
+  {
+    const sb = `${BASE}/sb6b`
+    buildSandbox(sb)
+    writeFleet(sb, 0)
+    const mock = await startMockDshMode('slow-session')
+    const { child, port } = await startDaemon(sb, { DSH_PORT: String(mock.port) })
+    try {
+      console.log(`\n=== SB6b ${sb} (session.list +2.5s; mock dsh :${mock.port}) port=${port} ===`)
+      const f = await req(port, 'GET', '/op/fleet')
+      const seat = (f.json?.seats ?? []).find((s) => s.sessionId === 'session-x')
+      ok('PMW2-I slow session.list (2.5s<10s budget) -> join still succeeds', f.status === 200 && f.json?.sessionJoined === true && f.json?.degraded === false && seat?.session?.title === 'gate-mock', `joined=${f.json?.sessionJoined} title=${seat?.session?.title}`)
+      const h = await req(port, 'GET', '/health')
+      ok('PMW2-I slow session.list does not drag dsh_api liveness', h.json?.sources?.dsh_api?.live === true && typeof h.json?.sources?.dsh_api?.latency_ms === 'number', JSON.stringify(h.json?.sources?.dsh_api))
+    } finally {
+      await stopDaemon(child)
+      await mock.close()
+    }
+  }
+}
+
 // ============ SB2: PM-002 port drift / flock / boot-death empty state ============
 async function sb2() {
   const sb = `${BASE}/sb2`
@@ -574,6 +636,7 @@ await sb2()
 await sb3()
 await sb4()
 await sb5()
+await sb6()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pm001-007', startedAt, finishedAt: new Date().toISOString(), pass, fail, version: VERSION, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)
