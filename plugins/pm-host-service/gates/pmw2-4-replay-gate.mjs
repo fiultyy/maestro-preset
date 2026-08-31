@@ -47,6 +47,8 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
   ok('A minimap: 全图缩略 + 视口框 + 点跳联动', cv.includes('drawMinimap') && cv.includes('updateMiniVp') && cv.includes('wireMinimap'))
   ok('A 打磨: 双击居中 + 泳道常显标题', cv.includes("addEventListener('dblclick'") && cv.includes('updateSticky') && cv.includes('cv-sticky-chip'))
   ok('A 初始 fit 全图 (既有 fitView 链在位)', cv.includes('function fitView()') && cv.includes('fitDoneCheck'))
+  ok('A PMW2-H: _ts 数值化 (字符串 time 不再产字符串游标)', cv.includes('_ts: Number(e.time ?? e.time0) || null'))
+  ok('A PMW2-H: 载入中态保持到完成 (成功后 hidden, 失败复位可重试)', /btn\.textContent = '载入中…'[\s\S]{0,2200}R\.loaded = true[\s\S]{0,200}btn\.hidden = true/.test(cv) && cv.includes("btn.textContent = '载入回放'"))
   const buf = readFileSync(`${PUBLIC}elk.bundled.js`)
   ok('红线: elk vendor sha256 仍钉死 (零触碰)', sha256(buf) === SPEC_SHA, sha256(buf).slice(0, 16) + '…')
   const dirty = spawnSync('git', ['-C', REPO, 'diff', '--name-only', 'HEAD', '--', 'plugins/pm-host-service/service.mjs', 'plugins/pm-host-service/public/app.js', 'plugins/pm-host-service/public/index.html'], { encoding: 'utf8' }).stdout.trim()
@@ -168,6 +170,13 @@ async function livePart(livePort) {
     liveE: document.querySelectorAll('.cv-edge:not(.cv-future)').length,
   })`)
   ok('B 回放: 游标 30% → 回放态(徽章/节点变色/边随游标增减)', mid.on && mid.mode === '回放中' && mid.futureN > 0 && mid.liveN > 0 && mid.futureE > 0 && mid.liveE > 0, JSON.stringify(mid))
+  // 2b) PMW2-H 回归: 活体/字符串 time — 拖动后必须有节点点亮 (原 bug: 字符串 _ts → 游标垃圾 → 全灰)
+  const audit = await c.cdp.eval(`(() => {
+    const R = window.__pmCanvas.replay
+    return { n: R.events.length, strSrc: R.events.filter((e) => typeof e.time === 'string' || typeof e.time0 === 'string').length, numTs: R.events.filter((e) => typeof e._ts === 'number' && Number.isFinite(e._ts)).length, minT: typeof R.min, cursorT: typeof R.cursor, liveN: document.querySelectorAll('.cv-node:not(.cv-future)').length, total: document.querySelectorAll('.cv-node').length }
+  })()`)
+  ok('B PMW2-H: _ts 全数值化且游标为 number', audit.n > 0 && audit.numTs === audit.n && audit.minT === 'number' && audit.cursorT === 'number', JSON.stringify(audit))
+  ok('B PMW2-H: 拖动 30% 后节点脱离 cv-future (点亮 0<lit<total)', audit.liveN > 0 && audit.total > 0 && audit.liveN < audit.total, `lit=${audit.liveN}/${audit.total}${audit.strSrc > 0 ? ` (含字符串 time 源 ${audit.strSrc} 条)` : ' (活体无字符串 time, 数值化不变式仍生效)'}`)
   await c.cdp.shot(shot('replay-mid.png'))
   ok('B 证据: replay-mid.png', statSync(shot('replay-mid.png')).size > 10000)
 
@@ -278,14 +287,16 @@ mkdirSync(BASE, { recursive: true })
 const startedAt = new Date().toISOString()
 const PORT_FILE = `${homedir()}/.dsh/maestro/pm.port`
 const SVC = 'pm-host-service'
-const oldPort = JSON.parse(readFileSync(PORT_FILE, 'utf8')).port
+const oldSnap = JSON.parse(readFileSync(PORT_FILE, 'utf8')) // PMW2-G 钉港: 部署信号=pid 更新, 端口应恒定
+const oldPort = oldSnap.port
+const oldPid = oldSnap.pid
 spawnSync('systemctl', ['--user', 'try-restart', SVC])
 let livePort = 0
 for (let i = 0; i < 80; i++) {
   await sleep(250)
-  try { const p = JSON.parse(readFileSync(PORT_FILE, 'utf8')); if (p.port !== oldPort) { livePort = p.port; break } } catch {}
+  try { const p = JSON.parse(readFileSync(PORT_FILE, 'utf8')); if (p.pid !== oldPid) { livePort = p.port; break } } catch {}
 }
-ok('部署: try-restart 后端口漂移(静态面新快照)', livePort > 0, `old=${oldPort} new=${livePort}`)
+ok('部署: try-restart 后 pid 更新且端口恒定(PMW2-G 钉港, 静态面新快照)', livePort > 0 && livePort === oldPort, `pid ${oldPid}->更新, port=${livePort}`)
 const health = await (await fetch(`http://127.0.0.1:${livePort}/health`)).json()
 ok('部署: /health 200 且服务版本可见', !!health?.version, `v${health?.version}`)
 

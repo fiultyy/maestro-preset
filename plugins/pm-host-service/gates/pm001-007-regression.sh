@@ -30,12 +30,18 @@ VER=$(node -p "JSON.parse(require('fs').readFileSync('$REPO/package.json','utf8'
 
 echo "=== PM-001..007 regression $LABEL  repo=$REPO version=$VER evid=$EVID ==="
 
-echo "=== 0. deploy check via PM-002 restart gate (port drift) ==="
+echo "=== 0. deploy check via PM-002 restart gate (pid 更新 + 端口恒定, PMW2-G 钉港) ==="
 OLD=$(port); OLDPID=$(systemctl --user show -p MainPID --value $SVC)
 systemctl --user try-restart $SVC
-for i in $(seq 50); do NEW=$(port); [ -n "$NEW" ] && [ "$NEW" != "$OLD" ] && break; sleep 0.2; done
-ok $([ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; echo $?) "PM-002 port drift after restart" "old=$OLD new=$NEW"
-curl -sS -m 3 "http://127.0.0.1:$OLD/health" >/dev/null 2>&1; ok $([ $? -ne 0 ]; echo $?) "PM-002 old port refused" "$OLD"
+NEW="$OLD"; NEWPID="$OLDPID"
+for i in $(seq 50); do
+  NEWPID=$(systemctl --user show -p MainPID --value $SVC 2>/dev/null || true)
+  PORTPID=$(node -pe "try{JSON.parse(require('fs').readFileSync('$PORT_FILE','utf8')).pid}catch{''}" 2>/dev/null || true)
+  [ -n "$NEWPID" ] && [ "$NEWPID" != 0 ] && [ "$NEWPID" != "$OLDPID" ] && [ "$PORTPID" = "$NEWPID" ] && NEW=$(port) && break
+  sleep 0.2
+done
+ok $([ -n "$NEW" ] && [ "$NEW" = "$OLD" ] && [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ]; echo $?) "PM-002 restart: pid 更新且端口恒定(PMW2-G 钉港)" "pid $OLDPID->$NEWPID port=$OLD->$NEW"
+curl -sS -m 3 "http://127.0.0.1:$NEW/health" >/dev/null 2>&1; ok $([ $? -eq 0 ]; echo $?) "PM-002 钉港 /health 200 after restart" "$NEW"
 H=$(apiget $NEW /health)
 echo "$H" | grep -q "\"version\":\"$VER\""; ok $? "repo version $VER live after restart" "$(echo "$H" | head -c 100)"
 

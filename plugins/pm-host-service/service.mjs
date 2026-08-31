@@ -1418,7 +1418,16 @@ const server = createServer((req, res) => {
   finish(404, { error: 'not found', service: SERVICE, hint: 'write passthrough = POST /op/act; health meta = GET /health (PM-009)' })
 })
 
-server.listen(0, '127.0.0.1', () => {
+// PMW2-G: PM_PORT pins the listen port (unset/invalid -> 0 = ephemeral random port,
+// keeping sandbox-gate compatibility); a pinned port that is occupied must fail fast.
+const PM_PORT = (() => { const v = Number(process.env.PM_PORT); return Number.isInteger(v) && v > 0 && v < 65536 ? v : 0 })()
+server.on('error', (e) => { // PMW2-G: 钉住端口冲突 -> 显式日志 + 非零退出，绝不静默跳港 (systemd Restart 可见)
+  const fatal = `FATAL listen 127.0.0.1:${PM_PORT || '(ephemeral)'} failed code=${e?.code ?? '?'} msg=${String(e?.message ?? e).slice(0, 160)}`
+  console.error(fatal) // stderr -> journald (systemctl status / journalctl 直接可见)
+  log(fatal) // file -> $LOG_DIR/service.log
+  process.exit(1)
+})
+server.listen(PM_PORT, '127.0.0.1', () => {
   const { port } = server.address()
   const action = writeFileIfChanged(PORT_FILE, jsonDoc({
     service: SERVICE,

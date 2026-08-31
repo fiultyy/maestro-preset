@@ -317,15 +317,17 @@ await sandboxPart()
 // 部署: 静态面是 boot 快照, 必须 try-restart 让 vendored/画布文件可服务
 const PORT_FILE = `${homedir()}/.dsh/maestro/pm.port`
 const SVC = 'pm-host-service'
-const oldPort = JSON.parse(readFileSync(PORT_FILE, 'utf8')).port
+const oldSnap = JSON.parse(readFileSync(PORT_FILE, 'utf8')) // PMW2-G 钉港: 部署信号=pid 更新, 端口应恒定
+const oldPort = oldSnap.port
+const oldPid = oldSnap.pid
 const { spawnSync } = await import('node:child_process')
 spawnSync('systemctl', ['--user', 'try-restart', SVC])
 let livePort = 0
 for (let i = 0; i < 80; i++) {
   await sleep(250)
-  try { const p = JSON.parse(readFileSync(PORT_FILE, 'utf8')); if (p.port !== oldPort) { livePort = p.port; break } } catch {}
+  try { const p = JSON.parse(readFileSync(PORT_FILE, 'utf8')); if (p.pid !== oldPid) { livePort = p.port; break } } catch {}
 }
-ok('部署: try-restart 后端口漂移(静态面新快照)', livePort > 0, `old=${oldPort} new=${livePort}`)
+ok('部署: try-restart 后 pid 更新且端口恒定(PMW2-G 钉港, 静态面新快照)', livePort > 0 && livePort === oldPort, `pid ${oldPid}->更新, port=${livePort}`)
 const health = await (await fetch(`http://127.0.0.1:${livePort}/health`)).json()
 ok('部署: /health 200 且服务版本可见', !!health?.version, `v${health?.version}`)
 

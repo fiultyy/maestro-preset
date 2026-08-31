@@ -12,6 +12,7 @@ RestartSec=2
 Environment=MAESTRO_HOME={{MAESTRO_HOME}}
 Environment=PM_HOST_SERVICE_LOG_DIR={{LOG_DIR}}
 Environment=PM_HOST_SERVICE_LOCK={{LOCK}}
+Environment=PM_PORT=35451
 SyslogIdentifier=pm-host-service
 
 [Install]

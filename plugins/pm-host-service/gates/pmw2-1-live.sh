@@ -27,9 +27,14 @@ VER=$(node -p "JSON.parse(require('fs').readFileSync('$REPO/package.json','utf8'
 echo "=== 0. deploy $VER via PM-002 try-restart ==="
 OLD=$(port); OLDPID=$(systemctl --user show -p MainPID --value $SVC)
 systemctl --user try-restart $SVC
-NEW=""
-for i in $(seq 60); do NEW=$(port 2>/dev/null || true); [ -n "$NEW" ] && [ "$NEW" != "$OLD" ] && break; sleep 0.25; done
-ok $([ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; echo $?) "PM-002 port drift after restart" "old=$OLD new=$NEW"
+NEW="$OLD"; NEWPID="$OLDPID"
+for i in $(seq 60); do
+  NEWPID=$(systemctl --user show -p MainPID --value $SVC 2>/dev/null || true)
+  PORTPID=$(node -pe "try{JSON.parse(require('fs').readFileSync('$PORT_FILE','utf8')).pid}catch{''}" 2>/dev/null || true)
+  [ -n "$NEWPID" ] && [ "$NEWPID" != 0 ] && [ "$NEWPID" != "$OLDPID" ] && [ "$PORTPID" = "$NEWPID" ] && NEW=$(port 2>/dev/null || true) && break
+  sleep 0.25
+done
+ok $([ -n "$NEW" ] && [ "$NEW" = "$OLD" ] && [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ]; echo $?) "PM-002 restart: pid 更新且端口恒定(PMW2-G 钉港)" "pid $OLDPID->$NEWPID port=$OLD->$NEW"
 H=$(curl -sS -m 10 "http://127.0.0.1:$NEW/health")
 echo "$H" | grep -q "\"version\":\"$VER\""; ok $? "$VER live after restart" "$(echo "$H" | head -c 100)"
 
