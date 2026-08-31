@@ -48,6 +48,7 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
   ok('A 打磨: 双击居中 + 泳道常显标题', cv.includes("addEventListener('dblclick'") && cv.includes('updateSticky') && cv.includes('cv-sticky-chip'))
   ok('A 初始 fit 全图 (既有 fitView 链在位)', cv.includes('function fitView()') && cv.includes('fitDoneCheck'))
   ok('A PMW2-H: _ts 数值化 (字符串 time 不再产字符串游标)', cv.includes('_ts: Number(e.time ?? e.time0) || null'))
+  ok('A PMW2-H: 载入面=全带 sessionId 节点 + 空面不锁 loaded (可重试)', /gatherSids[\s\S]{0,200}refetchGraph\(\)[\s\S]{0,300}回放事件流为空/.test(cv))
   ok('A PMW2-H: 载入中态保持到完成 (成功后 hidden, 失败复位可重试)', /btn\.textContent = '载入中…'[\s\S]{0,2200}R\.loaded = true[\s\S]{0,200}btn\.hidden = true/.test(cv) && cv.includes("btn.textContent = '载入回放'"))
   const buf = readFileSync(`${PUBLIC}elk.bundled.js`)
   ok('红线: elk vendor sha256 仍钉死 (零触碰)', sha256(buf) === SPEC_SHA, sha256(buf).slice(0, 16) + '…')
@@ -178,6 +179,13 @@ async function livePart(livePort) {
   })()`)
   ok('B PMW2-H: 游标元数据全 number (字符串 time 不再产字符串游标)', audit.loaded && audit.n > 0 && audit.maxT === 'number' && audit.cursorT === 'number', JSON.stringify(audit))
   ok('B PMW2-H: 拖动 30% 后节点脱离 cv-future (点亮 0<lit<total)', audit.liveN > 0 && audit.total > 0 && audit.liveN < audit.total, `lit=${audit.liveN}/${audit.total}`)
+  // 2c) PMW2-H 梯度: 拖到 90% -> 激活集单调增长, lit(90%) > lit(30%) 且 events>0
+  await c.cdp.eval(setRange(900))
+  await sleep(400)
+  const late = await c.cdp.eval(`({ events: window.__pmCanvas.replay.events, on: window.__pmCanvas.replay.on, liveN: document.querySelectorAll('.cv-node:not(.cv-future)').length })`)
+  ok('B PMW2-H: events>0 且点亮梯度 (lit 90% > lit 30%)', audit.n > 0 && late.events > 0 && late.on && late.liveN > audit.liveN, `events=${late.events} lit30=${audit.liveN} lit90=${late.liveN}`)
+  await c.cdp.eval(setRange(300)) // 回 30% 继续 4× 播放步
+  await sleep(300)
   await c.cdp.shot(shot('replay-mid.png'))
   ok('B 证据: replay-mid.png', statSync(shot('replay-mid.png')).size > 10000)
 

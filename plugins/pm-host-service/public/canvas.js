@@ -640,8 +640,16 @@ async function loadReplay() {
   const btn = $('#cv-tl-load')
   btn.disabled = true
   btn.textContent = '载入中…'
-  const sids = [...new Set([...C.nodes.values()].filter((n) => n.type === 'session').map((n) => n.sessionId).filter(Boolean))]
+  // PMW2-H 复验: 载入范围 = 图上**全部带 sessionId 的节点** (session 型 + seat 型都要,
+  // 不再只筛 type==='session'); 早点图未就绪时 refetch 一次再取; 空面不锁 loaded (可重试)。
+  const gatherSids = () => [...new Set([...C.nodes.values()].map((n) => n.sessionId).filter(Boolean))]
   try {
+    let sids = gatherSids()
+    if (sids.length === 0) { // 载入早于 /op/graph 首次就绪 → 拉一次图再取面
+      await refetchGraph()
+      sids = gatherSids()
+    }
+    if (sids.length === 0) throw new Error('图上无带 sessionId 的节点 (回放数据面为空)')
     const parts = await Promise.all(sids.map(async (sid) => {
       try {
         const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`)
@@ -652,6 +660,7 @@ async function loadReplay() {
       } catch { return [] }
     }))
     R.events = parts.flat().sort((a, b) => (a._ts ?? Infinity) - (b._ts ?? Infinity))
+    if (R.events.length === 0) throw new Error('回放事件流为空 (各会话 trace 均无 entries)')
     buildReplayHits(R.events)
     R.min = R.events.find((e) => e._ts != null)?._ts ?? Date.now() - 60_000
   } catch (e) { // 载入失败: 按钮复位可重试, 不吞 ctrl (载入中态只属于进行中的载入)
