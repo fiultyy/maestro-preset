@@ -403,3 +403,47 @@ dialog button.primary {
   color: #06121f;
   font-weight: 600;
 }
+
+/* ---- PMW2-2 画布 tab (只增; spec-pm-web-canvas §1.1/§1.2/§4/§5) ---- */
+
+#view-canvas { display: flex; flex-direction: column; gap: 8px; }
+
+.cv-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cv-counts { font-size: 12px; }
+
+.cv-banner {
+  border: 1px solid var(--warn); border-radius: 6px; background: #e0a93e14;
+  color: var(--warn); padding: 6px 10px; font-size: 12.5px;
+}
+.cv-banner:not(.warn) { border-color: var(--line); background: var(--bg-soft); color: var(--dim); }
+
+.cv-stage {
+  position: relative; height: 72vh; min-height: 420px;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  background: var(--bg); touch-action: none;
+}
+.cv-stage.cv-panning { cursor: grabbing; }
+#cv-svg-wrap, #cv-svg-wrap svg { width: 100%; height: 100%; display: block; }
+#canvas-svg { cursor: grab; }
+#canvas-svg.cv-panning, .cv-stage.cv-panning #canvas-svg { cursor: grabbing; }
+
+.cv-lane { fill: #141a22; stroke: var(--line); stroke-width: 1.5; }
+.cv-lane-title { fill: var(--dim); font: 600 12px var(--mono); }
+
+.cv-node { cursor: pointer; transition: opacity .25s; }
+.cv-node-body { fill: var(--bg-card); stroke-width: 2; }
+.cv-node-body.cv-solid { fill: #3fbf7f26; }
+.cv-node:hover .cv-node-body { filter: brightness(1.25); }
+.cv-label { fill: var(--fg); font: 600 11px var(--mono); text-anchor: middle; pointer-events: none; }
+.cv-sub { fill: var(--dim); font: 10px var(--mono); text-anchor: middle; pointer-events: none; }
+
+.cv-edge { fill: none; opacity: .85; transition: opacity .25s; }
+.cv-edge.cv-lit { stroke-width: 3; opacity: 1; }
+.cv-dim { opacity: .12 !important; } /* 选中/悬停时其余淡出 (spec §4 item 6: 30% 淡出基调下的强对比) */
+
+.cv-list { padding: 12px 16px; overflow: auto; height: 100%; }
+.cv-list-cols { display: grid; grid-template-columns: 3fr 2fr; gap: 20px; }
+.cv-lane-block h4 { margin: 10px 0 4px; color: var(--accent); }
+.cv-lane-block ul, .cv-edge-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.cv-lane-block li, .cv-edge-list li { padding: 1px 0; border-bottom: 1px dashed #212a36; }
+.cv-note { color: var(--dim); }

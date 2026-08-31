@@ -132,6 +132,23 @@ PMW2-1（spec spec-pm-web-canvas §1/§2/§5，0.10.0 基线）：沙箱门 `gat
 - **留存策略（②，不落 /tmp）**：一切回归/门产物固定落 `$PM_HOST_SERVICE_GATES_DIR/<label>/<run>/`（默认 `~/.dsh/maestro/logs/pm-host-service/gates`，`PM_HOST_SERVICE_GATES_DIR` 可整体重定向）：regression.log、SSE 临时帧、沙箱树（pm.port/游标/登记表/daemon.log）与 manifest.json 全部留档。
 - **重跑纪律（ADR-007.1 证据链）**：收口 = 新回归脚本 live ×2 全绿 + pm008/pm009 既有回归复跑绿，证据目录实测在册（`gates/pm001-007/`、`gates/pm008/`、`gates/pm009/`）。
 
+## Vendor 例外（elkjs — 零 npm 宪章唯一例外）
+
+> 例外条款（spec-pm-web-canvas §3 原文入宪，仅此一次，逐字适用）：零 npm 运行时依赖宪章（mvp-plan §6.1）仅开此一例外：`public/elk.bundled.js` 为 elkjs 0.12.0 官方 tarball 内 `lib/elk.bundled.js` 的逐字节原样拷贝（sha256 见下），依上游双许可之 EPL-2.0 条款 vendored；该文件不经 npm/构建/打包工具获取运行时依赖地位，不写入 package.json 依赖项，不做任何派生修改（**修改即失效本例外**，须重新原样 vendor 并更新 sha256）；版本、许可与来源注记常驻本 README。除本文件外，宪章对其余 public/ 文件与全部服务端代码仍然全部适用。
+
+| 项 | 值 |
+|---|---|
+| 版本 | elkjs 0.12.0（registry latest stable） |
+| 许可 | EPL-2.0 OR GPL-3.0-or-later（vendoring 取 EPL-2.0 通道） |
+| sha256 | `1222e44f953ce7746af23801e723708f8e6f436b8b377a6a5fc7552f34a307b3` |
+| 字节 | 1,609,707 |
+| 来源 URL | https://registry.npmjs.org/elkjs/-/elkjs-0.12.0.tgz |
+| 落位 | `public/elk.bundled.js`（逐字节）+ `public/LICENSE.elkjs.md`（tarball 内 LICENSE.md 原样）+ `public/elk.js`（薄 ESM 包装，`import './elk.bundled.js'` 后 `export const ELK = globalThis.ELK`；app 代码不触全局） |
+| 引入形态 | UMD 单文件（classic `<script>` 或模块副作用 import 均挂 `globalThis.ELK`）；画布代码只经 `elk.mjs` 取 `ELK` |
+| 落位偏差注记（PMW2-2 实测） | spec §3 原定 `public/vendor/` 子目录 —— PW-001 静态面为**非递归** boot 快照（`readdirSync(public/)` 顶层文件名直入 allowlist），且本票红线 service.mjs 冻结不动，子目录文件不可达；故落位上移一层至 `public/` 顶层；包装器同理由 `elk.mjs` 落为 `elk.js`（静态面 MIME 表无 `.mjs` —— 模块脚本必须 JS MIME，浏览器对 octet-stream 模块直接拒载）。字节/许可/注记义务全部照行。静态面将来若递归化+补 MIME，可原样移回 `vendor/elk.*` 并更新本节 |
+
+sha256 门：`gates/pmw2-2-canvas-gate.mjs` 校验 `public/elk.bundled.js` 的 sha256 与字节数（≠ 上值即 FAIL）。
+
 ## 边界
 
 - 只读投影（ADR-002）：不直写任何 sqlite 账本；写侧一律透传 maestro CLI（PM-008 已交付：`POST /op/act`，本进程零账本写入）

@@ -292,11 +292,13 @@ function connectSse() {
   es.onopen = () => {
     badge.textContent = 'SSE 已订阅'
     badge.className = 'badge ok'
+    window.dispatchEvent(new CustomEvent('pm:sse-state', { detail: { open: true } })) // PMW2-2 画布: 断线轮询窗
   }
   es.onerror = () => {
     // 浏览器原生自动重连；此处只亮态，不造数据（降级优先）
     badge.textContent = 'SSE 断连，自动重连中…'
     badge.className = 'badge err'
+    window.dispatchEvent(new CustomEvent('pm:sse-state', { detail: { open: false } })) // PMW2-2 画布: 转 30s 轮询
   }
   es.onmessage = (m) => {
     let ev
@@ -307,6 +309,7 @@ function connectSse() {
     }
     if (ev.t !== 'pm.event') return
     logEvent(ev)
+    window.dispatchEvent(new CustomEvent('pm:sse', { detail: ev })) // PMW2-2 画布: 复用同一连接, 画布侧自行去抖
     if (ev.kind === 'tickets') refetch.tickets()
     else if (ev.kind === 'fleet') { refetch.fleet(); refetch.tickets() } // 持票计数依赖票面
     else if (ev.kind === 'flow') refetch.flow()
