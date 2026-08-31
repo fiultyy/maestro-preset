@@ -1,2 +1,0 @@
-name: queen-v1
-description: 对提交的 diff 做逐文件代码审查，输出带文件路径:行号证据锚点的结构化审查清单。

@@ -121,7 +121,7 @@ maestro/
 │   ├── packages/         #   4 个 @deepseek-ai/dsh-long-task* 构建包 → profile node_modules
 │   ├── plugins/          #   random-uuid-polyfill / workspace-unarchive / ui-agent-pool → ~/.dsh/plugins
 │   └── polyfill.patch.yml#   host 补丁组合模板(run-web.sh --patch 挂载,路径 DSH_HOME 感知)
-└── agent-presets/        # 独立分发面②: long-task / queen-v1 / liangshen 三个自研 preset(→ ~/.dsh/.agent-presets/<id>)
+└── agent-presets/        # 独立分发面②: long-task / liangshen 两个自研 preset(→ ~/.dsh/.agent-presets/<id>)
 ```
 
 ## 运行时状态(不在包内,自动生成)

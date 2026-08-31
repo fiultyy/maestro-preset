@@ -108,5 +108,5 @@ user preset 等同 shell 权限(preset 是组合,插件代码无额外沙箱)。
 | `host/packages/` | 4 个 `@deepseek-ai/dsh-long-task*` 构建包(v0.1.0-rc.8) | `~/.dsh/profiles/<profile>/node_modules/@deepseek-ai/` |
 | `host/plugins/` | random-uuid-polyfill / workspace-unarchive / ui-agent-pool | `~/.dsh/plugins/`(polyfill.patch.yml 引用) |
 | `host/polyfill.patch.yml` | host 补丁组合模板(run-web.sh `--patch`) | 引用,不安装 |
-| `agent-presets/<id>/` | long-task / queen-v1 / liangshen 三个自研 preset | `~/.dsh/.agent-presets/<id>/` |
+| `agent-presets/<id>/` | long-task / liangshen 两个自研 preset | `~/.dsh/.agent-presets/<id>/` |
 

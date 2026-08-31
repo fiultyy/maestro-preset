@@ -77,7 +77,7 @@ python3 ~/.agents/skills/incubation-wizard/wizard.py \
 4. **血缘**：incubate params 携带 `lineage: {derived-by: queen, parent:
    <args.parent 或空>}`（插件侧消费面由 N10-T3 落地，当前多余参数被
    无害忽略）；命名即 `queen-v<版本号>`——wizard 校验该形式，并在不合规时
-   读池 `profiles/list` 取最大 N 后建议 N+1（daemon 不可达回退 queen-v1）。
+   读池 `profiles/list` 取最大 N 后建议 N+1（daemon 不可达时由 wizard 报错中止，不再回退固定名）。
 5. **铁条款**：人在环（不做全自动派生）、不直接孵化会话（spawn 走池选型
    面）、血缘如实——三条由 queen doctrine 模板注入产物并由三门把关。
 

@@ -75,7 +75,7 @@ function slugify(text) {
 }
 
 function suggestSlug(profile) {
-  return slugify(profile?.name) || 'queen-v1'
+  return slugify(profile?.name) || 'incubated-persona'
 }
 
 /**

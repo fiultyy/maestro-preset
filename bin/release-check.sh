@@ -67,7 +67,7 @@ chk_installer() {
     N_PRE=$(find "$SBX/.agent-presets" -mindepth 1 -maxdepth 1 -type d | wc -l)
     [ "$N_PKG" = 4 ] && ok "4 个 npm 包" || bad "npm 包数=$N_PKG (期望 4)"
     [ "$N_PLG" = 5 ] && ok "5 个插件"     || bad "插件数=$N_PLG (期望 5)"
-    [ "$N_PRE" = 3 ] && ok "3 个 preset"  || bad "preset数=$N_PRE (期望 3)"
+    [ "$N_PRE" = 2 ] && ok "2 个 preset"  || bad "preset数=$N_PRE (期望 2)"
   else
     bad "沙箱安装非零退出"
   fi

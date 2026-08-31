@@ -50,4 +50,4 @@ host/install.sh --systemd          # 另: 生成 a2a-profile-daemon systemd unit
 
 ## 关联 preset
 
-`../agent-presets/` 下三个自研 preset(long-task / queen-v1 / liangshen)同样由 install.sh 安装;maestro 本体 preset 即仓库根,走 `bin/dev-sync.sh`。
+`../agent-presets/` 下两个自研 preset(long-task / liangshen)同样由 install.sh 安装;maestro 本体 preset 即仓库根,走 `bin/dev-sync.sh`。

@@ -112,7 +112,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def suggest_queen_name() -> str:
-    """queen-v<N>：读池 profiles/list 取最大 N 后 +1；daemon 不可达回退 queen-v1。"""
+    """queen-v<N>：读池 profiles/list 取最大 N 后 +1；daemon 不可达即报错。"""
     port = os.environ.get("A2A_PROFILE_PORT", "8790")
     token = os.environ.get("A2A_PROFILE_TOKEN", "")
     body = json.dumps(
@@ -127,8 +127,10 @@ def suggest_queen_name() -> str:
         with urllib.request.urlopen(req, timeout=5) as resp:
             profiles = (json.loads(resp.read().decode())
                         .get("result", {}).get("profiles", []))
-    except (urllib.error.URLError, OSError, ValueError):
-        return "queen-v1"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise SystemExit(
+            f"daemon 不可达，无法建议 queen-v<N>（A2A_PROFILE_PORT={port}）：{e}"
+        ) from e
     versions = [
         int(m.group(1)) for p in profiles
         if (m := re.fullmatch(r"queen-v(\d+)", str(p.get("name", ""))))
