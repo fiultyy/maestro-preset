@@ -48,7 +48,7 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
   ok('A 打磨: 双击居中 + 泳道常显标题', cv.includes("addEventListener('dblclick'") && cv.includes('updateSticky') && cv.includes('cv-sticky-chip'))
   ok('A 初始 fit 全图 (既有 fitView 链在位)', cv.includes('function fitView()') && cv.includes('fitDoneCheck'))
   ok('A PMW2-H: _ts 数值化 (字符串 time 不再产字符串游标)', cv.includes('_ts: Number(e.time ?? e.time0) || null'))
-  ok('A PMW2-H: 载入面=全带 sessionId 节点 + 空面不锁 loaded (可重试)', /gatherSids[\s\S]{0,200}refetchGraph\(\)[\s\S]{0,300}回放事件流为空/.test(cv))
+  ok('A PMW2-H: 载入面=全带 sessionId 节点 + 空面不锁 loaded (可重试)', /gatherSids[\s\S]{0,300}refetchGraph\(\)[\s\S]{0,1200}回放事件流为空/.test(cv))
   ok('A PMW2-H: 载入中态保持到完成 (成功后 hidden, 失败复位可重试)', /btn\.textContent = '载入中…'[\s\S]{0,2200}R\.loaded = true[\s\S]{0,200}btn\.hidden = true/.test(cv) && cv.includes("btn.textContent = '载入回放'"))
   const buf = readFileSync(`${PUBLIC}elk.bundled.js`)
   ok('红线: elk vendor sha256 仍钉死 (零触碰)', sha256(buf) === SPEC_SHA, sha256(buf).slice(0, 16) + '…')
@@ -127,12 +127,18 @@ async function livePart(livePort) {
   const shot = (f) => `${BASE}/${f}`
   const errors = []
 
-  // gate 侧 trace 总数 (与页面同源同口径: /op/graph 会话集 → 逐会话 entries 和)
+  // gate 侧 trace 总数 (与页面同源同口径: /op/graph 全部带 sessionId 节点 [PMW2-H 复验: 含 seat] → 逐会话 entries 和;
+  // 逐请求 10s deadline 与页面 loadReplay 同参, 楔死会话对称降级)
   const g = await (await fetch(`http://127.0.0.1:${livePort}/op/graph`)).json()
-  const sids = [...new Set(g.nodes.filter((n) => n.type === 'session').map((n) => n.sessionId).filter(Boolean))]
+  const sids = [...new Set(g.nodes.filter((n) => n.sessionId).map((n) => n.sessionId).filter(Boolean))]
   let traceTotal = 0
   for (const sid of sids) {
-    try { const j = await (await fetch(`http://127.0.0.1:${livePort}/op/trace?sessionId=${encodeURIComponent(sid)}`)).json(); traceTotal += (j?.entries ?? []).length } catch {}
+    try {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 10_000)
+      try { const j = await (await fetch(`http://127.0.0.1:${livePort}/op/trace?sessionId=${encodeURIComponent(sid)}`, { signal: ctl.signal })).json(); traceTotal += (j?.entries ?? []).length } catch {}
+      finally { clearTimeout(timer) }
+    } catch {}
   }
 
   const c = await newChrome('live')
@@ -205,7 +211,7 @@ async function livePart(livePort) {
   const lra0 = await c.cdp.eval('window.__pmCanvas.lastRefetchAt')
   await c.cdp.eval(setRange(1000))
   let live = null
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 80; i++) { // 20s 窗口: 覆盖 refetchGraph 15s 楔死兜底 + 结算
     await sleep(250)
     live = await c.cdp.eval(`({
       on: window.__pmCanvas.replay.on,

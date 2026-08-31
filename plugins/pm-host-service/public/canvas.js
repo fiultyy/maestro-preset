@@ -161,8 +161,10 @@ async function layoutLane(lane) {
 async function refetchGraph() {
   if (C.refetching || C.replay.on) return // PMW2-4: 回放态数据冻结 (只改样式不重排), 游标回 now 自动恢复
   C.refetching = true
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 15_000) // PMW2-H: 传输楔死兜底 — refetching 不得永久 true (否则 exit 回放 kick 与 3s 对账轮询全被门死, 数据面冻结)
   try {
-    const res = await fetch('/op/graph')
+    const res = await fetch('/op/graph', { signal: ctl.signal })
     const g = await res.json()
     C.lastRefetchAt = Date.now()
     if (!g || g.op !== 'graph') throw new Error('bad /op/graph payload')
@@ -194,6 +196,7 @@ async function refetchGraph() {
   } catch (e) {
     bannerShow(`/op/graph 不可达 —— 保留上一帧渲染 (${String(e?.message ?? e).slice(0, 80)})`, true)
   } finally {
+    clearTimeout(timer)
     C.refetching = false
     introspect()
   }
@@ -643,21 +646,27 @@ async function loadReplay() {
   // PMW2-H 复验: 载入范围 = 图上**全部带 sessionId 的节点** (session 型 + seat 型都要,
   // 不再只筛 type==='session'); 早点图未就绪时 refetch 一次再取; 空面不锁 loaded (可重试)。
   const gatherSids = () => [...new Set([...C.nodes.values()].map((n) => n.sessionId).filter(Boolean))]
+  let sids = []
   try {
-    let sids = gatherSids()
-    if (sids.length === 0) { // 载入早于 /op/graph 首次就绪 → 拉一次图再取面
-      await refetchGraph()
+    sids = gatherSids()
+    for (let i = 0; sids.length === 0 && i < 40; i++) { // PMW2-H: 图未就绪/首拉在途 → 轮询等数据面 (~20s 上限)。
+      // 不能只 await refetchGraph(): C.refetching 卡在途时它秒回且不刷新, 会误判空面。
+      await new Promise((r) => setTimeout(r, 500))
+      if (!C.refetching) refetchGraph() // fire-and-forget: 数据面到位即收集到 sids
       sids = gatherSids()
     }
     if (sids.length === 0) throw new Error('图上无带 sessionId 的节点 (回放数据面为空)')
     const parts = await Promise.all(sids.map(async (sid) => {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 10_000) // 活体大 trace 慢载兜底: 单会话超时降级为空, 整条流必结算 (按钮不永久卡载入中)
       try {
-        const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`)
+        const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`, { signal: ctl.signal })
         const j = await res.json()
         // PMW2-H: 活体 trace 的 time 是字符串 ("1788172761057") — 必须数值化,
         // 否则拖拽 R.min+(R.max-R.min)*v/1000 变字符串拼接 → 游标垃圾 → 全灰。
         return (j?.entries ?? []).map((e) => ({ ...e, _sid: sid, _ts: Number(e.time ?? e.time0) || null }))
       } catch { return [] }
+      finally { clearTimeout(timer) }
     }))
     R.events = parts.flat().sort((a, b) => (a._ts ?? Infinity) - (b._ts ?? Infinity))
     if (R.events.length === 0) throw new Error('回放事件流为空 (各会话 trace 均无 entries)')
