@@ -155,3 +155,10 @@ fleet-tree  [--root <签名前缀>] [--json] [--orphans] [--fleet <path>]       
 spawn → 验席位 → fleet-adopt 认领挂树 → steer 派发(内嵌 cb-send 契约)
       → 独立验证闸 ×2 → ledger → flowc advance(幂等预检)
 ```
+
+**steer 简报必须内嵌回报全签名**(2026-08-30 and2 死信教训):cb-send 的 `to` 只认
+`alias@session-…` 全签名或注册别名——**fleet 4 位码不经桥寻址**(bridge/registry.json
+无 fleet 码索引),裸码回报必死信(dead.log)。派发模板写法:
+`完成 cb-send 到 <alias>@<sessionId>(必须全签名, 勿用裸码) type=done ref=<票>`。
+死信救信先例:旁路席捞 dead.log 转 report + 存档
+(`gates/pm009/and2-2-dead-rescue.jsonl`)。
