@@ -103,6 +103,23 @@
 // probe that fails marks ITS source degraded with a note — the endpoint
 // itself NEVER 5xxes; even with every source down it answers 200 +
 // status:"degraded" so tk can render empty states (spec gate).
+// PMW2-1 (canvas graph projection, GET /op/graph): spec
+// docs/specs/spec-pm-web-canvas.md §1/§2 frozen contract — four node types
+// (flow-node fn:<flow>/<id> / ticket tk:<id> / seat st:<code> / session
+// se:<sid>) × four edge kinds (dep / dispatch / callback / cb-send), edge id
+// `<kind>:<from>><to>`, response envelope field-for-field, 恒 200: any dead
+// source contributes the EMPTY SET + sources.<plane>.live=false + top
+// degraded:true, never 5xx. Sources: flows state.db (v_status + nodes.deps,
+// per-flow degrade like PM-006), tickets via serveTickets() (SAME PM-003
+// cache instance — zero double pull, PMW1-4 db-signature semantics), fleet
+// seats (readSeats) joined over dsh loopback session.list (session nodes
+// only with live join data; join loss = sessions empty set, spec-legal),
+// bridge inbox.log near-window 200 lines ((from,to) dedup keep-latest,
+// handles resolved to graph nodes — unresolved endpoints drop the edge into
+// sources.bridge.note, 悬挂禁止). cb-send is the honest empty set today: the
+// flows/ledger schema has NO structured orchestrator-seat→worker-seat
+// dispatch record (annotated in sources.bridge.note per spec §1.2). SSE
+// gains zero new kinds — clients refetch on the existing event kinds.
 //
 // Zero npm deps; node:* ESM only. Read projections only (ADR-002): never
 // opens a ledger/sqlite for writing; writes go through maestro CLI (PM-008).
@@ -111,11 +128,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
-import { accessSync, appendFileSync, chmodSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
+import { accessSync, appendFileSync, chmodSync, closeSync, constants, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-const VERSION = '0.9.0'
+const VERSION = '0.10.0'
 const SERVICE = 'pm-host-service'
 const ROOT = process.env.MAESTRO_HOME ?? `${homedir()}/.dsh`
 const LOG_DIR = process.env.PM_HOST_SERVICE_LOG_DIR ?? `${ROOT}/maestro/logs/${SERVICE}`
@@ -133,6 +150,7 @@ const DSH_PORT = process.env.DSH_PORT ?? '3080'
 const SESSIONS_ROOT = process.env.DSH_SESSIONS_ROOT ?? `${ROOT}/sessions`
 const FLOWS_ROOT = process.env.MAESTRO_FLOWS_ROOT ?? `${ROOT}/maestro/flows`
 const FLOWC_BIN = process.env.PM_HOST_SERVICE_FLOWC ?? `${ROOT}/maestro/bin/flowc`
+const BRIDGE_LOG = process.env.PM_HOST_SERVICE_BRIDGE_LOG ?? `${ROOT}/maestro/bridge/inbox.log`
 const TRACE_BUDGET_CHARS = 20_000 // head.compact threshold (KG 14 §2.5 default)
 const TRACE_KEEP_MAX_ENTRIES = 500
 const TRACE_FILE_MAX_BYTES = 64 * 1024 * 1024
@@ -525,6 +543,302 @@ function serveFlow() {
     sqlFailed: failed,
     cliFallback,
     note: notes.join('; ').slice(0, 220),
+  }
+}
+
+// ---- PMW2-1: op=graph (canvas plane projection; additive over PM-003..006) ----
+// Spec docs/specs/spec-pm-web-canvas.md §1/§2 (frozen, field-for-field):
+// 严守字段表 — nodes/edges 专有字段逐字段照抄, 无自创; sources.<plane>.count =
+// 该面对图的节点贡献 (bridge 面零节点, 计其边); note 仅注记, live 才是断源信号。
+const GRAPH_TAIL_BYTES = 1_000_000 // bridge tail-read cap: only the near-window matters
+const GRAPH_BRIDGE_WINDOW = 200 // spec §1.2: near-window line count
+const GRAPH_SID_RE = /(session-[0-9a-fA-F-]{8,})$/ // full or alias@session-<uuid> handle form
+let graphJoinSeq = 0
+
+async function fetchSessionMap() { // dsh loopback session.list -> Map(sid -> {running,title,cwd}); throws -> caller degrades
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 8000)
+  try {
+    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-graph-${++graphJoinSeq}`, method: 'session.list', payload: {} }),
+      signal: ctl.signal,
+    })
+    if (!res.ok) throw new Error(`http ${res.status}`)
+    const data = await res.json()
+    if (data?.result?.ok !== true) throw new Error(`rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 120)}`)
+    const map = new Map()
+    for (const s of data.result.value?.items ?? []) {
+      map.set(s.sessionId, { running: !!s.running, title: s.projections?.values?.title ?? null, cwd: s.cwd ?? null })
+    }
+    return map
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function readBridgeWindow() { // last <=GRAPH_BRIDGE_WINDOW complete lines (tail slice drops its torn head line)
+  let text
+  let sliced = false
+  try {
+    const st = statSync(BRIDGE_LOG)
+    const start = Math.max(0, st.size - GRAPH_TAIL_BYTES)
+    sliced = start > 0
+    const fh = openSync(BRIDGE_LOG, 'r')
+    try {
+      const buf = Buffer.alloc(st.size - start)
+      readSync(fh, buf, 0, buf.length, start)
+      text = buf.toString('utf8')
+    } finally { closeSync(fh) }
+  } catch (e) {
+    throw new Error(`bridge inbox.log unreadable: ${String(e?.message ?? e).slice(0, 120)}`)
+  }
+  const lines = text.split('\n').filter((l) => l.trim().length > 0)
+  if (sliced && lines.length) lines.shift()
+  return lines.slice(-GRAPH_BRIDGE_WINDOW)
+}
+
+function gatherBridgePairs() { // (from,to) dedup keep-latest, in file order = recency order
+  const lines = readBridgeWindow()
+  const latest = new Map()
+  let bad = 0
+  for (const line of lines) {
+    let r
+    try { r = JSON.parse(line) } catch { bad++; continue }
+    if (typeof r?.from !== 'string' || typeof r?.to !== 'string' || !r.from || !r.to) { bad++; continue }
+    latest.set(`${r.from}\u0000${r.to}`, { from: r.from, to: r.to }) // re-set on a later sighting = keep-latest
+  }
+  return { pairs: [...latest.values()], bad }
+}
+
+function graphResolveHandle(h, ctx) { // bridge handle -> emitted node id | null (unresolvable -> edge drops)
+  if (typeof h !== 'string') return null
+  const t = h.trim()
+  const m = GRAPH_SID_RE.exec(t) // full `alias@session-<uuid>` / bare session id
+  if (m) {
+    const sid = m[1]
+    if (ctx.sessionIds.has(sid)) return `se:${sid}`
+    if (ctx.seatBySessionId.has(sid)) return `st:${ctx.seatBySessionId.get(sid)}` // session gone, seat remains
+    return null
+  }
+  if (ctx.seatByCode.has(t)) { // bare seat code (fleet code, e.g. a804)
+    const sid = ctx.seatByCode.get(t).sessionId
+    if (typeof sid === 'string' && ctx.sessionIds.has(sid)) return `se:${sid}`
+    return `st:${t}`
+  }
+  if (/^[0-9a-f]{4,8}$/.test(t)) { // bare short code (e.g. af29) -> unique prefix of a known session id
+    for (const sid of ctx.sessionIds) if (sid.startsWith(`session-${t}`)) return `se:${sid}`
+  }
+  return null
+}
+
+function gatherFlowGraph(seatCodes) { // flow-node nodes + intra-flow dep edges + dispatch 子源②; per-flow degrade like PM-006
+  const nodes = []
+  const edges = []
+  const notes = []
+  let names = []
+  try {
+    names = readdirSync(FLOWS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort()
+  } catch (e) {
+    return { nodes, edges, live: false, note: `flows root unavailable: ${String(e?.message ?? e).slice(0, 140)}` }
+  }
+  if (!names.length) return { nodes, edges, live: false, note: `no flows under ${FLOWS_ROOT}` }
+  let failed = 0
+  for (const name of names) {
+    try {
+      const db = new DatabaseSync(`${FLOWS_ROOT}/${name}/state.db`, { readOnly: true }) // read-side red line: never a write handle
+      let rows
+      let depRows
+      let eventRows
+      try {
+        rows = db.prepare('SELECT node_id, verb, state, attempts, events FROM v_status ORDER BY node_id').all()
+        depRows = db.prepare('SELECT node_id, deps FROM nodes ORDER BY node_id').all()
+        eventRows = db.prepare('SELECT node_id, detail FROM events ORDER BY id').all() // dispatch 子源② source (§1.2)
+      } finally { db.close() }
+      const ids = new Set(rows.map((r) => `${name}/${r.node_id}`))
+      const verbOf = new Map(rows.map((r) => [r.node_id, r.verb]))
+      for (const r of rows) {
+        nodes.push({ id: `fn:${name}/${r.node_id}`, type: 'flow-node', label: r.node_id, nodeId: r.node_id, flow: name, verb: r.verb ?? null, state: r.state ?? null, attempts: Number(r.attempts ?? 0) || 0, events: Number(r.events ?? 0) || 0 })
+      }
+      for (const r of depRows) { // flow deps 同构: fn:X -> fn:Y (X 先行)
+        let deps = []
+        try { const p = JSON.parse(r.deps ?? '[]'); if (Array.isArray(p)) deps = p } catch {}
+        for (const d of deps) {
+          if (typeof d !== 'string' || !d || !ids.has(`${name}/${d}`) || !ids.has(`${name}/${r.node_id}`)) {
+            if (d) notes.push(`${name}: dangling dep ${d}->${r.node_id} dropped`)
+            continue
+          }
+          edges.push({ id: `dep:fn:${name}/${d}>fn:${name}/${r.node_id}`, kind: 'dep', from: `fn:${name}/${d}`, to: `fn:${name}/${r.node_id}`, label: '' })
+        }
+      }
+      // dispatch 子源② (§1.2: flow 事件中含 dispatch 目标席位 ⇒ st:<code> -> fn:…):
+      // steer/spawn targets are free-text in event details — extract 4-hex
+      // tokens and keep ONLY those that are CURRENT fleet seat codes (membership
+      // validation keeps the graph honest: unknown/retired seats yield no edge,
+      // 无数据/无命中则空集合法). Dedup per (seat, flow-node) pair.
+      const paired = new Set()
+      for (const ev of eventRows) {
+        if (verbOf.get(ev.node_id) !== 'dispatch' || typeof ev.detail !== 'string') continue
+        for (const m of ev.detail.matchAll(/\b[0-9a-f]{4}\b/g)) {
+          const code = m[0]
+          if (!seatCodes.has(code)) continue
+          const key = `${code}>${name}/${ev.node_id}`
+          if (paired.has(key)) continue
+          paired.add(key)
+          edges.push({ id: `dispatch:st:${code}>fn:${name}/${ev.node_id}`, kind: 'dispatch', from: `st:${code}`, to: `fn:${name}/${ev.node_id}`, label: '' })
+        }
+      }
+    } catch (e) { // locked / unreadable / corrupt: degrade THIS flow only
+      failed++
+      notes.push(`${name}: state.db unreadable (${String(e?.message ?? e).slice(0, 90)})`)
+    }
+  }
+  const live = failed < names.length
+  return { nodes, edges, live, note: notes.join('; ').slice(0, 220) }
+}
+
+function gatherTicketGraph(seatCodes) { // ticket nodes via the PM-003 cache instance (zero double pull)
+  const t = serveTickets() // never throws — degrades internally (PM-003 discipline)
+  const nodes = []
+  const edges = []
+  const notes = []
+  for (const tk of t.tickets ?? []) {
+    const tid = tk?.ticket_id
+    if (typeof tid !== 'string' || !tid) continue
+    let deps = []
+    try { const p = JSON.parse(tk.deps ?? '[]'); if (Array.isArray(p)) deps = p.filter((d) => typeof d === 'string') } catch {}
+    let refs = [] // spec §1.1: keys of the refs object (values stay out of the graph)
+    try {
+      const p = JSON.parse(tk.refs ?? '[]')
+      if (p && typeof p === 'object' && !Array.isArray(p)) refs = Object.keys(p)
+      else if (Array.isArray(p)) refs = p.filter((d) => typeof d === 'string')
+    } catch {}
+    nodes.push({ id: `tk:${tid}`, type: 'ticket', label: tid, ticketId: tid, state: tk.state ?? null, deps, leaseOwner: tk.lease_owner ?? null, refs })
+  }
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  for (const n of nodes) {
+    for (const d of n.deps) { // 票依赖执行序: tk:A.deps ∋ B ⇒ tk:B -> tk:A
+      if (!byId.has(`tk:${d}`)) { notes.push(`dangling ticket dep ${d} of ${n.ticketId} dropped`); continue }
+      edges.push({ id: `dep:tk:${d}>tk:${n.ticketId}`, kind: 'dep', from: `tk:${d}`, to: n.id, label: '' })
+    }
+    const owner = n.leaseOwner // 派发/持有 子源①: st:<code> -> tk:<id>, label "lease"
+    if (typeof owner === 'string' && owner) {
+      const code = owner.split('/')[0].trim() // recorded forms: "<code>" or "<code>/<budget>" (e.g. af29/240min)
+      if (seatCodes.has(code)) edges.push({ id: `dispatch:st:${code}>${n.id}`, kind: 'dispatch', from: `st:${code}`, to: n.id, label: 'lease' })
+      else notes.push(`dangling lease owner ${owner} of ${n.ticketId} dropped`)
+    }
+  }
+  const live = t.degraded ? nodes.length > 0 // stale cache still serves real nodes (live data, note carries the staleness)
+    : true
+  return { nodes, edges, live, note: notes.join('; ').slice(0, 200), sourceNote: t.note ?? '' }
+}
+
+async function gatherFleetGraph(bridgeSids) { // seat nodes + session nodes (only with live join data, §1.1)
+  let seats
+  try {
+    seats = readSeats()
+  } catch (e) {
+    return { seatNodes: [], sessionNodes: [], live: false, note: `fleet sources unavailable: ${String(e?.message ?? e).slice(0, 160)}` }
+  }
+  seats.sort((a, b) => (a.code < b.code ? -1 : 1)) // deterministic order (serveFleet precedent)
+  const seatNodes = seats.map((s) => ({ id: `st:${s.code}`, type: 'seat', label: s.code, code: s.code, role: s.role ?? null, node: s.node ?? null, preset: s.preset ?? null, status: s.status ?? null, sessionId: s.sessionId ?? null }))
+  const sessionNodes = []
+  const notes = []
+  let map = null
+  try {
+    map = await fetchSessionMap()
+  } catch (e) { // join loss = sessions empty set, seats keep sessionId (spec §1.1: 空集合法)
+    notes.push(`dsh session.list unreachable (127.0.0.1:${DSH_PORT}): ${String(e?.message ?? e).slice(0, 110)} — session nodes empty set`)
+  }
+  if (map) {
+    const want = new Set()
+    for (const s of seats) if (typeof s.sessionId === 'string' && s.sessionId && map.has(s.sessionId)) want.add(s.sessionId)
+    for (const sid of bridgeSids) if (map.has(sid)) want.add(sid) // orchestrator/peer sessions observed on the bridge (§2 se:…orch)
+    for (const sid of [...want].sort()) {
+      const m = map.get(sid)
+      const title = m.title ?? null
+      sessionNodes.push({ id: `se:${sid}`, type: 'session', label: title ? String(title).slice(0, 40) : sid.slice(0, 16), sessionId: sid, running: !!m.running, title, cwd: m.cwd ?? null })
+    }
+  }
+  return { seatNodes, sessionNodes, live: true, note: notes.join('; ').slice(0, 200) }
+}
+
+async function serveGraph() {
+  const generatedAt = new Date().toISOString()
+  const topNotes = []
+  // bridge near-window FIRST: its full-form handles feed the session-node set (§2 example needs se:…orch)
+  let bridge
+  try {
+    bridge = gatherBridgePairs()
+  } catch (e) {
+    bridge = { pairs: [], bad: 0, dead: String(e?.message ?? e).slice(0, 160) }
+  }
+  const bridgeSids = new Set()
+  for (const p of bridge.pairs) for (const h of [p.from, p.to]) { const m = GRAPH_SID_RE.exec(h.trim()); if (m) bridgeSids.add(m[1]) }
+
+  const fleet = await gatherFleetGraph(bridgeSids)
+  const seatCodes = new Set(fleet.seatNodes.map((s) => s.code))
+  const flow = gatherFlowGraph(seatCodes) // 席位码成员校验用于 dispatch 子源②
+  const ticket = gatherTicketGraph(seatCodes)
+
+  const ctx = {
+    sessionIds: new Set(fleet.sessionNodes.map((s) => s.sessionId)),
+    seatByCode: new Map(fleet.seatNodes.map((s) => [s.code, s])),
+    seatBySessionId: new Map(fleet.seatNodes.filter((s) => typeof s.sessionId === 'string' && s.sessionId).map((s) => [s.sessionId, s.code])),
+  }
+  // callback edges: worker->orchestrator upstream, resolved (from,to) dedup keep-latest
+  const callbackEdges = []
+  const seenPairs = new Set()
+  const bridgeNotes = []
+  let dropped = 0
+  for (const p of [...bridge.pairs].reverse()) { // reverse file order: first resolved sighting IS the latest
+    const from = graphResolveHandle(p.from, ctx)
+    const to = graphResolveHandle(p.to, ctx)
+    if (!from || !to || from === to) { dropped++; continue } // 悬挂引用禁止: drop + count into sources.bridge.note
+    const key = `${from}>${to}`
+    if (seenPairs.has(key)) continue
+    seenPairs.add(key)
+    callbackEdges.push({ id: `callback:${key}`, kind: 'callback', from, to, label: '', at: generatedAt })
+  }
+  // cb-send edges (orchestrator->worker steer/spawn, §1.2): source = flows/ledger 派发事件记录.
+  // Surveyed 2026-08-31 (PMW2-1 勘察): ledger CLI exposes NO event read (record-only
+  // verb) and flow events carry steer targets as free text with NO orchestrator-seat
+  // identity (the orchestrator is not a fleet seat) — no st:orch->st:worker edge is
+  // derivable today. Empty set is spec-legal; annotated honestly until the schema
+  // grows a structured record.
+  const cbSendEdges = []
+  bridgeNotes.push('cb-send empty set: no structured orchestrator-seat->worker-seat dispatch record in flows/ledger (spec §1.2 空集合法, 如实标注)')
+
+  const nodes = [...flow.nodes, ...ticket.nodes, ...fleet.seatNodes, ...fleet.sessionNodes].sort((a, b) => (a.id < b.id ? -1 : 1))
+  const edges = [...flow.edges, ...ticket.edges, ...callbackEdges, ...cbSendEdges].sort((a, b) => (a.id < b.id ? -1 : 1))
+  const byType = { 'flow-node': 0, ticket: 0, seat: 0, session: 0 }
+  for (const n of nodes) byType[n.type]++
+  const byKind = { dep: 0, dispatch: 0, callback: 0, 'cb-send': 0 }
+  for (const e of edges) byKind[e.kind]++
+  if (bridge.bad) bridgeNotes.push(`${bridge.bad} unparsable inbox line(s) skipped`)
+  if (dropped) bridgeNotes.push(`${dropped} bridge pair(s) unresolved to graph nodes, dropped (悬挂禁止)`)
+  if (bridge.dead) bridgeNotes.push(bridge.dead)
+  if (flow.note) topNotes.push(`flows: ${flow.note}`)
+  if (ticket.sourceNote) topNotes.push(`tickets: ${ticket.sourceNote}`)
+  if (ticket.note) topNotes.push(`tickets: ${ticket.note}`)
+  if (fleet.note) topNotes.push(`fleet: ${fleet.note}`)
+  if (bridgeNotes.length) topNotes.push(`bridge: ${bridgeNotes.join('; ')}`)
+  const sources = {
+    flows: { live: flow.live, count: flow.nodes.length, note: flow.note },
+    tickets: { live: ticket.live, count: ticket.nodes.length, note: ticket.sourceNote || ticket.note },
+    fleet: { live: fleet.live, count: fleet.seatNodes.length, note: fleet.note },
+    bridge: { live: !bridge.dead, count: callbackEdges.length + cbSendEdges.length, note: bridgeNotes.join('; ').slice(0, 240) },
+  }
+  return {
+    op: 'graph',
+    degraded: !sources.flows.live || !sources.tickets.live || !sources.fleet.live || !sources.bridge.live,
+    note: topNotes.join(' | ').slice(0, 300),
+    generatedAt,
+    nodes,
+    edges,
+    counts: { nodes: nodes.length, edges: edges.length, byType, byKind },
+    sources,
   }
 }
 
@@ -1095,6 +1409,10 @@ const server = createServer((req, res) => {
     serveFleet().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `internal: ${String(e?.message ?? e).slice(0, 120)}` }))
     return
   }
+  if (req.url === '/op/graph') { // PMW2-1: the catch-all keeps 恒 200 (spec §2 degradation discipline)
+    serveGraph().then((r) => finish(200, r)).catch((e) => finish(200, { op: 'graph', degraded: true, note: `internal: ${String(e?.message ?? e).slice(0, 140)}`, generatedAt: new Date().toISOString(), nodes: [], edges: [], counts: { nodes: 0, edges: 0, byType: { 'flow-node': 0, ticket: 0, seat: 0, session: 0 }, byKind: { dep: 0, dispatch: 0, callback: 0, 'cb-send': 0 } }, sources: { flows: { live: false, count: 0, note: 'internal' }, tickets: { live: false, count: 0, note: 'internal' }, fleet: { live: false, count: 0, note: 'internal' }, bridge: { live: false, count: 0, note: 'internal' } } }))
+    return
+  }
   finish(404, { error: 'not found', service: SERVICE, hint: 'write passthrough = POST /op/act; health meta = GET /health (PM-009)' })
 })
 
@@ -1108,8 +1426,8 @@ server.listen(0, '127.0.0.1', () => {
     startedAt: new Date(startedMs).toISOString(),
     bind: '127.0.0.1',
     tokenAuth: TOKEN !== '',
-    endpoints: ['GET / (pm-web static face: public/ snapshot)', 'GET /health (PM-009 meta: per-source live/degraded + bootstrap)', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
-    note: '幂等键=本文件路径; temp+rename 0600; PM-007 扇出 + PM-008 写透传 + PM-009 健康元已上线',
+    endpoints: ['GET / (pm-web static face: public/ snapshot)', 'GET /health (PM-009 meta: per-source live/degraded + bootstrap)', 'GET /op/tickets', 'GET /op/fleet', 'GET /op/trace', 'GET /op/flow', 'GET /op/graph (PMW2-1 canvas plane: 4 node types × 4 edge kinds, 恒 200)', 'GET /subscribe?consumer=<sessionId>&kinds=<csv>', 'POST /op/act {"tool","args","ref"?}', 'GET /op/act?ref=<vh-hex8>'],
+    note: '幂等键=本文件路径; temp+rename 0600; PM-007 扇出 + PM-008 写透传 + PM-009 健康元 + PMW2-1 /op/graph 画布面已上线',
   }))
   log(`http up 127.0.0.1:${port} pid=${process.pid} portfile=${action} tokenAuth=${TOKEN !== ''}`)
   armFanout() // PM-007: watchers + reconcile poll + SSE keepalive
