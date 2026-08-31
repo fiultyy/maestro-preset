@@ -641,16 +641,26 @@ async function loadReplay() {
   btn.disabled = true
   btn.textContent = '载入中…'
   const sids = [...new Set([...C.nodes.values()].filter((n) => n.type === 'session').map((n) => n.sessionId).filter(Boolean))]
-  const parts = await Promise.all(sids.map(async (sid) => {
-    try {
-      const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`)
-      const j = await res.json()
-      return (j?.entries ?? []).map((e) => ({ ...e, _sid: sid, _ts: e.time ?? e.time0 ?? null }))
-    } catch { return [] }
-  }))
-  R.events = parts.flat().sort((a, b) => (a._ts ?? Infinity) - (b._ts ?? Infinity))
-  buildReplayHits(R.events)
-  R.min = R.events.find((e) => e._ts != null)?._ts ?? Date.now() - 60_000
+  try {
+    const parts = await Promise.all(sids.map(async (sid) => {
+      try {
+        const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`)
+        const j = await res.json()
+        // PMW2-H: 活体 trace 的 time 是字符串 ("1788172761057") — 必须数值化,
+        // 否则拖拽 R.min+(R.max-R.min)*v/1000 变字符串拼接 → 游标垃圾 → 全灰。
+        return (j?.entries ?? []).map((e) => ({ ...e, _sid: sid, _ts: Number(e.time ?? e.time0) || null }))
+      } catch { return [] }
+    }))
+    R.events = parts.flat().sort((a, b) => (a._ts ?? Infinity) - (b._ts ?? Infinity))
+    buildReplayHits(R.events)
+    R.min = R.events.find((e) => e._ts != null)?._ts ?? Date.now() - 60_000
+  } catch (e) { // 载入失败: 按钮复位可重试, 不吞 ctrl (载入中态只属于进行中的载入)
+    R.loading = false
+    btn.disabled = false
+    btn.textContent = '载入回放'
+    toast(`回放载入失败: ${String(e?.message ?? e).slice(0, 80)}`)
+    return
+  }
   R.max = Date.now()
   R.cursor = R.max
   R.loaded = true

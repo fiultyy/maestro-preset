@@ -170,13 +170,14 @@ async function livePart(livePort) {
     liveE: document.querySelectorAll('.cv-edge:not(.cv-future)').length,
   })`)
   ok('B 回放: 游标 30% → 回放态(徽章/节点变色/边随游标增减)', mid.on && mid.mode === '回放中' && mid.futureN > 0 && mid.liveN > 0 && mid.futureE > 0 && mid.liveE > 0, JSON.stringify(mid))
-  // 2b) PMW2-H 回归: 活体/字符串 time — 拖动后必须有节点点亮 (原 bug: 字符串 _ts → 游标垃圾 → 全灰)
+  // 2b) PMW2-H 回归: 活体/字符串 time — 拖动后必须有节点点亮 (原 bug: 字符串 _ts → 游标垃圾 → 全灰)。
+  //     快照 R.events 是计数不是数组(introspect 有意不外泄原始事件), 故断言元数据类型 + 可观测点亮面。
   const audit = await c.cdp.eval(`(() => {
     const R = window.__pmCanvas.replay
-    return { n: R.events.length, strSrc: R.events.filter((e) => typeof e.time === 'string' || typeof e.time0 === 'string').length, numTs: R.events.filter((e) => typeof e._ts === 'number' && Number.isFinite(e._ts)).length, minT: typeof R.min, cursorT: typeof R.cursor, liveN: document.querySelectorAll('.cv-node:not(.cv-future)').length, total: document.querySelectorAll('.cv-node').length }
+    return { n: R.events, loaded: R.loaded, maxT: typeof R.max, cursorT: typeof R.cursor, liveN: document.querySelectorAll('.cv-node:not(.cv-future)').length, total: document.querySelectorAll('.cv-node').length }
   })()`)
-  ok('B PMW2-H: _ts 全数值化且游标为 number', audit.n > 0 && audit.numTs === audit.n && audit.minT === 'number' && audit.cursorT === 'number', JSON.stringify(audit))
-  ok('B PMW2-H: 拖动 30% 后节点脱离 cv-future (点亮 0<lit<total)', audit.liveN > 0 && audit.total > 0 && audit.liveN < audit.total, `lit=${audit.liveN}/${audit.total}${audit.strSrc > 0 ? ` (含字符串 time 源 ${audit.strSrc} 条)` : ' (活体无字符串 time, 数值化不变式仍生效)'}`)
+  ok('B PMW2-H: 游标元数据全 number (字符串 time 不再产字符串游标)', audit.loaded && audit.n > 0 && audit.maxT === 'number' && audit.cursorT === 'number', JSON.stringify(audit))
+  ok('B PMW2-H: 拖动 30% 后节点脱离 cv-future (点亮 0<lit<total)', audit.liveN > 0 && audit.total > 0 && audit.liveN < audit.total, `lit=${audit.liveN}/${audit.total}`)
   await c.cdp.shot(shot('replay-mid.png'))
   ok('B 证据: replay-mid.png', statSync(shot('replay-mid.png')).size > 10000)
 
@@ -192,17 +193,21 @@ async function livePart(livePort) {
   ok('B 回放: 暂停生效', paused === false)
   ok('B 证据: replay-playing-4x.png', statSync(shot('replay-playing-4x.png')).size > 10000)
 
-  // 4) 游标 → now 切回实况
+  // 4) 游标 → now 切回实况 (refetch 恢复: exit 时若有在途 fetch 会吞掉 kick, 以在途完成收敛 — 轮询等待, 不钉死 1200ms)
   const lra0 = await c.cdp.eval('window.__pmCanvas.lastRefetchAt')
   await c.cdp.eval(setRange(1000))
-  await sleep(1200)
-  const live = await c.cdp.eval(`({
-    on: window.__pmCanvas.replay.on,
-    mode: document.querySelector('#cv-tl-mode').textContent,
-    future: document.querySelectorAll('.cv-future').length,
-    sse: window.__pmCanvas.sseOpen,
-    lra: window.__pmCanvas.lastRefetchAt,
-  })`)
+  let live = null
+  for (let i = 0; i < 24; i++) {
+    await sleep(250)
+    live = await c.cdp.eval(`({
+      on: window.__pmCanvas.replay.on,
+      mode: document.querySelector('#cv-tl-mode').textContent,
+      future: document.querySelectorAll('.cv-future').length,
+      sse: window.__pmCanvas.sseOpen,
+      lra: window.__pmCanvas.lastRefetchAt,
+    })`)
+    if (live.on === false && live.mode === '实况' && live.future === 0 && live.lra > lra0) break
+  }
   ok('B 回放: 游标=now → 切回实况(样式清零 + refetch 恢复)', live.on === false && live.mode === '实况' && live.future === 0 && live.lra > lra0, JSON.stringify(live))
   await c.cdp.shot(shot('replay-live.png'))
   ok('B 证据: replay-live.png', statSync(shot('replay-live.png')).size > 10000)
