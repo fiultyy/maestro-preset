@@ -156,6 +156,14 @@ spawn → 验席位 → fleet-adopt 认领挂树 → steer 派发(内嵌 cb-send
       → 独立验证闸 ×2 → ledger → flowc advance(幂等预检)
 ```
 
+**派发落账三环 SOP(MF-1)**: steer 派发后 ledger 落账三环缺一不可——①node claim
+(`ledger node … dispatched`) ②票状态(票面无票先 `ticket add`, dispatched 态与派发
+同刻; 状态迁移走 `ticket state`) ③持票(`ledger ticket lease <票> <fleet 席位码>`)。
+`bin/dispatch-ticket` 已一体化自动三环(票面无票自动建票再挂 lease); 手工派发等价补齐。
+准绳 = /op/tickets 持票计数(lease_owner→pm-web 席位卡), 违例(dispatched/running 无
+lease)由 `plugins/pm-host-service/gates/mf-1-lease-gate.mjs` 兜底(豁免=显式白名单,
+无席位纯记录票)。
+
 **steer 简报必须内嵌回报全签名**(2026-08-30 and2 死信教训):cb-send 的 `to` 只认
 `alias@session-…` 全签名或注册别名——**fleet 4 位码不经桥寻址**(bridge/registry.json
 无 fleet 码索引),裸码回报必死信(dead.log)。派发模板写法:

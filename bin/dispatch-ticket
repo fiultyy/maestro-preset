@@ -8,6 +8,9 @@
   - 契约头: 生成的派发 prompt 头部自动嵌入"控制消息两段式"契约(OF-003,见 STEER_TWO_PHASE)
   - 签名: $MAESTRO_ORCH_SIGNATURE 或 ~/.dsh/maestro/bridge/orch.signature
   - 落账: ledger node(dispatched) + event(dispatched),project 按 repo 路径解析
+  - 持票三环(MF-1): node 账之外勾稽 tickets 票账——票面无此票先 `ticket add`
+    (dispatched 态,与派发同刻),再 `ticket lease` 挂执行席位; /op/tickets
+    持票计数(lease_owner→席位卡)是准绳,违例由 gates/mf-1-lease-gate.mjs 兜底
 环境: ORCA_CLI_COMMAND(默认 orca-ide)
 """
 import argparse, json, os, re, subprocess, sys
@@ -68,23 +71,48 @@ def send(terminal, message):
     if not ok: die(f'terminal send failed: {proc.stdout}{proc.stderr}', 5)
     return True
 
-def ledger(repo, ref, worker, terminal, title):
+def ledger(repo, ref, worker, terminal, title, refs_json):
     env = dict(os.environ)
     env['MAESTRO_ORCH_SIGNATURE'] = signature()
-    refs = json.dumps({'ref': ref, 'terminal': terminal, 'worker': worker, 'deliverable': f'docs/reports/{ref}-report.md'}, ensure_ascii=False)
-    for args in (['node', repo, ref, 'task', title, 'dispatched', '--owner', worker, '--refs', refs],
+    for args in (['node', repo, ref, 'task', title, 'dispatched', '--owner', worker, '--refs', refs_json],
                  ['event', repo, ref, 'dispatched', f'dispatch-ticket -> {terminal} ({worker})']):
         proc = subprocess.run([sys.executable, f'{MAESTRO}/bin/ledger', *args],
-                              capture_output=True, text=True, timeout=15)
+                              capture_output=True, text=True, timeout=15, env=env)
         if proc.returncode != 0:
             print(f'ledger write failed (continue): {proc.stderr.strip()}', file=sys.stderr)
+
+def ticket_ledger(ref, worker, terminal, title, refs_json):
+    """MF-1 持票三环第三环: node 账(per-repo nodes)与 tickets 票账两套账勾稽。
+    票面无此票 → `ticket add`(state=dispatched,与派发同刻,refs 带终端/席位溯源);
+    然后 `ticket lease <ref> <worker>` 挂执行席位。失败不回滚已发送的派发
+    (与 node/event 同 WARN-continue 策略),漏挂由 gates/mf-1-lease-gate.mjs 兜底。
+    worker 建议传 fleet 席位码(如 a804),lease_owner 才能入 pm-web 席位卡持票计数。"""
+    env = dict(os.environ)
+    env['MAESTRO_ORCH_SIGNATURE'] = signature()
+    cli = [sys.executable, f'{MAESTRO}/bin/ledger']
+    def run(args):
+        return subprocess.run(cli + args, capture_output=True, text=True, timeout=15, env=env)
+    have = False
+    lst = run(['ticket', 'list', '--json'])
+    try:
+        have = any(t.get('ticket_id') == ref for t in json.loads(lst.stdout or '[]'))
+    except json.JSONDecodeError:
+        pass
+    if not have:
+        proc = run(['ticket', 'add', ref, title, '--source', 'dispatch-ticket', '--refs', refs_json])
+        if proc.returncode != 0:
+            print(f'ticket add failed (continue): {proc.stderr.strip()}', file=sys.stderr); return
+    proc = run(['ticket', 'lease', ref, worker, '--source', 'dispatch-ticket'])
+    if proc.returncode != 0:
+        print(f'ticket lease failed (continue): {proc.stderr.strip()}', file=sys.stderr); return
+    print(f'ticket: {ref} lease_owner={worker} (terminal {terminal})')
 
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument('ref', help='票号, 如 LK-001')
     ap.add_argument('--repo', required=True, help='仓库绝对路径')
     ap.add_argument('--terminal', required=True, help='orca terminal handle')
-    ap.add_argument('--worker', default=None, help='worker 别名(默认 omp@<repo basename>)')
+    ap.add_argument('--worker', default=None, help='worker 别名(默认 omp@<repo basename>; 建议传 fleet 席位码, lease 才入持票计数)')
     ap.add_argument('--title', default=None, help='ledger 节点标题(默认取票首行)')
     ap.add_argument('--dry-run', action='store_true', help='只打印消息不发送不落账')
     a = ap.parse_args()
@@ -96,7 +124,10 @@ def main():
         print(msg); print(f'\n[dry-run] worker={worker} terminal={a.terminal} title={title}'); return
     send(a.terminal, msg)
     print(f'sent: {a.ref} -> {a.terminal} ({worker})')
-    ledger(a.repo, a.ref, worker, a.terminal, title)
+    refs = json.dumps({'ref': a.ref, 'terminal': a.terminal, 'worker': worker, 'deliverable': f'docs/reports/{a.ref}-report.md'}, ensure_ascii=False)
+    ledger(a.repo, a.ref, worker, a.terminal, title, refs)
     print(f'ledger: {a.ref} dispatched')
+    ticket_ledger(a.ref, worker, a.terminal, title, refs)
+    print(f'三环齐: node claim + ticket add/state + ticket lease (MF-1)')
 
 if __name__ == '__main__': main()
