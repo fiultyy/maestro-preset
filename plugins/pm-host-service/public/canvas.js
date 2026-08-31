@@ -87,6 +87,9 @@ const C = {
   drawerNode: null, // PMW2-3: 抽屉当前节点 id (null = 关)
   actHist: new Map(), // nodeId -> [ {ts, ref, action, status, exitCode, ms, err} ] (页内内存审计)
   pending: new Map(), // ref -> {nodeId, entry, timer} 在途 act (轮询 + SSE 双路对账)
+  replay: { on: false, loaded: false, loading: false, events: [], min: 0, max: 0, cursor: 0, playing: false, speed: 1, raf: 0 }, // PMW2-4: trace 回放
+  mini: { k: 1, ox: 0, oy: 0 }, // minimap 世界→缩略图 投影
+  stickySig: '', // 泳道常显标题 chips 签名 (lane 集变化才重建)
 }
 
 const stage = () => $('#cv-stage')
@@ -156,7 +159,7 @@ async function layoutLane(lane) {
 
 // ---- refetch + diff (§4 item 7: 按 id diff, 只重排受影响泳道) ----
 async function refetchGraph() {
-  if (C.refetching) return
+  if (C.refetching || C.replay.on) return // PMW2-4: 回放态数据冻结 (只改样式不重排), 游标回 now 自动恢复
   C.refetching = true
   try {
     const res = await fetch('/op/graph')
@@ -314,6 +317,7 @@ function drawScene() {
     gNodes.appendChild(g)
   }
   viewport.appendChild(gNodes)
+  drawMinimap()
   applyView()
   applyHighlight()
   introspect()
@@ -347,6 +351,7 @@ function reconcileDom() {
     C.nodeEls.set(n.id, g); gNodes.appendChild(g)
   }
   tweenTo()
+  drawMinimap()
   applyHighlight()
   introspect()
 }
@@ -464,6 +469,8 @@ function applyHighlight() {
 // ---- 视口: wheel 缩放 (指针锚, 0.5×–2×) + 空白拖拽平移 ----
 function applyView() {
   $('#cv-viewport')?.setAttribute('transform', `translate(${C.view.x} ${C.view.y}) scale(${C.view.s})`)
+  updateMiniVp()
+  updateSticky()
   introspect()
 }
 function fitView() {
@@ -516,12 +523,241 @@ function wireStage() {
   }
   s.addEventListener('pointerup', up)
   s.addEventListener('pointercancel', () => { pan = null; st.classList.remove('cv-panning') })
+  // PMW2-4 打磨: 双击节点居中+适配 (收尾态: 选中+抽屉开)
+  s.addEventListener('dblclick', (e) => {
+    const nodeG = e.target.closest?.('.cv-node')
+    if (!nodeG) return
+    const id = nodeG.dataset.id
+    const p = C.pos.get(id)
+    if (!p) return
+    const s2 = clamp(Math.max(C.view.s, 1.4), 0.5, 2)
+    C.view = { s: s2, x: st.clientWidth / 2 - (p.x + p.w / 2) * s2, y: st.clientHeight / 2 - (p.y + p.h / 2) * s2 }
+    C.selected = id
+    applyHighlight()
+    openDrawer(id)
+    applyView()
+  })
   s.addEventListener('mouseover', (e) => {
     const nodeG = e.target.closest?.('.cv-node')
     if (nodeG) { C.hover = nodeG.dataset.id; applyHighlight() }
   })
   s.addEventListener('mouseout', (e) => {
     if (e.target.closest?.('.cv-node')) { C.hover = null; applyHighlight() }
+  })
+}
+
+// ---- PMW2-4: minimap (全图缩略 + 视口框, 点跳/拖动, 与缩放平移联动) ----
+function drawMinimap() {
+  const svg = $('#minimap-svg')
+  if (!svg) return
+  const world = C.lanes.reduce((a, l) => ({ w: Math.max(a.w, l.w), h: Math.max(a.h, l.y + l.h) }), { w: 0, h: 0 })
+  if (!world.w) { svg.textContent = ''; return }
+  const k = Math.min(172 / world.w, 132 / world.h)
+  const ox = 4; const oy = 4
+  C.mini = { k, ox, oy }
+  const g = C.graph
+  const lanes = C.lanes.map((l) => `<rect x="${(l.x * k + ox).toFixed(1)}" y="${(l.y * k + oy).toFixed(1)}" width="${(l.w * k).toFixed(1)}" height="${(l.h * k).toFixed(1)}" rx="2" class="mm-lane"/>`).join('')
+  const dots = [...C.pos.entries()].map(([id, p]) => {
+    const n = C.nodes.get(id)
+    return `<circle cx="${(p.x * k + ox).toFixed(1)}" cy="${(p.y * k + oy).toFixed(1)}" r="1.8" fill="${colorOf(n?.state ?? n?.status)}"/>`
+  }).join('')
+  svg.innerHTML = `${lanes}<g id="mm-dots">${dots}</g><rect id="mm-vp" class="mm-vp"/>`
+  updateMiniVp()
+}
+function updateMiniVp() {
+  const vp = $('#mm-vp')
+  const st = stage()
+  if (!vp || !st || !st.clientWidth) return
+  const { k, ox, oy } = C.mini
+  const wx = -C.view.x / C.view.s; const wy = -C.view.y / C.view.s
+  const ww = st.clientWidth / C.view.s; const wh = st.clientHeight / C.view.s
+  vp.setAttribute('x', (wx * k + ox).toFixed(1))
+  vp.setAttribute('y', (wy * k + oy).toFixed(1))
+  vp.setAttribute('width', (ww * k).toFixed(1))
+  vp.setAttribute('height', (wh * k).toFixed(1))
+}
+function wireMinimap() {
+  const box = $('#cv-minimap')
+  const toWorld = (e) => {
+    const r = box.getBoundingClientRect()
+    const { k, ox, oy } = C.mini
+    return { x: (e.clientX - r.left - ox) / k, y: (e.clientY - r.top - oy) / k }
+  }
+  const jump = (e) => {
+    const w = toWorld(e)
+    const st = stage()
+    C.view.x = st.clientWidth / 2 - w.x * C.view.s
+    C.view.y = st.clientHeight / 2 - w.y * C.view.s
+    applyView()
+  }
+  box.addEventListener('pointerdown', (e) => { e.preventDefault(); jump(e); try { box.setPointerCapture?.(e.pointerId) } catch {} ; box.dataset.drag = '1' })
+  box.addEventListener('pointermove', (e) => { if (box.dataset.drag) jump(e) })
+  const drop = () => { delete box.dataset.drag }
+  box.addEventListener('pointerup', drop)
+  box.addEventListener('pointercancel', drop)
+}
+
+// ---- PMW2-4: flow 泳道标题常显 (header 滚出视口顶 → 顶部 sticky chip) ----
+function updateSticky() {
+  const st = stage()
+  const wrap = $('#cv-sticky')
+  if (!st || !wrap || !C.lanes.length) return
+  const sig = C.lanes.map((l) => `${l.id}:${l.nodeIds.length}`).join('|')
+  if (sig !== C.stickySig) {
+    C.stickySig = sig
+    wrap.textContent = ''
+    for (const lane of C.lanes) {
+      const chip = document.createElement('span')
+      chip.className = 'cv-sticky-chip'
+      chip.dataset.lane = lane.id
+      chip.textContent = `${lane.title} · ${lane.nodeIds.length}`
+      wrap.appendChild(chip)
+    }
+  }
+  let visible = 0
+  for (const lane of C.lanes) {
+    const chip = wrap.querySelector(`[data-lane="${CSS.escape(lane.id)}"]`)
+    if (!chip) continue
+    const hy = lane.y * C.view.s + C.view.y
+    const by = (lane.y + lane.h) * C.view.s + C.view.y
+    const lx = lane.x * C.view.s + C.view.x
+    const rx = (lane.x + lane.w) * C.view.s + C.view.x
+    const show = hy < 6 && by > 34 && rx > 340 && lx < st.clientWidth // 340 = 抽屉/时间轴侧让位
+    chip.style.display = show ? 'inline-flex' : 'none'
+    if (show) { visible++; chip.style.left = `${clamp(lx, 6, Math.max(6, st.clientWidth - 160))}px` }
+  }
+  introspect()
+}
+
+// ---- PMW2-4: trace 时间轴回放 (数据源既有 /op/trace, 服务端零改动) ----
+// 语义: 拉全部图上会话的 trace 事件流 → 按 time 升序 → 游标前的命中事件激活
+// 节点 (session 自身/同席席位/文本提及的 ticket·flow-node), 两端激活的边才亮,
+// 其余 cv-future 淡出 —— 回放只切样式, 零重排; 游标到 now → 切回实况 (SSE)。
+async function loadReplay() {
+  const R = C.replay
+  if (R.loading || R.loaded) return
+  R.loading = true
+  const btn = $('#cv-tl-load')
+  btn.disabled = true
+  btn.textContent = '载入中…'
+  const sids = [...new Set([...C.nodes.values()].filter((n) => n.type === 'session').map((n) => n.sessionId).filter(Boolean))]
+  const parts = await Promise.all(sids.map(async (sid) => {
+    try {
+      const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`)
+      const j = await res.json()
+      return (j?.entries ?? []).map((e) => ({ ...e, _sid: sid, _ts: e.time ?? e.time0 ?? null }))
+    } catch { return [] }
+  }))
+  R.events = parts.flat().sort((a, b) => (a._ts ?? Infinity) - (b._ts ?? Infinity))
+  buildReplayHits(R.events)
+  R.min = R.events.find((e) => e._ts != null)?._ts ?? Date.now() - 60_000
+  R.max = Date.now()
+  R.cursor = R.max
+  R.loaded = true
+  R.loading = false
+  btn.hidden = true
+  $('#cv-tl-ctrl').hidden = false
+  $('#cv-tl-range').value = '1000'
+  updateTimeLabel()
+  toast(`回放流就绪: ${R.events.length} 事件 / ${sids.length} 会话`)
+  introspect()
+}
+function buildReplayHits(events) { // 事件 → 图节点命中 (一次性预计算; 回放态只查表)
+  const seats = [...C.nodes.values()].filter((n) => n.type === 'seat')
+  const tks = [...C.nodes.values()].filter((n) => n.type === 'ticket' && n.label)
+  const fns = [...C.nodes.values()].filter((n) => n.type === 'flow-node' && n.label)
+  for (const e of events) {
+    const hits = new Set([`se:${e._sid}`])
+    for (const s of seats) if (s.sessionId === e._sid) hits.add(s.id)
+    const raw = JSON.stringify(e.data ?? e).toLowerCase()
+    for (const t of tks) if (raw.includes(String(t.label).toLowerCase())) hits.add(t.id)
+    for (const f of fns) if (raw.includes(String(f.label).toLowerCase())) hits.add(f.id)
+    e._hits = [...hits]
+  }
+}
+function replayActiveSet(upto) {
+  const s = new Set()
+  for (const e of C.replay.events) {
+    if (e._ts != null && e._ts <= upto) for (const id of e._hits) s.add(id)
+  }
+  return s
+}
+function applyReplay() {
+  const active = replayActiveSet(C.replay.cursor)
+  for (const [id, g] of C.nodeEls) g.classList.toggle('cv-future', !active.has(id))
+  for (const e of C.edges.values()) {
+    const p = C.edgeEls.get(e.id)
+    if (p) p.classList.toggle('cv-future', !(active.has(e.from) && active.has(e.to)))
+  }
+}
+function setReplayCursor(ms) {
+  const R = C.replay
+  R.cursor = clamp(ms, R.min, R.max)
+  $('#cv-tl-range').value = String(Math.round(((R.cursor - R.min) / Math.max(1, R.max - R.min)) * 1000))
+  if (R.max - R.cursor <= 1500) return exitReplay() // 游标=now → 切回实况
+  if (!R.on) {
+    R.on = true
+    const mode = $('#cv-tl-mode')
+    mode.textContent = '回放中'
+    mode.classList.add('warn')
+  }
+  applyReplay()
+  updateTimeLabel()
+  introspect()
+}
+function exitReplay() {
+  const R = C.replay
+  R.on = false
+  R.playing = false
+  cancelAnimationFrame(R.raf)
+  for (const [, g] of C.nodeEls) g.classList.remove('cv-future')
+  for (const [, p] of C.edgeEls) p.classList.remove('cv-future')
+  const mode = $('#cv-tl-mode')
+  if (mode) { mode.textContent = '实况'; mode.classList.remove('warn') }
+  const play = $('#cv-tl-play')
+  if (play) play.textContent = '▶'
+  R.cursor = R.max
+  const range = $('#cv-tl-range')
+  if (range) range.value = '1000'
+  updateTimeLabel()
+  introspect()
+  refetchGraph() // 回实况: 立即对齐当前数据面
+}
+function tlPlayToggle() {
+  const R = C.replay
+  if (R.playing) {
+    R.playing = false
+    cancelAnimationFrame(R.raf)
+    $('#cv-tl-play').textContent = '▶'
+    introspect()
+    return
+  }
+  if (R.max - R.cursor <= 1500) R.cursor = R.min - 1 // 从头播
+  R.playing = true
+  $('#cv-tl-play').textContent = '⏸'
+  let last = performance.now()
+  const step = (now) => {
+    if (!R.playing) return
+    setReplayCursor(R.cursor + (now - last) * R.speed)
+    last = now
+    if (R.playing && R.on) R.raf = requestAnimationFrame(step)
+  }
+  R.raf = requestAnimationFrame(step)
+}
+function updateTimeLabel() {
+  const R = C.replay
+  const el = $('#cv-tl-time')
+  if (!el) return
+  const past = R.events.filter((e) => e._ts != null && e._ts <= R.cursor).length
+  el.textContent = `${new Date(R.cursor).toLocaleTimeString()} · 事件 ${past}/${R.events.length}`
+}
+function wireTimeline() {
+  $('#cv-tl-load').addEventListener('click', loadReplay)
+  $('#cv-tl-play').addEventListener('click', tlPlayToggle)
+  $('#cv-tl-speed').addEventListener('change', (e) => { C.replay.speed = Number(e.target.value) || 1; introspect() })
+  $('#cv-tl-range').addEventListener('input', (e) => {
+    const R = C.replay
+    setReplayCursor(R.min + ((R.max - R.min) * Number(e.target.value)) / 1000)
   })
 }
 
@@ -856,6 +1092,9 @@ function introspect() {
     drawer: C.drawerNode, // PMW2-3 内省 (只读)
     actHist: [...C.actHist.values()].reduce((a, l) => a + l.length, 0),
     pendingActs: C.pending.size,
+    replay: { on: C.replay.on, loaded: C.replay.loaded, events: C.replay.events.length, cursor: C.replay.cursor, playing: C.replay.playing, speed: C.replay.speed }, // PMW2-4
+    minimapDots: $('#mm-dots') ? $('#mm-dots').children.length : 0,
+    stickyVisible: [...($('#cv-sticky')?.children ?? [])].filter((c) => c.style.display !== 'none').length,
   }
 }
 
@@ -876,9 +1115,23 @@ async function boot() {
       <span class="dim small">只读画布 · wheel 缩放 / 拖拽平移 / 点击或悬停高亮关联 · 点节点开抽屉 · 数据 GET /op/graph</span>
     </div>
     <div id="cv-banner" class="cv-banner" hidden></div>
+    <div id="cv-timeline" class="cv-timeline">
+      <button id="cv-tl-load" class="cv-act-btn" title="拉取 /op/trace 事件流 (图上全部会话)">载入回放</button>
+      <div id="cv-tl-ctrl" hidden>
+        <button id="cv-tl-play" class="cv-act-btn" title="播放/暂停">▶</button>
+        <select id="cv-tl-speed" title="倍速"><option value="1">1×</option><option value="4">4×</option><option value="16">16×</option></select>
+        <input type="range" id="cv-tl-range" min="0" max="1000" value="1000">
+        <span id="cv-tl-time" class="mono small dim"></span>
+        <span id="cv-tl-mode" class="cv-badge">实况</span>
+      </div>
+    </div>
     <div class="cv-stage" id="cv-stage">
       <div id="cv-svg-wrap"><svg id="canvas-svg"></svg></div>
       <div id="cv-list" hidden></div>
+      <div id="cv-sticky" aria-hidden="true"></div>
+      <div id="cv-minimap" title="缩略图 · 点击/拖动跳转">
+        <svg id="minimap-svg" width="180" height="140"></svg>
+      </div>
       <aside id="cv-drawer" hidden>
         <div class="cv-drawer-head">
           <span id="cv-drawer-kind" class="cv-badge"></span>
@@ -907,6 +1160,8 @@ async function boot() {
     <div id="cv-toast" hidden></div>`
   wireStage()
   wireDrawer()
+  wireTimeline()
+  wireMinimap()
   wireVisibility()
   await refetchGraph()
   if (C.mode === 'canvas' && C.lanes.length) { fitView() }
