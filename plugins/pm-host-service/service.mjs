@@ -316,7 +316,7 @@ function readSeats() { // fleet.json direct; bin/fleet-list CLI as fallback auth
 }
 
 let joinSeq = 0
-async function joinSessions(seats) { // dsh loopback RPC; JOIN_DSH_TIMEOUT_MS abort -> caller degrades (独立注记, 不连坐 dsh_api liveness)
+async function fetchSessionJoin() { // dsh loopback session.list -> Map(sid->session 投影); throw = 上游不可用/超时 (身份+活性投影, 波动指标不入射以保同上游重放字节一致)
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), JOIN_DSH_TIMEOUT_MS)
   try {
@@ -329,22 +329,45 @@ async function joinSessions(seats) { // dsh loopback RPC; JOIN_DSH_TIMEOUT_MS ab
     if (!res.ok) throw new Error(`http ${res.status}`)
     const data = await res.json()
     if (data?.result?.ok !== true) throw new Error(`rpc error: ${JSON.stringify(data?.result?.error ?? 'unknown').slice(0, 120)}`)
-    const byId = new Map((data.result.value?.items ?? []).map((s) => [s.sessionId, s]))
-    return seats.map((seat) => {
-      const s = byId.get(seat.sessionId)
-      // identity+liveness only: volatile metrics (updatedAt/tokens) stay out so
-      // same-upstream replays are byte-identical
-      const session = s ? {
+    const bySid = new Map()
+    for (const s of data.result.value?.items ?? []) {
+      bySid.set(s.sessionId, {
         running: !!s.running,
         blank: !!s.blank,
         agentPreset: s.agentPreset ?? null,
         cwd: s.cwd ?? null,
         title: s.projections?.values?.title ?? null,
-      } : null
-      return { ...seat, session }
-    })
+      })
+    }
+    return bySid
   } finally {
     clearTimeout(timer)
+  }
+}
+const applySessionJoin = (seats, bySid) => seats.map((seat) => ({ ...seat, session: bySid.get(seat.sessionId) ?? null }))
+
+// PMW2-J: join 结果 TTL 缓存 + stale-while-revalidate — dsh 宿主退化 (session.list >30s) 时
+// /op/fleet 命中缓存立即回 (横幅不再间歇闪); 过期后台异步刷新, 失败只累积 note; 冷启动首拉
+// 允许阻塞, 超时如实 degraded (现行为)。字段只增: +sessionJoinFreshness。
+const JOIN_CACHE_TTL_MS = Number(process.env.PM_JOIN_CACHE_TTL_MS) || 60_000
+let joinCache = null // { bySid: Map(sid->session), fetchedAt: ms }
+let joinRefreshing = false
+let joinRefreshErrors = { count: 0, last: '' }
+
+async function refreshJoinCache() { // 后台异步刷新: 成功翻新缓存; 失败只累积注记, 绝不影响在途响应
+  if (joinRefreshing) return
+  joinRefreshing = true
+  try {
+    const bySid = await fetchSessionJoin()
+    joinCache = { bySid, fetchedAt: Date.now() }
+    if (joinRefreshErrors.count > 0) log(`op=fleet join cache recovered after ${joinRefreshErrors.count} failed refreshes`)
+    joinRefreshErrors = { count: 0, last: '' }
+  } catch (e) {
+    joinRefreshErrors.count++
+    joinRefreshErrors.last = String(e?.message ?? e).slice(0, 100)
+    log(`op=fleet join background refresh failed x${joinRefreshErrors.count}: ${joinRefreshErrors.last}`)
+  } finally {
+    joinRefreshing = false
   }
 }
 
@@ -356,9 +379,21 @@ async function serveFleet() {
     return { op: 'fleet', count: 0, seats: [], degraded: true, sessionJoined: false, note: `fleet sources unavailable: ${String(e?.message ?? e).slice(0, 160)}` }
   }
   seats.sort((a, b) => (a.code < b.code ? -1 : 1)) // deterministic order
-  try {
-    seats = await joinSessions(seats)
-    return { op: 'fleet', count: seats.length, seats, degraded: false, sessionJoined: true, note: '' }
+  if (joinCache) { // 缓存命中: 立即回 (stale-while-revalidate), 不阻塞不闪横幅
+    const ageMs = Date.now() - joinCache.fetchedAt
+    const fresh = ageMs <= JOIN_CACHE_TTL_MS
+    if (!fresh && !joinRefreshing) refreshJoinCache() // fire-and-forget 后台刷新
+    const seats2 = applySessionJoin(seats, joinCache.bySid)
+    // fresh 命中 note='' 与冷启动响应字节一致 (PM-004 replay byte-stable); 新鲜度走只增字段 sessionJoinFreshness
+    let note = fresh ? '' : `sessionJoin: stale age=${Math.round(ageMs / 1000)}s`
+    if (joinRefreshErrors.count > 0) note += `${note ? '; ' : ''}后台刷新失败 x${joinRefreshErrors.count} (${joinRefreshErrors.last})`
+    return { op: 'fleet', count: seats2.length, seats: seats2, degraded: false, sessionJoined: true, sessionJoinFreshness: fresh ? 'fresh' : 'stale', note }
+  }
+  try { // 冷启动: 首拉允许阻塞, 超时如实 degraded (现行为)
+    const bySid = await fetchSessionJoin()
+    joinCache = { bySid, fetchedAt: Date.now() }
+    const seats2 = applySessionJoin(seats, bySid)
+    return { op: 'fleet', count: seats2.length, seats: seats2, degraded: false, sessionJoined: true, sessionJoinFreshness: 'fresh', note: '' }
   } catch (e) {
     const note = `dsh session.list unreachable (127.0.0.1:${DSH_PORT}): ${String(e?.message ?? e).slice(0, 140)} — pure fleet view`
     log(`op=fleet DEGRADED ${note}`)
@@ -1205,7 +1240,7 @@ loadRegistry() // PM-008 boot recovery (flying -> interrupted) before serving
 const CONFIG_DIR = process.env.XDG_CONFIG_HOME ?? `${homedir()}/.config`
 const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
 const HEALTH_DSH_TIMEOUT_MS = 1_000 // loopback RPC probe budget (health must stay snappy)
-const JOIN_DSH_TIMEOUT_MS = 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness
+const JOIN_DSH_TIMEOUT_MS = Number(process.env.PM_JOIN_TIMEOUT_MS) || 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness。PM_JOIN_TIMEOUT_MS 供沙箱门调参
 const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
 
 const errBrief = (e) => String(e?.message ?? e).slice(0, 120)

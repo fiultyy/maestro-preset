@@ -236,6 +236,8 @@ async function sb1() {
     PMG_CALLS: `${sb}/ledger-calls.log`,
     PMG_LEDGER_MODE: `${sb}/maestro/ledger-mode`,
     DSH_PORT: String(mock.port),
+    PM_JOIN_CACHE_TTL_MS: '3000', // PMW2-J: SB1 dsh-death 断言需在秒级看到 stale 翻转
+    PM_JOIN_TIMEOUT_MS: '2000',
   })
   try {
     console.log(`\n=== SB1 ${sb} (mock dsh :${mock.port}) port=${port} ===`)
@@ -407,12 +409,15 @@ async function sb1() {
     const t7 = await req(port, 'GET', '/op/tickets')
     ok('HF-016 hit path recovers when the probe passes again', t7.json?.cache === 'hit' && t7.json?.degraded === false && t7.json?.cliSpawns === t5.json?.cliSpawns)
 
-    // ---- PM-004 dsh API death -> pure fleet view + degraded ----
+    // ---- PM-004 dsh API death -> PMW2-J SWR: 缓存 join 照常服务 (横幅不闪), 刷新失败只累积 note ----
     await mock.close()
-    await sleep(200)
+    await sleep(3200) // 越过 join 缓存 TTL (SB1 env 钉 3s) -> f3 走 stale 命中
     const f3 = await req(port, 'GET', '/op/fleet')
-    ok('PM-004 dsh death -> 200 + degraded:true + sessionJoined:false', f3.status === 200 && f3.json?.degraded === true && f3.json?.sessionJoined === false)
-    ok('PM-004 pure fleet view still served with note', f3.json?.count === 2 && /unreachable/.test(f3.json?.note ?? '') && f3.json?.seats?.every((s) => s.session == null), `note=${(f3.json?.note ?? '').slice(0, 70)}`)
+    ok('PM-004 dsh death -> cached join served, degraded:false (PMW2-J 横幅不闪)', f3.status === 200 && f3.json?.degraded === false && f3.json?.sessionJoined === true && f3.json?.sessionJoinFreshness === 'stale', `freshness=${f3.json?.sessionJoinFreshness} note=${(f3.json?.note ?? '').slice(0, 50)}`)
+    ok('PM-004 cached seats still enriched (session data from cache)', f3.json?.count === 2 && f3.json?.seats?.some((s) => s.session?.title === 'gate-mock'), `note=${(f3.json?.note ?? '').slice(0, 60)}`)
+    await sleep(2300) // 后台刷新 (dsh 死, 2s 预算) 结算
+    const f4 = await req(port, 'GET', '/op/fleet')
+    ok('PM-004 dsh death -> refresh failures accumulate in note only', f4.json?.degraded === false && /后台刷新失败/.test(f4.json?.note ?? ''), `note=${(f4.json?.note ?? '').slice(0, 80)}`)
 
     // ---- HF-007: audit.jsonl must be 0600 (fresh create + legacy heal) ----
     const auditFile = `${sb}/maestro/state/act/audit.jsonl`
@@ -518,13 +523,23 @@ function startMockDshMode(mode) { // mode: 'ok' | 'err-session' | 'slow-session'
       const reply = (obj, delay = 0) => setTimeout(() => { rs.writeHead(200, { 'content-type': 'application/json' }); rs.end(JSON.stringify(obj)) }, delay)
       if (/workspace\.list/.test(rq.url ?? '')) return reply({ result: { ok: true, value: { items: [] } } })
       if (mode === 'err-session') return reply({ result: { ok: false, error: 'injected: session.list broken (PMW2-I gate)' } })
+      if (mode === 'slow12-session') return reply({ result: { ok: true, value: { items: [
+        { sessionId: 'session-x', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/gate', projections: { values: { title: 'gate-mock' } } },
+      ] } } }, 12_000)
       if (mode === 'slow-session') return reply({ result: { ok: true, value: { items: [
         { sessionId: 'session-x', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/gate', projections: { values: { title: 'gate-mock' } } },
       ] } } }, 2500)
-      return reply({ result: { ok: true, value: { items: [] } } })
+      return reply({ result: { ok: true, value: { items: [ // 'ok' 及其余: 快答 + session-x (PMW2-J SB7 冷启动 warm 面)
+        { sessionId: 'session-x', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/gate', projections: { values: { title: 'gate-mock' } } },
+      ] } } })
     })
   })
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, close: () => new Promise((r) => server.close(r)) })))
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
+    server,
+    port: server.address().port,
+    setMode: (m) => { mode = m }, // PMW2-J: 运行中切换 mock 行为 (注入慢/恢复)
+    close: () => new Promise((r) => server.close(r)),
+  })))
 }
 
 async function sb6() {
@@ -571,7 +586,60 @@ async function sb6() {
   }
 }
 
-// ============ SB2: PM-002 port drift / flock / boot-death empty state ============
+// ============ SB7: PMW2-J join 缓存 + stale-while-revalidate (慢 session.list 不再闪横幅) ============
+async function sb7() {
+  const JOIN_BUDGET = 2000 // 沙箱 join 预算 (env PM_JOIN_TIMEOUT_MS)
+  const TTL = 3000 // 沙箱缓存 TTL (env PM_JOIN_CACHE_TTL_MS)
+  const env = { PM_JOIN_TIMEOUT_MS: String(JOIN_BUDGET), PM_JOIN_CACHE_TTL_MS: String(TTL) }
+  const sb = `${BASE}/sb7`
+  buildSandbox(sb)
+  writeFleet(sb, 0)
+  const mock = await startMockDshMode('ok')
+  const { child, port } = await startDaemon(sb, { DSH_PORT: String(mock.port), ...env })
+  try {
+    console.log(`\n=== SB7 ${sb} (join cache SWR; mock dsh :${mock.port}) port=${port} ===`)
+    const f1 = await req(port, 'GET', '/op/fleet')
+    ok('PMW2-J cold first pull -> fresh join (现行为)', f1.status === 200 && f1.json?.degraded === false && f1.json?.sessionJoined === true && f1.json?.sessionJoinFreshness === 'fresh' && f1.json?.seats?.[0]?.session?.title === 'gate-mock', `freshness=${f1.json?.sessionJoinFreshness}`)
+    const f2 = await req(port, 'GET', '/op/fleet')
+    ok('PMW2-J cache hit (fresh) -> 立即回, 与冷启动字节一致 (note 空, freshness 字段 fresh)', f2.json?.sessionJoinFreshness === 'fresh' && f2.json?.note === '' && f2.text === f1.text, `note=${JSON.stringify(f2.json?.note)}`)
+
+    mock.setMode('slow12-session') // 注入 12s 慢 session.list (> 预算 2s)
+    await sleep(TTL + 600) // 等 TTL 过期
+    const t0 = Date.now()
+    const f3 = await req(port, 'GET', '/op/fleet')
+    const dur3 = Date.now() - t0
+    ok('PMW2-J 过期缓存命中: 立即回(不阻塞 2s 预算) + stale 注记 + degraded:false(横幅不闪)', f3.status === 200 && f3.json?.degraded === false && f3.json?.sessionJoined === true && f3.json?.sessionJoinFreshness === 'stale' && /stale age=/.test(f3.json?.note ?? '') && dur3 < 1500, `dur=${dur3}ms freshness=${f3.json?.sessionJoinFreshness} note=${(f3.json?.note ?? '').slice(0, 60)}`)
+    await sleep(JOIN_BUDGET + 800) // 等后台刷新 (12s 慢源 → 2s 预算 abort) 结算
+    const f4 = await req(port, 'GET', '/op/fleet')
+    ok('PMW2-J 后台刷新失败只累积 note (degraded 仍 false)', f4.json?.degraded === false && /后台刷新失败 x1/.test(f4.json?.note ?? ''), `note=${(f4.json?.note ?? '').slice(0, 80)}`)
+
+    mock.setMode('ok') // 恢复
+    await req(port, 'GET', '/op/fleet') // 触发后台刷新
+    await sleep(1200)
+    const f5 = await req(port, 'GET', '/op/fleet')
+    ok('PMW2-J 恢复后后台刷新回 fresh + 失败计数清零', f5.json?.sessionJoinFreshness === 'fresh' && !/后台刷新失败/.test(f5.json?.note ?? ''), `note=${f5.json?.note}`)
+  } finally {
+    await stopDaemon(child)
+    await mock.close()
+  }
+  // Phase 4: 冷启动 + 慢源 → 首拉阻塞到预算后如实 degraded (现行为保留)
+  {
+    const sb = `${BASE}/sb7-cold`
+    buildSandbox(sb)
+    writeFleet(sb, 0)
+    const mock = await startMockDshMode('slow12-session')
+    const { child, port } = await startDaemon(sb, { DSH_PORT: String(mock.port), ...env })
+    try {
+      const t0 = Date.now()
+      const f = await req(port, 'GET', '/op/fleet')
+      const dur = Date.now() - t0
+      ok('PMW2-J 冷启动无缓存: 首拉阻塞到预算后如实 degraded', f.json?.degraded === true && f.json?.sessionJoined === false && /unreachable/.test(f.json?.note ?? '') && dur >= JOIN_BUDGET && dur < JOIN_BUDGET + 3000, `dur=${dur}ms note=${(f.json?.note ?? '').slice(0, 60)}`)
+    } finally {
+      await stopDaemon(child)
+      await mock.close()
+    }
+  }
+}
 async function sb2() {
   const sb = `${BASE}/sb2`
   buildSandbox(sb) // no fixtures: ledger/fleet/sessions all absent by design
@@ -637,6 +705,7 @@ await sb3()
 await sb4()
 await sb5()
 await sb6()
+await sb7()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pm001-007', startedAt, finishedAt: new Date().toISOString(), pass, fail, version: VERSION, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)
