@@ -729,8 +729,10 @@ function gatherTicketGraph(seatCodes) { // ticket nodes via the PM-003 cache ins
       else notes.push(`dangling lease owner ${owner} of ${n.ticketId} dropped`)
     }
   }
-  const live = t.degraded ? nodes.length > 0 // stale cache still serves real nodes (live data, note carries the staleness)
-    : true
+  // D2 (PMW2-F): 旗标跟源 —— live 与 /op/tickets 的 degraded 同源同值 (照单源端点的
+  // HF-016 轻探针判定, 不造新判据): 暖缓存期源 CLI 不可读 -> degraded:true = live:false
+  // (stale 节点仍如实服务, note 透传轻探针信息); 冷路径行为不变 (源死=空集+live:false)。
+  const live = !t.degraded
   return { nodes, edges, live, note: notes.join('; ').slice(0, 200), sourceNote: t.note ?? '' }
 }
 

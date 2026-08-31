@@ -759,6 +759,13 @@ function wireTimeline() {
     const R = C.replay
     setReplayCursor(R.min + ((R.max - R.min) * Number(e.target.value)) / 1000)
   })
+  // D1 (PMW2-F, spec §4-12): 回放态 ESC = 游标跳 now + 切回实况; 非回放态不抢
+  // ESC (确认门 dialog 原生关闭等既有语义原样)。
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !C.replay.on) return
+    if ($('#cv-act-confirm')?.open) return // dialog 在场: ESC 归原生关闭
+    exitReplay()
+  })
 }
 
 // ---- PMW2-3: 节点抽屉 (四型明细) + 过门 act ----
@@ -1092,7 +1099,7 @@ function introspect() {
     drawer: C.drawerNode, // PMW2-3 内省 (只读)
     actHist: [...C.actHist.values()].reduce((a, l) => a + l.length, 0),
     pendingActs: C.pending.size,
-    replay: { on: C.replay.on, loaded: C.replay.loaded, events: C.replay.events.length, cursor: C.replay.cursor, playing: C.replay.playing, speed: C.replay.speed }, // PMW2-4
+    replay: { on: C.replay.on, loaded: C.replay.loaded, events: C.replay.events.length, cursor: C.replay.cursor, max: C.replay.max, playing: C.replay.playing, speed: C.replay.speed }, // PMW2-4/F
     minimapDots: $('#mm-dots') ? $('#mm-dots').children.length : 0,
     stickyVisible: [...($('#cv-sticky')?.children ?? [])].filter((c) => c.style.display !== 'none').length,
   }
