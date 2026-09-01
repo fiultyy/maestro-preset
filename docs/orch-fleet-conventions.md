@@ -164,6 +164,22 @@ spawn → 验席位 → fleet-adopt 认领挂树 → steer 派发(内嵌 cb-send
 lease)由 `plugins/pm-host-service/gates/mf-1-lease-gate.mjs` 兜底(豁免=显式白名单,
 无席位纯记录票)。
 
+## 签名纪律: 禁止借用他人注册签名(IDX-1)
+
+事故锚: 他线编排跑 `bridge-rearm --sync` 看到 registry 唯一活体消费者签名,派单时
+直接照抄(from=他人席+回调=他人签名)——被冒名编排者收到全数错投回调;skill 模板旧文
+只说"签名必须写全",未禁借。本节钉死:
+
+1. **派发前必自注册签名**(`bridge-rearm` 无参 / `bridge_arm`);未注册先注册,再派发。
+2. **禁止使用 registry 既存他人签名**——那是别的编排者的活体签名,照抄即冒名;
+   `--sync` 清扫输出里的签名同样禁抄。
+3. **`session-send` 的 from 必为本席码/本席 sessionId**,绝不填他人 alias/sessionId。
+4. 收方对称校验: 回调 `to` 非你自己的签名 → 视为错投,拒收并回告发送方
+   (cb-send skill 规则 7 同文)。
+
+落点: `shared/maestro-orch` + `shared/cb-send` SKILL.md 嵌同款禁令(grep "禁止" 可验),
+dev-sync 同步至 `~/.agents/skills` 对端发现面。
+
 **steer 简报必须内嵌回报全签名**(2026-08-30 and2 死信教训):cb-send 的 `to` 只认
 `alias@session-…` 全签名或注册别名——**fleet 4 位码不经桥寻址**(bridge/registry.json
 无 fleet 码索引),裸码回报必死信(dead.log)。派发模板写法:

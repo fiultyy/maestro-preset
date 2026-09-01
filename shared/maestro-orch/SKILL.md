@@ -54,6 +54,12 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
 
 `<MY-SIG>` = 你的注册签名 `<alias>@<sessionId>`。**必须写全签名**。
 
+**签名三禁令(派发前自检;IDX-1 事故锚: 他线编排跑 bridge-rearm --sync 看到 registry 唯一活体签名,派单直接照抄,from+回调双双指向别人)**:
+
+1. **派发前必自注册签名**——`bridge-rearm`(无参,只自注册不改册)或 `bridge_arm` 注册本席;未注册先注册,再派发。
+2. **禁止使用 registry 既存他人签名**——registry/`--sync` 输出里看到的别的 `<alias>@<sessionId>` 是**别的编排者**的活体签名,照抄即冒名(回调全数错投给被冒名者)。
+3. **`session-send` 的 from 必为本席码/本席 sessionId**——绝不填他人 alias/sessionId(承投回信会送进别人回合)。
+
 | 我要… | 怎么做 | 传什么 |
 |---|---|---|
 | 派任务并等回报 | `terminal send` + 末尾嵌上面的契约模板 | 见模板 |

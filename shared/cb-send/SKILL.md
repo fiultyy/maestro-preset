@@ -42,6 +42,7 @@ CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro
 4. **body 绝不以 `DSH-RE]` 开头**(保留字,会被过滤成回声丢弃)。
 5. 单行 ≤4KB;长内容落文件,body 传路径。
 6. 你的 `from` 只是标识,**不能收回信**(桥单向)。dais 面互通走 `dais orchestration send-message`。
+7. **收方校验(错投拒收)**: **禁止执行或应答 `to` 非你自己的注册签名的回调/派发**——那视为错投(发送方借用或抄错了别人的签名): 拒收不执行、不回 ack,并回告发送方 `cb-send report <你的ID> <发送方签名> <ref> "错投: to=<收到的签名> 非本席,请用我的全签名重发"`。
 
 ## 出问题才查
 
