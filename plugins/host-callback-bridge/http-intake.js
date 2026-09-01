@@ -151,6 +151,8 @@ export function createHttpIntake(config) {
     failed: 0,
     registered: 0,
     unregistered: 0,
+    staleHits: 0,
+    epochBumps: 0,
     lastFrom: null,
     lastTo: null,
     lastAcceptedAt: null,
@@ -177,6 +179,8 @@ export function createHttpIntake(config) {
           failed: counters.failed,
           registered: counters.registered,
           unregistered: counters.unregistered,
+          staleHits: counters.staleHits,
+          epochBumps: counters.epochBumps,
         },
         last: {
           from: counters.lastFrom,
@@ -188,6 +192,33 @@ export function createHttpIntake(config) {
     })
   }
 
+  /** 活槽判定(stale = 已换代,不算在册,spec §1.3)。 */
+  function liveSids(registry) {
+    return Object.keys(registry.consumers).filter((sid) => {
+      const e = registry.consumers[sid]
+      return e.stale === null || e.stale === undefined
+    })
+  }
+
+  /** dead 裁定 → 400 载荷(IDX-4: details 分类增量,旧 error 语义不变,spec §1.1/§2.4)。 */
+  function deadPayload(toValue, routing) {
+    if (routing.classification === 'stale address') {
+      return {
+        ok: false,
+        error: routing.reason,
+        details: { classification: routing.classification, address: toValue, supersededBy: routing.supersededBy, epoch: routing.epoch },
+      }
+    }
+    if (routing.classification === 'ghost address') {
+      return {
+        ok: false,
+        error: routing.reason,
+        details: { classification: routing.classification, address: toValue, canonicalHint: routing.hintCanonicals ?? ['none'] },
+      }
+    }
+    return { ok: false, error: routing.reason }
+  }
+
   /** 受理决策: 返回 {to} 或 {error, status, payload}。 */
   async function decideTo(payload) {
     const toValue = payload.to
@@ -196,12 +227,13 @@ export function createHttpIntake(config) {
     if (!missing) {
       const routing = resolveHostRouting(parseAddress(toValue), registry)
       if (routing.action === 'dead') {
-        return { error: true, status: 400, payload: { ok: false, error: routing.reason } }
+        if (routing.classification === 'stale address') counters.staleHits += 1
+        return { error: true, status: 400, payload: deadPayload(toValue, routing) }
       }
       return { to: toValue, broadcast: routing.broadcast ?? false }
     }
-    // 缺省 to: 唯一在册消费者补全;≥2 → 400 歧义;0 → 503。
-    const sids = Object.keys(registry.consumers)
+    // 缺省 to: 唯一**活槽**消费者补全;≥2 → 400 歧义;0 → 503(stale 不算在册,spec §1.3)。
+    const sids = liveSids(registry)
     if (sids.length === 0) {
       return {
         error: true,
@@ -337,15 +369,17 @@ export function createHttpIntake(config) {
       return
     }
     const trimmedAlias = alias?.trim() ?? null
-    const registry = await registerConsumer(paths.registry, version, { sessionId, alias: trimmedAlias }, { armedAt: new Date(now()).toISOString(), pid: process.pid })
+    const { registry, receipt } = await registerConsumer(paths.registry, version, { sessionId, alias: trimmedAlias }, { armedAt: new Date(now()).toISOString(), pid: process.pid, now })
     counters.registered += 1
+    if (receipt.superseded !== null) counters.epochBumps += 1
     await persistState()
-    // 多编排者防撞名(2026-08-26): 同 alias 被其他 sessionId 持有时附 warning——
+    // 多编排者防撞名(2026-08-26): 同 alias 被**其他活槽**持有时附 warning——
     // 裸别名寻址将死信(ambiguous), 差异化别名或全签名可解。非阻断: alias 是标签非键。
+    // (IDX-4 后正常换代即 stale 退出, 此 warning 只剩 v4 懒迁移多槽等边角会触发。)
     let warning = null
     if (trimmedAlias) {
       const holders = Object.entries(registry.consumers)
-        .filter(([sid, c]) => c?.alias === trimmedAlias && sid !== sessionId)
+        .filter(([sid, c]) => c?.alias === trimmedAlias && sid !== sessionId && (c.stale === null || c.stale === undefined))
         .map(([sid]) => sid)
       if (holders.length > 0) {
         warning = `alias "${trimmedAlias}" also held by ${holders.length} other consumer(s); bare-alias addressing will dead-letter (ambiguous) — use <alias>@<sessionId>`
@@ -356,6 +390,10 @@ export function createHttpIntake(config) {
       status: 'registered',
       consumer: canonicalOf(sessionId, trimmedAlias),
       registeredConsumers: Object.keys(registry.consumers).length,
+      // IDX-4(spec §2.3): 代际回执——signature/epoch 恒在; superseded 非空 = 本次 arm 换代。
+      signature: receipt.signature,
+      epoch: receipt.epoch,
+      superseded: receipt.superseded,
       ...(warning ? { warning } : {}),
     })
   }
@@ -410,7 +448,14 @@ export function createHttpIntake(config) {
         pid: process.pid,
         bind: { host: bind, port: rt.boundPort },
         counters: { ...counters },
-        registeredConsumers: Object.entries(registry.consumers).map(([sid, entry]) => canonicalOf(sid, entry.alias)),
+        // IDX-4(spec §2.3): 每消费者带 epoch/stale; 新增 aliases 节(别名→epoch/holder)。
+        registeredConsumers: Object.entries(registry.consumers).map(([sid, entry]) => ({
+          consumer: canonicalOf(sid, entry.alias),
+          sessionId: sid,
+          epoch: entry.epoch ?? 0,
+          stale: entry.stale ?? null,
+        })),
+        aliases: registry.aliases,
       })
       return
     }

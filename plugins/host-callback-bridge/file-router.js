@@ -16,7 +16,7 @@ import { watch } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import { parseAddress, resolveHostRouting } from './core/addressing.js'
 import { digestKeys, digestOf } from './core/dedup.js'
-import { readRegistry } from './core/registry.js'
+import { readRegistry, pruneStaleSlots, STALE_RETENTION_MS } from './core/registry.js'
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
@@ -64,6 +64,7 @@ export function createFileRouter(config) {
     dedupWindowMs = 60_000,
     maxWakeFailures = 3,
     retryDelayMs = 2_000,
+    staleRetentionMs = STALE_RETENTION_MS,
     now = () => Date.now(),
   } = config
 
@@ -95,6 +96,8 @@ export function createFileRouter(config) {
     blankCount: 0,
     dedupCount: 0,
     skippedCount: 0,
+    staleHits: 0,
+    prunedStaleSlots: 0,
     lastDeliveredAt: null,
     lastDeadAt: null,
     senders: {},
@@ -170,6 +173,8 @@ export function createFileRouter(config) {
         blankCount: counters.blankCount,
         dedupCount: counters.dedupCount,
         skippedCount: counters.skippedCount,
+        staleHits: counters.staleHits,
+        prunedStaleSlots: counters.prunedStaleSlots,
         lastDeliveredAt: counters.lastDeliveredAt,
         lastDeadAt: counters.lastDeadAt,
       }
@@ -177,10 +182,13 @@ export function createFileRouter(config) {
     })
   }
 
-  async function appendDead(line, reason) {
-    const entry = `${JSON.stringify({ at: isoOf(now), reason, line })}\n`
+  /** dead.log 追加(IDX-4: classification 键按需新增,既有键形状不动,spec §1.1)。 */
+  async function appendDead(line, reason, classification = null) {
+    const entry = classification === null
+      ? { at: isoOf(now), reason, line }
+      : { at: isoOf(now), reason, classification, line }
     try {
-      await fsp.appendFile(paths.dead, entry)
+      await fsp.appendFile(paths.dead, `${JSON.stringify(entry)}\n`)
     } catch (error) {
       console.error('host-callback-bridge dead.log append failed:', errorMessage(error))
     }
@@ -338,7 +346,8 @@ export function createFileRouter(config) {
           const routing = resolveHostRouting(parseAddress(toValue), registry)
 
           if (routing.action === 'dead') {
-            await appendDead(line, routing.reason)
+            if (routing.classification === 'stale address') counters.staleHits += 1
+            await appendDead(line, routing.reason, routing.classification ?? null)
             rt.cursor += 1
             await writeCursorFile(rt.cursor)
             await saveState()
@@ -379,6 +388,14 @@ export function createFileRouter(config) {
         }
         const rotated = await rotateIfOversized(lines.length)
         if (!rotated) break
+      }
+      // undertaker(spec §2.5): 既有巡检拍子尾加 prune pass——超期 stale 槽清出
+      // consumers(aliases 账本永不清); 同别名更旧代已在换代时剪除。
+      try {
+        const pruned = await pruneStaleSlots(paths.registry, { retentionMs: staleRetentionMs, now })
+        if (pruned.length > 0) counters.prunedStaleSlots += pruned.length
+      } catch (error) {
+        console.error('host-callback-bridge prune pass failed:', errorMessage(error))
       }
     } finally {
       rt.flushing = false

@@ -46,6 +46,7 @@ export const MAX_WAKE_FAILURES = 3
 export const RETRY_DELAY_MS = 2_000
 export const ROTATE_MAX_BYTES = 1024 * 1024
 export const ROTATE_MAX_LINES = 1000
+export const STALE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000 // undertaker: stale 槽保留期(spec §2.5)
 export const ECHO_PREFIX = 'DSH-RE]'
 export const MESSAGE_PREFIX = 'ORCA-CB]'
 
@@ -118,6 +119,7 @@ export async function activate(options = {}) {
     rotateMaxLines = ROTATE_MAX_LINES,
     maxWakeFailures = MAX_WAKE_FAILURES,
     retryDelayMs = RETRY_DELAY_MS,
+    staleRetentionMs = STALE_RETENTION_MS,
   } = options
 
   const fsp = await import('node:fs/promises')
@@ -160,6 +162,7 @@ export async function activate(options = {}) {
     dedupWindowMs: DEDUP_WINDOW_MS,
     maxWakeFailures,
     retryDelayMs,
+    staleRetentionMs,
     now,
   })
   const intake = intakeOverride ?? createHttpIntake({
