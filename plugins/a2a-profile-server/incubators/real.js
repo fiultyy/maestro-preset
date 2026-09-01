@@ -36,6 +36,35 @@ async function fileExists(path) {
   }
 }
 
+/**
+ * C-fix(用户裁决 2026-09-01): spawn 后、首回合注入前显式挂池人格。
+ * 人格轴在首条消息即锁(persona-locked)——本函数恰在 incubateDsh 的 session.prompt
+ * 注入之前调用;漏 select = 会话终身无池人格(7078 事故锚:persona/current=null,
+ * 锁死后不可补挂,只能重切会话)。
+ * persona-axis 是宿主插件(JSON-RPC 于 /persona-axis/rpc,非 /api/)。
+ * 失败重试一次;仍败则抛错中止孵化——宁留空白会话(可复用/归档),
+ * 不产"已锁死的无人格会话"。binding-mode 不经此路径(会话属调用方,select 归其责)。
+ */
+async function selectPersona(sessionId, persona) {
+  let last = ''
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${dshPort()}/persona-axis/rpc`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: `inc-${Date.now()}`, method: 'persona/select', params: { sessionId, persona } }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (res.ok && j?.ok && j.persona) return j.persona
+      last = `http ${res.status} ${JSON.stringify(j).slice(0, 120)}`
+    } catch (e) {
+      last = String(e).slice(0, 120)
+    }
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 250))
+  }
+  throw new Error(`persona/select failed for ${sessionId} (persona=${persona}): ${last}`)
+}
+
 async function rpc(method, payload) {
   // 与 maestro session-spawn/session-send 同 wire 格式（loopback /api/<method>）。
   const res = await fetch(`http://127.0.0.1:${dshPort()}/api/${method}`, {
@@ -120,6 +149,8 @@ export async function incubateDsh(ctx) {
   const code = (stdout.trim().match(/\b([0-9a-f]{4})\b/g) ?? []).pop()
   if (!code) throw new Error(`session-spawn produced no code: ${stdout.trim().slice(-120)}`)
   const sessionId = await resolveSessionId(code)
+  // C-fix: 首回合注入(session.prompt)即首条消息,人格轴随之锁定——select 必须先于注入。
+  const persona = await selectPersona(sessionId, name)
   // 首回合注入：信封前缀复用 loopback-sink 形制（ORCA-CB]）；role doctrine 在前，行为准则在后
   const doctrine = ext ? roleDoctrine(ext.role, ext) : ''
   const prompt = injectionPrompt(name, version, agentsMd, doctrine)
@@ -135,8 +166,8 @@ export async function incubateDsh(ctx) {
     })
   }
   return ext
-    ? { target: `dsh-${ext.role}`, name, version, code, sessionId, mailbox: ext.mailbox, role: ext.role, project: ext.project, preset, marker }
-    : { target: 'dsh', name, version, code, sessionId, preset, marker }
+    ? { target: `dsh-${ext.role}`, name, version, code, sessionId, mailbox: ext.mailbox, role: ext.role, project: ext.project, preset, marker, persona }
+    : { target: 'dsh', name, version, code, sessionId, preset, marker, persona }
 }
 
 /**

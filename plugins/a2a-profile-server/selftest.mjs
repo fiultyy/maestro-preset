@@ -182,8 +182,19 @@ console.log('mock session-spawn ok code=' + code)
     req.on('end', () => {
       let payload = {}
       try { payload = JSON.parse(raw).payload ?? {} } catch {}
-      prompts.push({ url: req.url, payload })
+      let rpcParams = null
+      if (req.url.startsWith('/persona-axis/rpc')) {
+        try { rpcParams = JSON.parse(raw).params ?? null } catch {}
+      }
+      prompts.push({ url: req.url, payload, params: rpcParams })
       res.writeHead(200, { 'content-type': 'application/json' })
+      if (req.url.startsWith('/persona-axis/rpc')) {
+        // C-fix mock: persona-axis JSON-RPC(参数体非 /api/ wire),回 {ok,persona}
+        let params = {}
+        try { params = JSON.parse(raw).params ?? {} } catch {}
+        res.end(JSON.stringify({ ok: true, persona: { name: String(params.persona ?? ''), version: 1 } }))
+        return
+      }
       res.end(JSON.stringify({ ok: true, value: { queued: true } }))
     })
   })
@@ -355,6 +366,13 @@ async function main() {
           && liPrompt.includes('check-messages agent_liaison'))
       ok('T13d purpose 携 role、preset/marker 不变',
         liArgs?.[2] === 'maestro' && liArgs?.[3] === 'vh-liaison-probe' && liArgs?.[4] === 'liaison for voice orchestration')
+      // T13e C-fix: persona-select 先于首回合注入(锁前),回执带 persona
+      {
+        const selIdx = mock.prompts.findIndex((p) => p.url.startsWith('/persona-axis/rpc') && p.params?.sessionId === lr.sessionId)
+        const injIdx = mock.prompts.findIndex((p) => p.url.includes('session.prompt') && p.payload?.sessionId === lr.sessionId)
+        ok('T13e persona/select 先于 session.prompt 注入且回执含 persona',
+          selIdx >= 0 && injIdx >= 0 && selIdx < injIdx && lr.persona?.name === 'liaison-probe')
+      }
 
       // T14 dsh-manager 缺省推导：不传 role → 目标蕴含 manager；mailbox 默认 agent_<name>
       const mg = await rpc(base, 'incubate', {
@@ -429,9 +447,10 @@ async function main() {
           && new Set(fr18.map((r) => r.mailbox)).size === 3
           && fr18.map((r) => r.mailbox).sort().join(',') === 'fan-probe-1,fan-probe-2,fan-probe-3'
           && fanFleet.length === 3 && fanFleet.every((e) => e.profile_version === 2)
-          && mock.prompts.length === promptsBefore18 + 3
-          && mock.prompts.slice(-3).every((p) => (p.payload?.content?.[0]?.text ?? '')
-            .startsWith('ORCA-CB] PROFILE-INJECT] explore-mvp@v2\n')))
+          && mock.prompts.length === promptsBefore18 + 6 // C-fix: 每实例 +1 persona-select +1 注入
+          && mock.prompts.slice(-6).filter((p) => (p.payload?.content?.[0]?.text ?? '')
+            .startsWith('ORCA-CB] PROFILE-INJECT] explore-mvp@v2\n')).length === 3
+          && mock.prompts.slice(-6).filter((p) => p.url.startsWith('/persona-axis/rpc')).length === 3)
 
       // T19 binding-mode：mock loopback 收到 session.prompt 信封；session-spawn 次数不变；缺 sessionId → -32602
       const spawnCalls19 = readFileSync(argsLog, 'utf8').trim().split('\n').filter(Boolean).length
