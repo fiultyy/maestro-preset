@@ -120,6 +120,7 @@ export function createHttpIntake(config) {
     dedup,
     version,
     intake,
+    routerStatus = null,
     onActivity = null,
     basePath = '/callback',
     bind = '127.0.0.1',
@@ -448,6 +449,7 @@ export function createHttpIntake(config) {
         pid: process.pid,
         bind: { host: bind, port: rt.boundPort },
         counters: { ...counters },
+        ...(routerStatus ? { router: routerStatus() } : {}),
         // IDX-4(spec §2.3): 每消费者带 epoch/stale; 新增 aliases 节(别名→epoch/holder)。
         registeredConsumers: Object.entries(registry.consumers).map(([sid, entry]) => ({
           consumer: canonicalOf(sid, entry.alias),

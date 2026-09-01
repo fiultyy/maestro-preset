@@ -200,6 +200,8 @@ export function createFileRouter(config) {
         deadCount: counters.deadCount,
         deadTrueGhost: counters.deadTrueGhost,
         deadNoise: counters.deadNoise,
+        adaptiveSkip: counters.adaptiveSkip,   // A-fix: 原生道已投实证后本道跳过数
+        adaptiveDefer: counters.adaptiveDefer, // A-fix: 让道窗口触发数
         echoCount: counters.echoCount,
         blankCount: counters.blankCount,
         dedupCount: counters.dedupCount,

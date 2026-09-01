@@ -198,6 +198,7 @@ export async function activate(options = {}) {
     store,
     dedup,
     version,
+    routerStatus: () => router.status(),
     intake: async (line) => {
       await fsp.appendFile(store.paths.inbox, `${line}\n`)
     },
