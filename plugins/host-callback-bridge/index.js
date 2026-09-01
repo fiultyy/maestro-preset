@@ -51,6 +51,7 @@ export const inject = []
 export const DEDUP_WINDOW_MS = 60_000
 export const MAX_WAKE_FAILURES = 3
 export const RETRY_DELAY_MS = 2_000
+export const ADAPTIVE_DEFER_MS = 2_500 // A-fix: sole 下原生道让道窗(原生道慢于窗=本道兜底直投)
 export const ROTATE_MAX_BYTES = 1024 * 1024
 export const ROTATE_MAX_LINES = 1000
 export const STALE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000 // undertaker: stale 槽保留期(spec §2.5)
@@ -143,6 +144,7 @@ export async function activate(options = {}) {
     rotateMaxLines = ROTATE_MAX_LINES,
     maxWakeFailures = MAX_WAKE_FAILURES,
     retryDelayMs = RETRY_DELAY_MS,
+    adaptiveDeferMs = ADAPTIVE_DEFER_MS,
     staleRetentionMs = STALE_RETENTION_MS,
     fileDelivery: fileDeliveryOption = null,
   } = options
@@ -188,6 +190,7 @@ export async function activate(options = {}) {
     dedupWindowMs: DEDUP_WINDOW_MS,
     maxWakeFailures,
     retryDelayMs,
+    adaptiveDeferMs,
     staleRetentionMs,
     now,
   })

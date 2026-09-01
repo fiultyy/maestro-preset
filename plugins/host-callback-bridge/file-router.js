@@ -69,6 +69,7 @@ export function createFileRouter(config) {
     retryDelayMs = 2_000,
     staleRetentionMs = STALE_RETENTION_MS,
     tailCheckMs = 750,
+    adaptiveDeferMs = 2_500,
     now = () => Date.now(),
   } = config
 
@@ -118,6 +119,8 @@ export function createFileRouter(config) {
     deadCount: 0,
     deadTrueGhost: 0, // IDX-5: 真幽灵死信(无槽且原生道未投)
     deadNoise: 0,     // IDX-5: 噪声死信(并行原生道已投,本面重复记账而已)
+    adaptiveSkip: 0,  // A-fix: 原生道已投实证后本道跳过(消重复)
+    adaptiveDefer: 0, // A-fix: 让道窗口触发次数
     echoCount: 0,
     blankCount: 0,
     dedupCount: 0,
@@ -240,6 +243,39 @@ export function createFileRouter(config) {
     return n > lineIndex
   }
 
+  /** A-fix 探针: 目标会话曾 arm 过 v4 原生道(游标文件存在)。存在≠活着——
+   * 活性由 defer 窗口终检兜底(窗口尽游标仍未过=原生道死/僵,本道直投)。 */
+  async function nativeLaneExists(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return false
+    try {
+      await fsp.access(`${paths.dir}/.cursor.${sessionId}`)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * A-fix(自适应让道, 用户裁决 2026-09-01): sole 下目标有 v4 原生道时先让原生道投,
+   * 消双道重复唤醒;至少一次不变——跳过仅发生在原生道"已投"实证之后
+   * (v4 契约: deliver 成功后才推进游标, sources/file-inbox.js 在案)。
+   * 三段: ① 原生游标已过→跳过; ② 有原生道但未过→短窗让道(defer);
+   * ③ 窗口尽仍未过(死/僵/慢)→本道兜底直投。窗口内原生道后到=有界竞态重复
+   * (与旧常态相比重复只减不增, L4)。
+   */
+  async function adaptiveYield(attempts) {
+    let armed = false
+    for (const sid of [...attempts.keys()]) {
+      if (await nativeCursorPassed(sid, rt.cursor)) {
+        attempts.delete(sid)
+        counters.adaptiveSkip += 1
+        continue
+      }
+      if (await nativeLaneExists(sid)) armed = true
+    }
+    return armed
+  }
+
   async function appendEcho(line) {
     try {
       await fsp.appendFile(paths.echo, `${line}\n`)
@@ -304,11 +340,28 @@ export function createFileRouter(config) {
     return true
   }
 
-  /** 对 pending 剩余目标逐一投递;全部终态(送达/死信)返回 true。 */
+  /** 对 pending 剩余目标逐一投递;全部终态(送达/死信/原生道已投)返回 true。 */
   async function deliverPending() {
     const { line, parsed, keys, broadcast } = rt.pending
     const attempts = rt.pending.attempts
     let deadLettered = 0
+    // A-fix 自适应让道(详见 adaptiveYield 注释): 原生道已投→跳过;有原生道未投→
+    // 短窗让道;窗口尽→终检后兜底直投。deferUntil 三态: undefined=未评估,
+    // 未来时刻=让道中, 过去时刻=窗口尽(终检一次)。
+    if (rt.pending.deferUntil === undefined) {
+      const armed = await adaptiveYield(attempts)
+      if (attempts.size > 0 && armed) {
+        rt.pending.deferUntil = now() + adaptiveDeferMs
+        counters.adaptiveDefer += 1
+        scheduleRetry()
+        return false
+      }
+    } else if (now() < rt.pending.deferUntil) {
+      scheduleRetry()
+      return false
+    } else if (await adaptiveYield(attempts) || attempts.size > 0) {
+      // 窗口尽:终检(可能全跳过);仍有目标则落回兜底直投。
+    }
     for (const sid of [...attempts.keys()]) {
       try {
         await sink.deliver(sid, line, { parsed, at: now(), broadcast, consumer: sid })

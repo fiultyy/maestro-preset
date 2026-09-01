@@ -616,23 +616,32 @@ async function idx5Scene() {
   //   c) wake-failed + 原生游标越行 → deadClass(noise), 四键 {at,deadClass,reason,line}
   {
     const bridgeDir = makeBridgeDir()
-    const mockHost = makeMockHost({ failFor: 'session-wake' })
+    const mockHost = makeMockHost({ failFor: 'session-wake2' })
     const apiPort = await listen(mockHost.server)
     let handle = null
     try {
-      handle = await activate({ bridgeDir, apiPort, retryDelayMs: 10, maxWakeFailures: 2 })
+      handle = await activate({ bridgeDir, apiPort, retryDelayMs: 10, maxWakeFailures: 2, adaptiveDeferMs: 10 })
       // 原生 watcher rendition: 目标会话已 arm(留下游标)但已不在 registry(ghost 寻址)。
       writeFileSync(join(bridgeDir, '.cursor.session-noise'), '5')
+      // A-fix 契约变更: session-wake 游标预置越行 = 原生道已投实证 → 路由器 adaptiveYield
+      // 直接跳过,不再打必败唤醒、不再产噪声死信(旧行为: 3 败→noise 死信,已让位)。
+      // "游标在失败间隙越行"的噪声死信只剩窄竞态可达,断言面改为: 零死信+adaptiveSkip+行推进。
+      // 真幽灵 wake 面由 session-wake2(游标存在但未越行)保留旧四键形状断言。
       writeFileSync(join(bridgeDir, '.cursor.session-wake'), '5')
-      // c) 面: session-wake 必须在册(活槽)但投递必败(failFor)→ 走 wake-failed 终态。
+      writeFileSync(join(bridgeDir, '.cursor.session-wake2'), '0')
+      // c) 面: wake/wake2 在册(活槽);sink failFor=session-wake 双双必败 → wake2 走 wake-failed 终态。
       const portX3 = Number.parseInt(readFileSync(join(bridgeDir, 'http.port'), 'utf8').trim(), 10)
       const regX3 = await httpJson(portX3, 'POST', '/register', { sessionId: 'session-wake', alias: 'wk' })
       assertEq('x3:wake-target-registered', regX3.status, 200)
+      const regX3b = await httpJson(portX3, 'POST', '/register', { sessionId: 'session-wake2', alias: 'wk2' })
+      assertEq('x3:wake2-target-registered', regX3b.status, 200)
       const inboxPath = join(bridgeDir, 'inbox.log')
       appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'na@session-noise', body: '[ref:X3a] noise' }) + '\n')
       appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'nb@session-true-ghost', body: '[ref:X3b] ghost' }) + '\n')
       appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'wk@session-wake', body: '[ref:X3c] wake' }) + '\n')
+      appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'wk2@session-wake2', body: '[ref:X3d] wake2' }) + '\n')
       const deadPath = join(bridgeDir, 'dead.log')
+      // A-fix 后死信面 = 2(ghost-noise + ghost-true + wake2-true);X3c 由 adaptiveSkip 消死信。
       ok('x3:three-dead-letters', await waitFor(() => {
         if (!existsSync(deadPath)) return false
         return readFileSync(deadPath, 'utf8').trim().split('\n').filter((l) => l.includes('[ref:X3')).length === 3
@@ -641,17 +650,23 @@ async function idx5Scene() {
       const noise = entries.find((e) => e.line?.includes('[ref:X3a'))
       const ghost = entries.find((e) => e.line?.includes('[ref:X3b'))
       const wake = entries.find((e) => e.line?.includes('[ref:X3c'))
+      const wake2 = entries.find((e) => e.line?.includes('[ref:X3d'))
       assertEq('x3:noise-deadclass-key', noise?.deadClass, 'noise-parallel-delivered')
       assertEq('x3:noise-five-keys', Object.keys(noise ?? {}).sort(), ['at', 'classification', 'deadClass', 'line', 'reason'])
       assertEq('x3:true-ghost-four-keys-unchanged', Object.keys(ghost ?? {}).sort(), ['at', 'classification', 'line', 'reason'])
       ok('x3:true-ghost-has-no-deadclass', ghost?.deadClass === undefined)
-      assertEq('x3:wake-noise-deadclass', wake?.deadClass, 'noise-parallel-delivered')
-      assertEq('x3:wake-four-keys', Object.keys(wake ?? {}).sort(), ['at', 'deadClass', 'line', 'reason'])
-      ok('x3:wake-reason-wording-unchanged', typeof wake?.reason === 'string' && wake.reason.startsWith('wake failed ') && wake.reason.includes('(target session-wake)'), wake?.reason)
+      // A-fix 新契约: X3c(游标预越行)零死信、走 adaptiveSkip;X3d(游标未越行)保留 wake 四键。
+      ok('x3:wake-prenative-passed-zero-deadletter', wake === undefined)
+      // wake2 真幽灵变体 = 三键(at/line/reason,无 classification 无 deadClass——它非寻址死信)
+      assertEq('x3:wake2-true-ghost-four-keys', Object.keys(wake2 ?? {}).sort(), ['at', 'line', 'reason'])
+      ok('x3:wake2-no-deadclass', wake2?.deadClass === undefined)
+      ok('x3:wake-reason-wording-unchanged', typeof wake2?.reason === 'string' && wake2.reason.startsWith('wake failed ') && wake2.reason.includes('(target session-wake2)'), wake2?.reason)
       const counters = handle.status().router.counters
-      assertEq('x4:counters-split', [counters.deadNoise, counters.deadTrueGhost, counters.deadCount], [2, 1, 3])
+      // deadNoise=1(仅 ghost 面 X3a);wake2 终检时游标(0)未越行 → trueGhost;adaptiveSkip≥2(X3c + X3a 不经此,预置5)。
+      assertEq('x4:counters-split', [counters.deadNoise, counters.deadTrueGhost, counters.deadCount], [1, 2, 3])
+      ok('x4:adaptive-skip-counted', (counters.adaptiveSkip ?? 0) >= 1 && (counters.adaptiveDefer ?? 0) >= 1)
       const disk = JSON.parse(readFileSync(join(bridgeDir, 'state.json'), 'utf8'))
-      assertEq('x4:counters-persisted', [disk.hostBridge?.counters?.deadNoise, disk.hostBridge?.counters?.deadTrueGhost], [2, 1])
+      assertEq('x4:counters-persisted', [disk.hostBridge?.counters?.deadNoise, disk.hostBridge?.counters?.deadTrueGhost], [1, 2])
       handle.stop()
       handle = null
     } finally {
