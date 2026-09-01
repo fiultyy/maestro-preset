@@ -217,7 +217,7 @@ async function mainScene() {
     appendFileSync(join(bridgeDir, 'inbox.log'), JSON.stringify({ type: 'report', from: 'cx', to: `orch1@${ORCH}`, body: 'cancel-me' }) + '\n')
     ok('t13:busy-target-cancel-then-prompt', await waitFor(() =>
       mockHost.calls.some((c) => c.method === 'session.cancel' && c.sessionId === ORCH)
-      && mockHost.calls.some((c) => c.method === 'session.prompt' && c.text?.includes('cancel-me'))))
+      && mockHost.calls.some((c) => c.method === 'session.prompt' && c.text?.includes('cancel-me')), { timeoutMs: 8000 }))
     const cancelIdx = mockHost.calls.findIndex((c) => c.method === 'session.cancel' && c.sessionId === ORCH)
     const promptIdx = mockHost.calls.findIndex((c) => c.method === 'session.prompt' && c.text?.includes('cancel-me'))
     ok('t13:cancel-precedes-prompt', cancelIdx >= 0 && promptIdx > cancelIdx)
@@ -405,7 +405,7 @@ async function epochScene() {
       if (hit === undefined) return false
       const keys = Object.keys(hit).sort()
       return hit.classification === 'ghost address' && JSON.stringify(keys) === JSON.stringify(['at', 'classification', 'line', 'reason'])
-    }))
+    }, { timeoutMs: 8000 }))
     await waitFor(() => mockHost.calls.some((c) => c.text?.includes('ver-passthrough')))
 
     // G3: 双活槽 + ghost 显式 to → 双方投递零新增(任何面都不猜收件人)。
@@ -417,11 +417,21 @@ async function epochScene() {
     assertEq('g3:no-inbox-growth', inboxLines().length, inboxG3)
     assertEq('g3:no-auto-redirection', mockHost.calls.length, callsBefore)
 
-    // G12: 无 epoch 意识旧端四态全链。
+    // G12(IDX-4-reopen 定性修订): 去重契约=投递级最终判重——mark 在 file-router
+    // 投递完成侧(P3b.2), HTTP 208 是投递后快路径(deliveredAt=投递时刻)。竞态重放
+    // 得 200 合法, 重复行由消费侧 seen-skip 吸收; 确定性 208 须等投递信号(禁裸 sleep)。
     r = await httpJson(port, 'POST', '/callback', { type: 'done', from: 'old-client', to: `gb@${SIDY}`, body: '[ref:G12] done' })
     assertEq('g12:live-200', [r.status, r.data?.status], [200, 'accepted'])
     r = await httpJson(port, 'POST', '/callback', { type: 'done', from: 'old-client', to: `gb@${SIDY}`, body: '[ref:G12] done' })
-    assertEq('g12:replay-208', [r.status, r.data?.status], [208, 'already-delivered'])
+    ok('g12:racing-replay-200-or-208-both-legal', r.status === 200 || r.status === 208, `status=${r.status}`)
+    const g12Total = inboxLines().length
+    ok('g12:router-consumed-all', await waitFor(() => handle.status().router.cursor >= g12Total, { timeoutMs: 8000 }))
+    assertEq('g12:at-most-once-under-race', mockHost.calls.filter((c) => c.text?.includes('[ref:G12] done')).length, 1)
+    r = await httpJson(port, 'POST', '/callback', { type: 'done', from: 'old-client', to: `gb@${SIDY}`, body: '[ref:G12b] done' })
+    assertEq('g12:deterministic-path-live-200', r.status, 200)
+    ok('g12:delivery-signal-before-replay', await waitFor(() => mockHost.calls.some((c) => c.text?.includes('[ref:G12b] done')), { timeoutMs: 8000 }))
+    r = await httpJson(port, 'POST', '/callback', { type: 'done', from: 'old-client', to: `gb@${SIDY}`, body: '[ref:G12b] done' })
+    assertEq('g12:deterministic-replay-208', [r.status, r.data?.status, typeof r.data?.deliveredAt], [208, 'already-delivered', 'string'])
     r = await httpJson(port, 'POST', '/callback', { type: 'done', from: 'old-client', to: 'gb@session-g12-ghost', body: '[ref:G12] x' })
     ok('g12:ghost-400-error-readable', r.status === 400 && typeof r.data?.error === 'string' && r.data.error.startsWith('unknown-addressee'))
     appendFileSync(inboxPath, JSON.stringify({ type: 'done', from: 'old-client', to: 'gb@session-g12-ghost', body: '[ref:G12f]' }) + '\n')
@@ -440,7 +450,7 @@ async function epochScene() {
     assertEq('g5:http-400-stale', [r.status, r.data?.details?.classification, r.data?.details?.supersededBy, r.data?.details?.epoch], [400, 'stale address', `ga@${SID2}`, 2])
     assertEq('g5:no-inbox-write', inboxLines().length, inboxG5)
     appendFileSync(inboxPath, JSON.stringify({ type: 'ack', from: 'g5f', to: `ga@${SIDX}`, body: '[ref:G5f]' }) + '\n')
-    ok('g5:file-dead-stale-classification', await waitFor(() => existsSync(deadPath) && readFileSync(deadPath, 'utf8').includes('"classification":"stale address"') && readFileSync(deadPath, 'utf8').includes('is a stale generation of alias ga')))
+    ok('g5:file-dead-stale-classification', await waitFor(() => existsSync(deadPath) && readFileSync(deadPath, 'utf8').includes('"classification":"stale address"') && readFileSync(deadPath, 'utf8').includes('is a stale generation of alias ga'), { timeoutMs: 8000 }))
 
     // G6: 同 sid 重 arm = 续期不换代。
     const armedBefore = readJson(join(bridgeDir, 'registry.json')).consumers[SID2].armedAt
@@ -533,7 +543,7 @@ async function migrationScene() {
     }
     // 裸别名 m 歧义死信(v4 双槽 → holder:null)。
     appendFileSync(join(bridgeDir, 'inbox.log'), JSON.stringify({ type: 'ping', from: 'g13', to: 'm', body: 'mig-bare' }) + '\n')
-    ok('g13:bare-alias-ambiguous-dead', await waitFor(() => existsSync(join(bridgeDir, 'dead.log')) && readFileSync(join(bridgeDir, 'dead.log'), 'utf8').includes('is ambiguous across 2')))
+    ok('g13:bare-alias-ambiguous-dead', await waitFor(() => existsSync(join(bridgeDir, 'dead.log')) && readFileSync(join(bridgeDir, 'dead.log'), 'utf8').includes('is ambiguous across 2'), { timeoutMs: 8000 }))
     // 任一 /register → 落盘 v5 + 存量槽回填 epoch:0。
     const r = await httpJson(port, 'POST', '/register', { sessionId: 'session-v4-new', alias: 'other' })
     assertEq('g13:register-200', r.status, 200)

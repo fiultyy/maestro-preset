@@ -65,6 +65,7 @@ export function createFileRouter(config) {
     maxWakeFailures = 3,
     retryDelayMs = 2_000,
     staleRetentionMs = STALE_RETENTION_MS,
+    tailCheckMs = 750,
     now = () => Date.now(),
   } = config
 
@@ -82,9 +83,29 @@ export function createFileRouter(config) {
   const rt = {
     cursor: null,
     flushing: false,
+    missedWake: false, // flush 进行中被吞的 watch/受理事件 → 本轮结束后补读(IDX-4-reopen: 防末行孤儿化)
     retryTimer: null,
+    tailTimer: null, // 有界尾查: 有产出 pass 后挂一次性校验, 静稳态零存活定时器(非轮询)
+    didWork: false,
     startedAt: null,
     pending: null, // { line, parsed, digest, broadcast, to, attempts: Map<sid, n> }
+  }
+
+  /**
+   * 有界尾查(IDX-4-reopen): fs.watch 事件可被内核静默丢(inotify 队列溢出)且
+   * 读/写交错可截出残行——每次**有产出**的 flush 后挂一次性 tailCheckMs 校验,
+   * 再读一轮;仍有新行则续链,无产出即停(静稳态零存活定时器,T02 禁轮询不破)。
+   * 这让"末行孤儿化"从概率性停顿变为 ≤tailCheckMs 的自愈。
+   */
+  function armTailCheck() {
+    if (rt.tailTimer !== null) return
+    rt.tailTimer = setTimeout(() => {
+      rt.tailTimer = null
+      flush().catch((error) => {
+        console.error('host-callback-bridge tail-check flush failed:', errorMessage(error))
+      })
+    }, tailCheckMs)
+    rt.tailTimer.unref?.()
   }
 
   const counters = {
@@ -293,8 +314,14 @@ export function createFileRouter(config) {
   }
 
   async function flush() {
-    if (rt.flushing) return
+    if (rt.flushing) {
+      // 冲撞中的事件不再丢弃: 记一笔, 本轮 outer loop 末尾补一轮重读(否则末行
+      // 孤儿化到下一个外部事件——静默系统里可能永不投递)。
+      rt.missedWake = true
+      return
+    }
     rt.flushing = true
+    const entryCursor = rt.cursor
     try {
       if (rt.cursor === null) rt.cursor = await initialCursor()
       for (;;) {
@@ -387,7 +414,12 @@ export function createFileRouter(config) {
           await saveState()
         }
         const rotated = await rotateIfOversized(lines.length)
-        if (!rotated) break
+        if (rotated) continue
+        if (rt.missedWake) {
+          rt.missedWake = false
+          continue // 被吞的事件: 补一轮重读新行
+        }
+        break
       }
       // undertaker(spec §2.5): 既有巡检拍子尾加 prune pass——超期 stale 槽清出
       // consumers(aliases 账本永不清); 同别名更旧代已在换代时剪除。
@@ -398,6 +430,15 @@ export function createFileRouter(config) {
         console.error('host-callback-bridge prune pass failed:', errorMessage(error))
       }
     } finally {
+      // 有界尾查(IDX-4-reopen): 本 pass 游标有推进(=消费过行) → 挂一次性校验,
+      // 兜内核丢事件/残行交错;无产出不挂——静稳态零存活定时器(T02 禁轮询不破)。
+      if (rt.cursor !== null && (entryCursor === null || rt.cursor > entryCursor)) {
+        rt.didWork = true
+      }
+      if (rt.didWork) {
+        rt.didWork = false
+        armTailCheck()
+      }
       rt.flushing = false
     }
   }
@@ -423,6 +464,10 @@ export function createFileRouter(config) {
     if (rt.retryTimer !== null) {
       clearTimeout(rt.retryTimer)
       rt.retryTimer = null
+    }
+    if (rt.tailTimer !== null) {
+      clearTimeout(rt.tailTimer)
+      rt.tailTimer = null
     }
   }
 
