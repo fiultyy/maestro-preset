@@ -60,6 +60,8 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
 2. **禁止使用 registry 既存他人签名**——registry/`--sync` 输出里看到的别的 `<alias>@<sessionId>` 是**别的编排者**的活体签名,照抄即冒名(回调全数错投给被冒名者)。
 3. **`session-send` 的 from 必为本席码/本席 sessionId**——绝不填他人 alias/sessionId(承投回信会送进别人回合)。
 
+**新编排线首动作纪律(IDX-5 事故③锚: 38c3 换址后从未 arm,回调 3 小时无人消费)**——新起的编排线,回合第一个动作 = `bridge_arm`(或 `bridge-rearm` 自注册)武装本席;不 arm = 注册只是死条目,发向本线的回调全部失联,直到你 arm 为止。
+
 | 我要… | 怎么做 | 传什么 |
 |---|---|---|
 | 派任务并等回报 | `terminal send` + 末尾嵌上面的契约模板 | 见模板 |

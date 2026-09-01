@@ -26,6 +26,10 @@
 #       message-bridge 已删,host lane 持口者是 host 进程而非某会话);
 #       不可用(无端口文件/连接失败)或非 200/208(含 404 显式 to 失配/ADDR-R1、
 #       400、503)亦降级文件桥(append inbox.log,游标消费不丢)。
+#       IDX-5 韧性(事故②: 400 即静默弃件): 语义性拒收(4xx/5xx)退避重试
+#       CB_RETRY_MAX 次(默认 3;间隔 CB_RETRY_DELAY_S 秒,默认 30;env 可调,
+#       0 即零等待);穷尽仍拒收 → 全息档案(stall.log)+ 大写 stderr——绝不静默。
+#       000/无端口 = 不可达(桥宕机常态降级面),非拒收: 不重试、不落 stall。
 # 依赖: curl + python3(与 session-send 同);二者皆无时按 SKILL.md 手拼 JSON。
 set -euo pipefail
 
@@ -106,6 +110,47 @@ elif len(holders) > 1:
 ' "$1" "$2" 2>/dev/null
 }
 
+# 重试预算(纯函数, IDX-5): CB_RETRY_MAX/CB_RETRY_DELAY_S 消毒——空/非负整数形
+# 之外一律回默认(3 次 / 30 秒);0 次不合法(至少试一发)钳回 3,延迟 0 合法。
+retry_budget() { # <retry_max_env> <retry_delay_env> → stdout "<max> <delay>"
+  local max="${1:-}" delay="${2:-}"
+  case "$max" in ''|*[!0-9]*|0) max=3 ;; esac
+  case "$delay" in ''|*[!0-9]*) delay=30 ;; esac
+  echo "$max $delay"
+}
+
+# stall 档案构造(纯函数, IDX-5): 终末 HTTP 拒收的全息单行 JSON(十一键)。信封字段
+# (type/from/to/ref/msgid/ver)一律从 payload 权威提取(不复制 shell 变量,
+# v3 缺省 msgid 在 python 内生成,shell 侧本就不知道);非 JSON payload 退化
+# {"raw": …} 保真;lastHttpBody 截 2000 字符防档案膨胀。
+build_stall_record() { # <http_code> <http_body> <payload> <delivered_via>
+  python3 -c '
+import json, sys
+from datetime import datetime, timezone
+code, http_body, raw, via = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    env = json.loads(raw)
+    if not isinstance(env, dict):
+        raise ValueError("not an object")
+except Exception:
+    env = {}
+rec = {
+    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "lastHttpCode": int(code) if (code.isdigit() and code != "000") else code,
+    "lastHttpBody": (http_body or "")[:2000],
+    "msgid": env.get("msgid", "-"),
+    "ver": env.get("ver", 2),
+    "type": env.get("type", "-"),
+    "from": env.get("from", "-"),
+    "to": env.get("to", "-"),
+    "ref": env.get("ref", "-"),
+    "deliveredVia": via,
+    "envelope": env if env else {"raw": raw},
+}
+print(json.dumps(rec, ensure_ascii=False))
+' "$1" "$2" "$3" "${4:-none}"
+}
+
 # ---------- selftest(mktemp 临时目录;纯断言;零 HTTP/零文件桥写入) ----------
 
 selftest_run() {
@@ -179,6 +224,37 @@ PY
   got=$(resolve_alias "$tmp/reg3" orch)
   st_check 'cb:alias-missing-registry-passthrough' "$([ -z "$got" ] && echo 0 || echo 1)" "got=$got"
 
+  # IDX-5: 重试预算消毒(默认/透传/垃圾值回默认;0 次钳 3;延迟 0 合法)
+  st_check 'cb:retry-budget-defaults' "$([ "$(retry_budget '' '')" = '3 30' ] && echo 0 || echo 1)" "$(retry_budget '' '')"
+  st_check 'cb:retry-budget-passthrough' "$([ "$(retry_budget 5 0)" = '5 0' ] && echo 0 || echo 1)" "$(retry_budget 5 0)"
+  st_check 'cb:retry-budget-sanitize' "$([ "$(retry_budget abc -7)" = '3 30' ] && echo 0 || echo 1)" "$(retry_budget abc -7)"
+  st_check 'cb:retry-budget-zero-max-clamps' "$([ "$(retry_budget 0 0)" = '3 0' ] && echo 0 || echo 1)" "$(retry_budget 0 0)"
+
+  # IDX-5: stall 档案构造——十键全息形制;信封字段权威提取;非 JSON 退化保真
+  got=$(build_stall_record 400 '{"error":"boom"}' \
+    '{"type":"done","from":"w1","to":"orch@s9","body":"[ref:R9] x","ref":"R9","msgid":"m-9","ver":3}' 'file-bridge')
+  rc=0; python3 - "$got" <<'PY' || rc=$?
+import json, sys
+d = json.loads(sys.argv[1])
+assert sorted(d) == ["at", "deliveredVia", "envelope", "from", "lastHttpBody",
+                     "lastHttpCode", "msgid", "ref", "to", "type", "ver"], sorted(d)
+assert d["lastHttpCode"] == 400 and d["lastHttpBody"] == '{"error":"boom"}'
+assert d["msgid"] == "m-9" and d["ver"] == 3 and d["type"] == "done"    # 信封权威
+assert d["from"] == "w1" and d["to"] == "orch@s9" and d["ref"] == "R9"
+assert d["deliveredVia"] == "file-bridge" and isinstance(d["envelope"], dict)
+assert d["at"].endswith("+00:00") or d["at"].endswith("Z"), d["at"]     # UTC ISO
+PY
+  st_check 'cb:stall-record-shape' "$rc" "got=$got"
+  got=$(build_stall_record 000 '' 'not-json-at-all' 'none')
+  rc=0; python3 - "$got" <<'PY' || rc=$?
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["envelope"] == {"raw": "not-json-at-all"}, d["envelope"]       # 非 JSON 保真
+assert d["msgid"] == "-" and d["ref"] == "-" and d["ver"] == 2          # v2/野包兜底 "-"
+assert d["lastHttpCode"] == "000" and d["deliveredVia"] == "none"
+PY
+  st_check 'cb:stall-record-nonjson-fidelity' "$rc" "got=$got"
+
   rm -rf "$tmp"
   echo "cb-send selftest: $pass/$total passed"
   [ "$pass" = "$total" ]
@@ -217,19 +293,56 @@ for sid, c in sorted(consumers.items()):
 esac
 payload=$(build_payload "$ver" "$msgid" "$typ" "$frm" "$to" "$ref" "$body")
 
-# 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)
+# 1) HTTP 直发(有语义应答: 200 已投递 / 208 幂等重放)。
+#    IDX-5: 语义性拒收(4xx/5xx)退避重试;穷尽仍拒 → 记 stall 档案后再走文件桥。
+#    000/无端口 = 不可达(桥宕机常态降级面),非拒收: 不重试、不落 stall。
+read -r retry_max retry_delay <<< "$(retry_budget "${CB_RETRY_MAX:-}" "${CB_RETRY_DELAY_S:-}")"
+http_reject_code=""; http_reject_body=""
 if url=$(bridge_url "$B") && command -v curl >/dev/null 2>&1; then
   tmp=$(mktemp)
-  code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "$url" \
-    -H 'content-type: application/json' -d "$payload" 2>/dev/null || echo 000)
-  case "$code" in
-    200|208) echo "cb-send: http ${code} $(cat "$tmp")"; rm -f "$tmp"; exit 0 ;;
-    *) echo "cb-send: http ${code} $(cat "$tmp" 2>/dev/null), falling back to file bridge" >&2 ;;
-  esac
+  attempt=0
+  while [ "$attempt" -lt "$retry_max" ]; do
+    attempt=$((attempt + 1))
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "$url" \
+      -H 'content-type: application/json' -d "$payload" 2>/dev/null || echo 000)
+    case "$code" in
+      200|208) echo "cb-send: http ${code} $(cat "$tmp")"; rm -f "$tmp"; exit 0 ;;
+    esac
+    case "$code" in
+      4??|5??)
+        http_reject_code="$code"
+        http_reject_body="$(cat "$tmp" 2>/dev/null || true)"
+        if [ "$attempt" -lt "$retry_max" ]; then
+          echo "cb-send: http ${code} rejected (attempt ${attempt}/${retry_max}), retrying in ${retry_delay}s" >&2
+          [ "$retry_delay" -gt 0 ] && sleep "$retry_delay"
+        fi
+        ;;
+      *)
+        echo "cb-send: http ${code} $(cat "$tmp" 2>/dev/null), falling back to file bridge" >&2
+        break
+        ;;
+    esac
+  done
   rm -f "$tmp"
 fi
 
 # 2) 文件桥兜底: append inbox.log,armed 泵按游标顺序消费(at-least-once)
-mkdir -p "$B"; touch "$B/inbox.log"
-printf '%s\n' "$payload" >> "$B/inbox.log"
-echo "cb-send: file-bridge appended -> ${B}/inbox.log"
+delivered_via="none"; file_rc=1
+mkdir -p "$B" 2>/dev/null || true
+if touch "$B/inbox.log" 2>/dev/null && printf '%s\n' "$payload" >> "$B/inbox.log" 2>/dev/null; then
+  echo "cb-send: file-bridge appended -> ${B}/inbox.log"
+  delivered_via="file-bridge"; file_rc=0
+else
+  echo "cb-send: file-bridge append FAILED (${B}/inbox.log unwritable)" >&2
+fi
+
+# 3) IDX-5: 终末 HTTP 拒收(重试穷尽)→ stall 全息档案 + 大写告警,绝不静默。
+if [ -n "$http_reject_code" ]; then
+  if build_stall_record "$http_reject_code" "$http_reject_body" "$payload" "$delivered_via" >> "$B/stall.log" 2>/dev/null; then
+    echo "CB-SEND: HTTP FACE TERMINALLY REJECTED (${http_reject_code}) AFTER ${retry_max} ATTEMPTS — stall recorded -> ${B}/stall.log; deliveredVia=${delivered_via}" >&2
+  else
+    echo "CB-SEND: HTTP FACE TERMINALLY REJECTED (${http_reject_code}) AND STALL RECORD WRITE FAILED (${B}/stall.log) — envelope follows" >&2
+    echo "CB-SEND: ${payload}" >&2
+  fi
+fi
+exit "$file_rc"

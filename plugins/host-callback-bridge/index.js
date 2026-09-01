@@ -19,6 +19,13 @@
  * 本插件全程待机不绑端口不盯文件,零干扰在飞编排;下次 host boot(旧面随进程消亡,
  * 端口必然空闲)自动全量接管。检测是一次性事件探活,不是轮询。
  *
+ * 文件面单一权威(IDX-5): 2026-09 现场实证 polyfill file-router 与宿主原生
+ * per-session watcher(bridge_arm 起活)并存时,同一 inbox 行被双投、且 polyfill
+ * 误将原生道已投的行记成 ghost dead-letter。'sole'(缺省)保持本插件独占文件面
+ * (全部既有门零回归);MAESTRO_BRIDGE_FILE_DELIVERY=ceded 让渡文件面——本插件
+ * 只留 HTTP 受理面,消费交宿主原生 watcher,每行恰一个消费者 = 恰好一次。
+ * 权衡全文见 README.md「文件面单一权威」。
+ *
  * 部署形态: 源码=maestro-preset 仓 plugins/host-callback-bridge/(唯一源头);
  * 运行面=~/.dsh/plugins/host-callback-bridge/(自包含副本,dev-sync --polyfill 同步)
  * + ~/.dsh/plugins/polyfill.patch.yml 插入行(run-web.sh --patch 已装载)。
@@ -59,6 +66,23 @@ export function resolveBridgeDir(configured) {
     return configured.replace(/^~(?=\/|$)/, process.env.HOME ?? '')
   }
   return `${process.env.HOME}/.dsh/maestro/bridge`
+}
+
+/**
+ * 文件面投递权裁决(IDX-5 事故①: 双 watcher 同一 inbox.log — polyfill file-router
+ * 与宿主原生 per-session watcher 并行消费,同一行双投 + 一方误记 dead-letter)。
+ *   'sole'  (缺省) 现状不变: file-router 是文件面唯一消费者(既有门零回归)。
+ *   'ceded'            polyfill 让渡文件面: 不启动 file-router、不写游标、不 flush;
+ *                      HTTP 受理面照旧受理并 append inbox.log,文件消费整体交宿主
+ *                      原生 per-session watcher(armed 才盯,自己游标自己写)。
+ *                      caveat: 从未 arm 的会话其 inbox 行无人消费,积压不封顶——
+ *                      由"编排线首动作 arm 自己"(IDX-5 Task D)缓解。
+ * 解析优先级: options.fileDelivery > env MAESTRO_BRIDGE_FILE_DELIVERY > 'sole'。
+ * 权衡记录见 README.md「文件面单一权威」。
+ */
+export function resolveFileDelivery(configured) {
+  const raw = (configured ?? process.env.MAESTRO_BRIDGE_FILE_DELIVERY ?? '').trim().toLowerCase()
+  return raw === 'ceded' ? 'ceded' : 'sole'
 }
 
 function log(bridgeDir, message) {
@@ -120,7 +144,9 @@ export async function activate(options = {}) {
     maxWakeFailures = MAX_WAKE_FAILURES,
     retryDelayMs = RETRY_DELAY_MS,
     staleRetentionMs = STALE_RETENTION_MS,
+    fileDelivery: fileDeliveryOption = null,
   } = options
+  const fileDelivery = resolveFileDelivery(fileDeliveryOption)
 
   const fsp = await import('node:fs/promises')
   await fsp.mkdir(bridgeDir, { recursive: true })
@@ -173,17 +199,25 @@ export async function activate(options = {}) {
       await fsp.appendFile(store.paths.inbox, `${line}\n`)
     },
     onActivity: () => {
-      router.flush().catch(() => {})
+      if (fileDelivery === 'sole') {
+        router.flush().catch(() => {})
+      }
     },
     now,
     dedupWindowMs: DEDUP_WINDOW_MS,
   })
 
   const boundPort = await intake.start(recordedPort ?? 0)
-  router.start()
-  // boot 即冲账: 接管 legacy 游标之后的积压(事故现场的"积压 3 行"场景)。
-  await router.flush()
-  log(bridgeDir, `active: /callback on 127.0.0.1:${boundPort} (http.port written); file router watching inbox.log; apiPort=${sink.resolveApiPort()}`)
+  if (fileDelivery === 'sole') {
+    router.start()
+    // boot 即冲账: 接管 legacy 游标之后的积压(事故现场的"积压 3 行"场景)。
+    await router.flush()
+    log(bridgeDir, `active: /callback on 127.0.0.1:${boundPort} (http.port written); file router watching inbox.log (fileDelivery=sole); apiPort=${sink.resolveApiPort()}`)
+  } else {
+    // IDX-5: 文件面让渡——零 flush 零游标写入,文件消费权整体移交宿主原生
+    // per-session watcher(投递恰好一次的前提是每行恰一个消费者)。
+    log(bridgeDir, `active: /callback on 127.0.0.1:${boundPort} (http.port written); file delivery CEDED to per-session native watchers (fileDelivery=ceded; exactly-once = one consumer per line); caveat: never-armed sessions leave inbox backlog unbounded until they arm; apiPort=${sink.resolveApiPort()}`)
+  }
   return {
     standby: false,
     stop() {
@@ -195,6 +229,7 @@ export async function activate(options = {}) {
         plugin: '@maestro/host-callback-bridge',
         version,
         standby: false,
+        fileDelivery,
         http: intake.status(),
         router: router.status(),
       }

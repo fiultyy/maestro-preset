@@ -155,6 +155,9 @@ def bridge_register(sid: str, alias: str) -> None:
         if warn:  # 多编排者撞名: 注册成功但裸别名寻址将死信, 提示编排者差异化别名
             print(f'bridge-rearm: WARNING {warn}', file=sys.stderr)
         print(f'bridge-rearm: registered {alias}@{sid[:18]}', file=sys.stderr)
+        # IDX-5 事故③: 注册 ≠ 消费就位——armed watcher 才真正消费本线信箱;
+        # 38c3 实证只注册不 arm = 回调 3 小时无人消费(dead.log ghost 堆积)。
+        print('spawn-note: 该线首条 dispatch 前言应含「首动作 bridge_arm(或 bridge-rearm)自我武装」,否则回调失联', file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — 旁路面, 任何失败都只 warn
         print(f'bridge-rearm: register skipped ({exc}); session works, callbacks need POST /register', file=sys.stderr)
 

@@ -25,7 +25,7 @@ import { join, dirname } from 'node:path'
 import { createServer } from 'node:http'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { spawnSync } from 'node:child_process'
-import { activate, version } from './index.js'
+import { activate, resolveFileDelivery, version } from './index.js'
 import { readRegistry, registerConsumer } from './core/registry.js'
 
 const VERBOSE = process.argv.includes('--verbose')
@@ -560,16 +560,122 @@ async function migrationScene() {
   }
 }
 
-/** IDX-4: G15(预部署面)/G16(剧本演练,沙箱 rendition)。 */
+/**
+ * IDX-5: 无人值守回调韧性 —— X1 ceded 让渡面 / X2 fileDelivery 解析优先级 /
+ * X3 死信二分类(ghost-noise vs true-ghost vs wake-noise) / X4 计数分立落盘。
+ */
+async function idx5Scene() {
+  // X2: resolveFileDelivery 解析(纯函数, 先行零环境)。
+  {
+    const prev = process.env.MAESTRO_BRIDGE_FILE_DELIVERY
+    assertEq('x2:default-sole', resolveFileDelivery(null), 'sole')
+    assertEq('x2:option-ceded', resolveFileDelivery('ceded'), 'ceded')
+    assertEq('x2:option-sole', resolveFileDelivery('sole'), 'sole')
+    assertEq('x2:garbage-falls-back-sole', resolveFileDelivery('  NONSENSE '), 'sole')
+    process.env.MAESTRO_BRIDGE_FILE_DELIVERY = 'ceded'
+    assertEq('x2:env-ceded', resolveFileDelivery(null), 'ceded')
+    assertEq('x2:option-beats-env', resolveFileDelivery('sole'), 'sole')
+    if (prev === undefined) delete process.env.MAESTRO_BRIDGE_FILE_DELIVERY
+    else process.env.MAESTRO_BRIDGE_FILE_DELIVERY = prev
+    ok('x2:env-restored', process.env.MAESTRO_BRIDGE_FILE_DELIVERY === prev)
+  }
+
+  // X1: ceded 模式 —— file-router 不启动(零 flush 零游标零投递),HTTP 受理面照常
+  // 受理入账;每行恰一个消费者(宿主原生 watcher)由环境侧保证。
+  {
+    const bridgeDir = makeBridgeDir()
+    const mockHost = makeMockHost()
+    const apiPort = await listen(mockHost.server)
+    let handle = null
+    try {
+      handle = await activate({ bridgeDir, apiPort, fileDelivery: 'ceded' })
+      assertEq('x1:status-reports-ceded', handle.status().fileDelivery, 'ceded')
+      assertEq('x1:router-not-watching', handle.status().router.watching, false)
+      const port = Number.parseInt(readFileSync(join(bridgeDir, 'http.port'), 'utf8').trim(), 10)
+      const r = await httpJson(port, 'POST', '/register', { sessionId: 'session-x1', alias: 'x1' })
+      assertEq('x1:register-ok', r.status, 200)
+      const callsBefore = mockHost.calls.length
+      const r2 = await httpJson(port, 'POST', '/callback', { type: 'ping', from: 'x1', to: 'x1@session-x1', body: 'ceded-line' })
+      assertEq('x1:intake-accepts-200', r2.status, 200)
+      await sleep(600) // 给假想中的 polyfill 消费面充分时间;ceded 面必须零投递
+      assertEq('x1:zero-polyfill-delivery', mockHost.calls.length, callsBefore)
+      ok('x1:inbox-line-kept-for-native-watcher', readFileSync(join(bridgeDir, 'inbox.log'), 'utf8').includes('ceded-line'))
+      ok('x1:no-host-cursor-written', !existsSync(join(bridgeDir, '.cursor.host-bridge')))
+      handle.stop()
+      handle = null
+    } finally {
+      if (handle !== null) handle.stop()
+      await close(mockHost.server)
+      rmSync(bridgeDir, { recursive: true, force: true })
+    }
+  }
+
+  // X3+X4: 死信二分类与计数分立(sole 模式,专用桥)。三个死信面:
+  //   a) ghost + 原生游标越行  → deadClass=noise-parallel-delivered(五键)
+  //   b) ghost + 无原生游标    → 真幽灵,既有四键形状逐字不变
+  //   c) wake-failed + 原生游标越行 → deadClass(noise), 四键 {at,deadClass,reason,line}
+  {
+    const bridgeDir = makeBridgeDir()
+    const mockHost = makeMockHost({ failFor: 'session-wake' })
+    const apiPort = await listen(mockHost.server)
+    let handle = null
+    try {
+      handle = await activate({ bridgeDir, apiPort, retryDelayMs: 10, maxWakeFailures: 2 })
+      // 原生 watcher rendition: 目标会话已 arm(留下游标)但已不在 registry(ghost 寻址)。
+      writeFileSync(join(bridgeDir, '.cursor.session-noise'), '5')
+      writeFileSync(join(bridgeDir, '.cursor.session-wake'), '5')
+      // c) 面: session-wake 必须在册(活槽)但投递必败(failFor)→ 走 wake-failed 终态。
+      const portX3 = Number.parseInt(readFileSync(join(bridgeDir, 'http.port'), 'utf8').trim(), 10)
+      const regX3 = await httpJson(portX3, 'POST', '/register', { sessionId: 'session-wake', alias: 'wk' })
+      assertEq('x3:wake-target-registered', regX3.status, 200)
+      const inboxPath = join(bridgeDir, 'inbox.log')
+      appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'na@session-noise', body: '[ref:X3a] noise' }) + '\n')
+      appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'nb@session-true-ghost', body: '[ref:X3b] ghost' }) + '\n')
+      appendFileSync(inboxPath, JSON.stringify({ type: 'ping', from: 'x3', to: 'wk@session-wake', body: '[ref:X3c] wake' }) + '\n')
+      const deadPath = join(bridgeDir, 'dead.log')
+      ok('x3:three-dead-letters', await waitFor(() => {
+        if (!existsSync(deadPath)) return false
+        return readFileSync(deadPath, 'utf8').trim().split('\n').filter((l) => l.includes('[ref:X3')).length === 3
+      }, { timeoutMs: 8000 }))
+      const entries = readFileSync(deadPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+      const noise = entries.find((e) => e.line?.includes('[ref:X3a'))
+      const ghost = entries.find((e) => e.line?.includes('[ref:X3b'))
+      const wake = entries.find((e) => e.line?.includes('[ref:X3c'))
+      assertEq('x3:noise-deadclass-key', noise?.deadClass, 'noise-parallel-delivered')
+      assertEq('x3:noise-five-keys', Object.keys(noise ?? {}).sort(), ['at', 'classification', 'deadClass', 'line', 'reason'])
+      assertEq('x3:true-ghost-four-keys-unchanged', Object.keys(ghost ?? {}).sort(), ['at', 'classification', 'line', 'reason'])
+      ok('x3:true-ghost-has-no-deadclass', ghost?.deadClass === undefined)
+      assertEq('x3:wake-noise-deadclass', wake?.deadClass, 'noise-parallel-delivered')
+      assertEq('x3:wake-four-keys', Object.keys(wake ?? {}).sort(), ['at', 'deadClass', 'line', 'reason'])
+      ok('x3:wake-reason-wording-unchanged', typeof wake?.reason === 'string' && wake.reason.startsWith('wake failed ') && wake.reason.includes('(target session-wake)'), wake?.reason)
+      const counters = handle.status().router.counters
+      assertEq('x4:counters-split', [counters.deadNoise, counters.deadTrueGhost, counters.deadCount], [2, 1, 3])
+      const disk = JSON.parse(readFileSync(join(bridgeDir, 'state.json'), 'utf8'))
+      assertEq('x4:counters-persisted', [disk.hostBridge?.counters?.deadNoise, disk.hostBridge?.counters?.deadTrueGhost], [2, 1])
+      handle.stop()
+      handle = null
+    } finally {
+      if (handle !== null) handle.stop()
+      await close(mockHost.server)
+      rmSync(bridgeDir, { recursive: true, force: true })
+    }
+  }
+}
+
+/** IDX-4: G15(预部署面)/G16(剧本演练,沙箱 rendition);IDX-5 G15 白名单扩容。 */
 async function deployScene() {
   const pluginDir = dirname(new URL(import.meta.url).pathname)
   const repoRoot = join(pluginDir, '..', '..')
-  // G15(预部署面): 本票改动不出 plugins/host-callback-bridge; polyfill.patch.yml 入口行未动。
-  //   (完整 G15 = dev-sync 后 diff -rq 装点零差异——本票红线禁 dev-sync 正向, 留给部署门。)
+  // G15(预部署面): 改动不出本票白名单; polyfill.patch.yml 入口行未动。
+  //   IDX-4 票面 = plugins/host-callback-bridge/;IDX-5 票面追加回调韧性四件
+  //   (cb-send 韧性 / cb-send 回归剧本 / session-spawn 提示 / maestro-orch 技能行)。
+  //   白名单外任何路径 = 越权改动, 门红。
+  //   (完整 G15 = dev-sync 后 diff -rq 装点零差异——部署门执行,留予编排者。)
   {
+    const idx5Allow = ['bin/cb-send', 'bin/cb-send-regress.sh', 'bin/session-spawn', 'shared/maestro-orch/SKILL.md']
     const diff = spawnSyncJson('git', ['-C', repoRoot, 'diff', '--name-only', 'HEAD'])
-    const outside = (Array.isArray(diff) ? diff : []).filter((f) => !f.startsWith('plugins/host-callback-bridge/'))
-    ok('g15:changes-confined-to-plugin-dir', outside.length === 0, outside.join(','))
+    const outside = (Array.isArray(diff) ? diff : []).filter((f) => !f.startsWith('plugins/host-callback-bridge/') && !idx5Allow.includes(f))
+    ok('g15:changes-confined-to-ticket-allowlist', outside.length === 0, outside.join(','))
     let yml = null
     try { yml = readFileSync(join(process.env.HOME ?? '', '.dsh', 'plugins', 'polyfill.patch.yml'), 'utf8') } catch { /* 装点无 yml(非部署环境) */ }
     ok('g15:polyfill-yml-entry-intact', yml === null || yml.includes('host-callback-bridge/index.js'))
@@ -643,6 +749,7 @@ async function main() {
   await rotationScene()
   await epochScene()      // IDX-4: G1-G3, G5-G12 (ADDR-R1 + alias-epoch)
   await migrationScene()  // IDX-4: G13 (v4 懒迁移)
+  await idx5Scene()       // IDX-5: X1-X4 (ceded 让渡 / 死信二分类 / 计数分立)
   await deployScene()     // IDX-4: G15(预部署面)/G16(剧本演练) + G14 汇总于退出码
   const total = passed + failed
   console.log(`\nhost-callback-bridge selftest: ${passed}/${total} passed`)

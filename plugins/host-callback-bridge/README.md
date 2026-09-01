@@ -50,6 +50,32 @@ boot 旧面随进程消亡、端口必然空闲,自动全量接管。检测是�
   正向同步时自动 rsync) + `~/.dsh/plugins/polyfill.patch.yml` 插入行
 - **红线**: DSH 本体零改动;宿主 boot 经 `run-web.sh --patch` 已有机制装载。
 
+## 文件面单一权威(IDX-5)
+
+2026-09 现场实证(事故①): dsh v4 起宿主原生 callback-bridge 为 armed 会话各挂一个
+文件 watcher(`.cursor.session-<sid>` 自带游标),与本插件的 file-router
+(`.cursor.host-bridge`)对同一 `inbox.log` 并行消费——同一行双投给目标会话、且
+polyfill 侧把原生道已投的行误记成 ghost dead-letter。裁决:一行同时段只允许一个
+消费者。
+
+**两个候选方案**(判据: 每行恰好一次):
+
+1. *polyfill file-router 唯一游标权威 + 宿主 arm 侧仅槽登记不消费* —— 需要 dsh
+   本体 arm 语义改动(armed 不起 watcher)。本票红线禁改 DSH 本体、禁重启装点,
+   该方案落地即超纲。
+2. *polyfill 让渡文件面(ceded),HTTP 受理面照旧,消费交宿主原生 per-session
+   watcher* —— 纯配置开关(env `MAESTRO_BRIDGE_FILE_DELIVERY=ceded`,或 activate
+   option `fileDelivery:'ceded'`),零 DSH 改动,重启时生效。
+
+**采纳方案 2**。代价与缓解:
+
+- 覆盖损失: 会话不 arm 就没人消费它的 inbox 行(方案 1 无此洞)。缓解 = IDX-5
+  Task D「编排线首动作 arm 自己」纪律 + 派发前言提示;
+- 积压不封顶: ceded 模式下从未 arm 的会话行永久滞留 inbox.log(体积增长无界)。
+  观测靠 `wc -l inbox.log`;装点轮转策略留后续票;
+- 缺省 'sole' 不变: 未显式 opt-in 的环境全部既有门零回归,生产切换 = 部署门里
+  加一个 env 值(仍需用户门重启才生效)。
+
 ## 测试
 
 ```bash

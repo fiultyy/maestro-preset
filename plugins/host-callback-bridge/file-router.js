@@ -9,6 +9,9 @@
  *   - 每行按 registry.json 裁定: 单播 → 目标会话;广播 → 每在册消费者各一次;
  *     回声(DSH-RE] 前缀)→ echo.log;malformed/unknown-addressee → dead.log
  *     (措辞与 v3.5/v3.6 逐字一致);投递失败退避×maxWakeFailures → dead.log;
+ *   - IDX-5 死信二分类(deadClass 键,仅 noise 行追加,真幽灵行四键形状不变):
+ *     目标会话的宿主原生 watcher 游标(.cursor.<sid>)已越过本行 = 并行道已投
+ *     (noise-parallel-delivered);无原生游标/未越过 = true-ghost(无槽真失联);
  *   - 轮转闸门: 本游标到尾 + 超 1MB/1000 行 → rename inbox.log.1,游标归零;
  *   - 投递经 sink.deliver(sessionId, line, info)(loopback session.prompt)。
  */
@@ -113,6 +116,8 @@ export function createFileRouter(config) {
     wakeTargets: 0,
     broadcastLines: 0,
     deadCount: 0,
+    deadTrueGhost: 0, // IDX-5: 真幽灵死信(无槽且原生道未投)
+    deadNoise: 0,     // IDX-5: 噪声死信(并行原生道已投,本面重复记账而已)
     echoCount: 0,
     blankCount: 0,
     dedupCount: 0,
@@ -190,6 +195,8 @@ export function createFileRouter(config) {
         wakeTargets: counters.wakeTargets,
         broadcastLines: counters.broadcastLines,
         deadCount: counters.deadCount,
+        deadTrueGhost: counters.deadTrueGhost,
+        deadNoise: counters.deadNoise,
         echoCount: counters.echoCount,
         blankCount: counters.blankCount,
         dedupCount: counters.dedupCount,
@@ -203,11 +210,16 @@ export function createFileRouter(config) {
     })
   }
 
-  /** dead.log 追加(IDX-4: classification 键按需新增,既有键形状不动,spec §1.1)。 */
-  async function appendDead(line, reason, classification = null) {
+  /**
+   * dead.log 追加(IDX-4: classification 键按需新增,既有键形状不动,spec §1.1)。
+   * IDX-5: deadClass 仅在 noise-parallel-delivered 时追加——真幽灵行保持既有
+   * 四键形状(at/reason/classification/line),既有门(G1f 逐键断言)零回归。
+   */
+  async function appendDead(line, reason, classification = null, deadClass = null) {
     const entry = classification === null
       ? { at: isoOf(now), reason, line }
       : { at: isoOf(now), reason, classification, line }
+    if (deadClass !== null) entry.deadClass = deadClass
     try {
       await fsp.appendFile(paths.dead, `${JSON.stringify(entry)}\n`)
     } catch (error) {
@@ -215,6 +227,17 @@ export function createFileRouter(config) {
     }
     counters.deadCount += 1
     counters.lastDeadAt = isoOf(now)
+  }
+
+  /**
+   * IDX-5 死信二分类探针: 目标会话的宿主原生 watcher 游标(.cursor.<sid>,行数
+   * 语义与本题游标一致,轮转时一并归零)已越过本行下标 = 原生道已消费 = 本面
+   * 若再死信记账纯属并行噪声;游标文件缺失(会话从未 arm)或未越过 = 真幽灵。
+   */
+  async function nativeCursorPassed(sessionId, lineIndex) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return false
+    const n = await readCursorFile(`${paths.dir}/.cursor.${sessionId}`)
+    return n > lineIndex
   }
 
   async function appendEcho(line) {
@@ -294,7 +317,16 @@ export function createFileRouter(config) {
         const count = (attempts.get(sid) ?? 0) + 1
         attempts.set(sid, count)
         if (count >= maxWakeFailures) {
-          await appendDead(line, `wake failed ${count} consecutive attempts: ${errorMessage(error)} (target ${sid})`)
+          // IDX-5: 唤醒失败终态同样二分类——原生道已投 = 噪声死信。
+          const noise = await nativeCursorPassed(sid, rt.cursor)
+          if (noise) counters.deadNoise += 1
+          else counters.deadTrueGhost += 1
+          await appendDead(
+            line,
+            `wake failed ${count} consecutive attempts: ${errorMessage(error)} (target ${sid})`,
+            null,
+            noise ? 'noise-parallel-delivered' : null,
+          )
           attempts.delete(sid)
           deadLettered += 1
         }
@@ -374,7 +406,17 @@ export function createFileRouter(config) {
 
           if (routing.action === 'dead') {
             if (routing.classification === 'stale address') counters.staleHits += 1
-            await appendDead(line, routing.reason, routing.classification ?? null)
+            // IDX-5 二分类: 幽灵/换代死信先探原生道——已投 = 噪声(记 deadClass),
+            // 未投 = 真幽灵(四键形状不变)。寻址解析不出 sessionId(裸名/坏形)按真幽灵。
+            let deadClass = null
+            if (routing.classification === 'ghost address' || routing.classification === 'stale address') {
+              const addr = parseAddress(toValue)
+              const noise = await nativeCursorPassed(addr.kind === 'qualified' ? addr.sessionId : null, rt.cursor)
+              deadClass = noise ? 'noise-parallel-delivered' : null
+              if (noise) counters.deadNoise += 1
+              else counters.deadTrueGhost += 1
+            }
+            await appendDead(line, routing.reason, routing.classification ?? null, deadClass)
             rt.cursor += 1
             await writeCursorFile(rt.cursor)
             await saveState()
