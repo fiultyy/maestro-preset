@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""ref-guard — 回调 ref 验账闸(IDX-2 任务B;事故锚: 编排侧收到未派发 ref 的回调无告警)
+
+用法: ref-guard <ref> [--sender X] [--nack] [--selftest]
+  <ref>        回调里的任务 ref(cb-send/session-send 的 ref 字段;无 ref 的回调不适用本闸)
+  --sender X   回调 from(fleet 码/sessionId 前缀/完整 sid);--nack 回告的目标
+  --nack       ref 未知时自动 session-send 回告发送方 'unknown-ref rejected'(exit 仍 1)
+  --selftest   内置自测(临时目录 + PATH shim 假 session-send,零真发)
+
+查三账(maestro 账本面):
+  1. ledger nodes.node_id   (MAESTRO_LEDGER,默认 ~/.dsh/maestro/ledger.db)
+  2. ledger tickets.ticket_id
+  3. flowc flows/<ref>      (MAESTRO_FLOWC_ROOT,默认 ~/.dsh/maestro/flows)
+已知 → exit 0(stdout 注明命中账别);未知 → exit 1(stderr unknown-ref)。
+编排者收到回调先跑本闸: 命中才信,未派发的 ref 一律拒之门外。
+
+环境: MAESTRO_LEDGER / MAESTRO_FLOWC_ROOT / MAESTRO_FLEET(session-send --nack 回告经它)。
+"""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+SESSION_SEND = os.environ.get('REF_GUARD_SESSION_SEND', 'session-send')
+
+
+def parse_cli(argv):
+    """scan-and-delete: --sender X / --nack / --selftest 删除后恰 1 位置参 <ref>。
+    返回 (ref|None, sender|None, nack, selftest, err);err ∈ None|'arity'|'sender'。"""
+    ref = None
+    sender = None
+    nack = False
+    selftest = False
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--sender':
+            if i + 1 >= len(argv) or argv[i + 1] == '':
+                return None, None, False, False, 'sender'
+            sender = argv[i + 1]
+            i += 2
+        elif a == '--nack':
+            nack = True
+            i += 1
+        elif a == '--selftest':
+            selftest = True
+            i += 1
+        else:
+            args.append(a)
+            i += 1
+    if len(args) != 1:
+        return None, sender, nack, selftest, 'arity'
+    ref = args[0]
+    return ref, sender, nack, selftest, None
+
+
+def ledger_ref_known(db_path, ref):
+    """查 ledger 两账(nodes.node_id / tickets.ticket_id);库缺/表缺按未命中(不炸)。"""
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        for table, column in (('nodes', 'node_id'), ('tickets', 'ticket_id')):
+            try:
+                row = conn.execute(f'SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1',
+                                   (ref,)).fetchone()
+            except sqlite3.Error:
+                continue  # 表缺(老库)→ 下一账
+            if row:
+                return table
+        return None
+    finally:
+        conn.close()
+
+
+def flow_ref_known(flows_root, ref):
+    """查 flowc flows 账: <flows_root>/<ref> 目录存在即命中。"""
+    if not ref or '/' in ref or ref.startswith('.'):
+        return False  # flow id 是单段目录名;带斜杠/点开头的不是
+    return os.path.isdir(os.path.join(flows_root, ref))
+
+
+def nack_sender_args(sender):
+    """--nack 回告的 session-send 参数(from=本席 DSH_SESSION_ID,降级 'ref-guard')。"""
+    frm = (os.environ.get('DSH_SESSION_ID') or '').strip() or 'ref-guard'
+    return [SESSION_SEND, frm, sender, 'nack', '-', 'unknown-ref rejected']
+
+
+def main() -> None:
+    ref, sender, nack, selftest, err = parse_cli(sys.argv[1:])
+    if selftest:
+        sys.exit(self_test())
+    if err == 'sender':
+        print('ref-guard: --sender requires a value', file=sys.stderr)
+        sys.exit(2)
+    if err == 'arity' or ref is None:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+
+    db_path = os.environ.get('MAESTRO_LEDGER', os.path.expanduser('~/.dsh/maestro/ledger.db'))
+    flows_root = os.environ.get('MAESTRO_FLOWC_ROOT', os.path.expanduser('~/.dsh/maestro/flows'))
+
+    face = ledger_ref_known(db_path, ref)
+    if face is None and flow_ref_known(flows_root, ref):
+        face = 'flows'
+    if face is not None:
+        print(f'known {face} ref={ref}')
+        sys.exit(0)
+
+    print(f'ref-guard: unknown-ref {ref}', file=sys.stderr)
+    if nack:
+        if not sender:
+            print('ref-guard: --nack requires --sender', file=sys.stderr)
+            sys.exit(2)
+        cmd = nack_sender_args(sender)
+        try:
+            subprocess.run(cmd, check=False)
+        except OSError as exc:
+            print(f'ref-guard: nack send failed ({SESSION_SEND}): {exc}', file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------- selftest(临时目录 + PATH shim;零真库/真发) ----------
+
+def self_test():
+    tmp = tempfile.mkdtemp(prefix='ref-guard-selftest-')
+    db_path = os.path.join(tmp, 'ledger.db')
+    conn = sqlite3.connect(db_path)
+    conn.execute('CREATE TABLE nodes(node_id TEXT PRIMARY KEY)')
+    conn.execute('CREATE TABLE tickets(ticket_id TEXT PRIMARY KEY)')
+    conn.execute("INSERT INTO nodes VALUES ('SI-001')")
+    conn.execute("INSERT INTO tickets VALUES ('A1-RW-001')")
+    conn.commit()
+    conn.close()
+    flows_root = os.path.join(tmp, 'flows')
+    os.makedirs(os.path.join(flows_root, 'ping-pong-loop'))
+    shim_dir = os.path.join(tmp, 'shim')
+    os.makedirs(shim_dir)
+    shim = os.path.join(shim_dir, 'session-send')
+    with open(shim, 'w') as fh:
+        fh.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SHIM_LOG"\n')
+    os.chmod(shim, 0o755)
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    env = dict(os.environ)
+    env.update({
+        'MAESTRO_LEDGER': db_path,
+        'MAESTRO_FLOWC_ROOT': flows_root,
+        'PATH': shim_dir + os.pathsep + env.get('PATH', ''),
+        'SHIM_LOG': os.path.join(tmp, 'shim.log'),
+        'DSH_SESSION_ID': 'session-callersid',
+    })
+    env.pop('MAESTRO_FLEET', None)  # shim 不读 fleet;显式unset防串真库环境
+
+    def run(*args):
+        return subprocess.run([sys.executable, os.path.join(here, 'ref-guard'), *args],
+                              capture_output=True, text=True, env=env)
+
+    shim_lines = lambda: [l.split() for l in open(env['SHIM_LOG']).read().splitlines()] \
+        if os.path.exists(env['SHIM_LOG']) else []
+
+    results = []
+
+    def check(name):
+        def deco(fn):
+            results.append((name, fn))
+            return fn
+        return deco
+
+    @check('rg:known-node')
+    def _():
+        r = run('SI-001')
+        assert r.returncode == 0 and 'nodes' in r.stdout, (r.returncode, r.stdout)
+
+    @check('rg:known-ticket')
+    def _():
+        r = run('A1-RW-001')
+        assert r.returncode == 0 and 'tickets' in r.stdout, (r.returncode, r.stdout)
+
+    @check('rg:known-flow')
+    def _():
+        r = run('ping-pong-loop')
+        assert r.returncode == 0 and 'flows' in r.stdout, (r.returncode, r.stdout)
+
+    @check('rg:unknown-exit-1')
+    def _():
+        r = run('ZZ-999')
+        assert r.returncode == 1 and 'unknown-ref ZZ-999' in r.stderr, (r.returncode, r.stderr)
+
+    @check('rg:traversal-not-flow')
+    def _():
+        r = run('..')
+        assert r.returncode == 1, (r.returncode, r.stdout)  # 带点路径不按 flow 目录命中
+
+    @check('rg:nack-shim-captures')
+    def _():
+        if os.path.exists(env['SHIM_LOG']):
+            os.remove(env['SHIM_LOG'])
+        r = run('ZZ-999', '--nack', '--sender', 'w9')
+        assert r.returncode == 1, r.returncode
+        lines = shim_lines()
+        assert len(lines) == 1, lines  # 一次回告,单行
+        words = lines[0]
+        frm, to, typ, ref = words[0], words[1], words[2], words[3]
+        body = ' '.join(words[4:])
+        assert frm == 'session-callersid' and to == 'w9', words
+        assert typ == 'nack' and ref == '-' and body == 'unknown-ref rejected', words
+
+    @check('rg:nack-without-sender-exit-2')
+    def _():
+        r = run('ZZ-999', '--nack')
+        assert r.returncode == 2 and '--sender' in r.stderr, (r.returncode, r.stderr)
+
+    @check('rg:arity-exit-2')
+    def _():
+        r = run()
+        assert r.returncode == 2, r.returncode
+        r = run('a', 'b')
+        assert r.returncode == 2, r.returncode
+
+    @check('rg:missing-ledger-still-flow-or-unknown')
+    def _():
+        env2 = dict(env)
+        env2['MAESTRO_LEDGER'] = os.path.join(tmp, 'nope.db')
+        r = subprocess.run([sys.executable, os.path.join(here, 'ref-guard'), 'ping-pong-loop'],
+                           capture_output=True, text=True, env=env2)
+        assert r.returncode == 0 and 'flows' in r.stdout, (r.returncode, r.stdout)
+        r = subprocess.run([sys.executable, os.path.join(here, 'ref-guard'), 'ZZ-999'],
+                           capture_output=True, text=True, env=env2)
+        assert r.returncode == 1, r.returncode
+
+    npass = 0
+    for name, fn in results:
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f'[FAIL] {name}: {exc}')
+        except Exception as exc:  # noqa: BLE001
+            print(f'[FAIL] {name}: unexpected {type(exc).__name__}: {exc}')
+        else:
+            print(f'[ ok ] {name}')
+            npass += 1
+    print(f'ref-guard selftest: {npass}/{len(results)} passed')
+    return 0 if npass == len(results) else 1
+
+
+if __name__ == '__main__':
+    main()

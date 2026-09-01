@@ -93,6 +93,55 @@ def find_entry(key, fleet):
     return None
 
 
+def best_effort_session(key, fleet):
+    """from 的尽力解析(IDX-2,不 exit;解析不了返回 None,老调用零破坏):
+    完整 sessionId 原样;短码/前缀查 fleet;未命中 → None(free-form from 照发)。"""
+    if key.startswith('session-'):
+        return key
+    ent = fleet.get('fleet', {}).get(key)
+    if isinstance(ent, dict) and ent.get('sessionId'):
+        return ent['sessionId']
+    for ent in fleet.get('fleet', {}).values():
+        sid = ent.get('sessionId') if isinstance(ent, dict) else None
+        if sid and sid.startswith('session-' + key):
+            return sid
+    return None
+
+
+def registered_consumer_alias(registry_path, session_id):
+    """bridge registry 里该 session 的已注册消费者别名(IDX-2);无/坏文件/未注册 → None。"""
+    try:
+        with open(registry_path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    ent = (data.get('consumers') or {}).get(session_id)
+    if isinstance(ent, dict):
+        return ent.get('alias') or ''
+    return None
+
+
+def identity_advisory(frm, frm_sid, registry_path):
+    """IDX-2 from 身份告警(非阻断;事故锚 38c3 冒用 af29)。返回 warn|None。
+    主路径: 本进程带 DSH_SESSION_ID(harness 给每个会话的 shell 工具注入,实测
+    worker/编排 shell 皆有)且 ≠ from 解析 → 冒用嫌疑大写 WARN;
+    降级: 无 DSH_SESSION_ID 且 from 解析命中 bridge registry 已注册消费者签名
+    → 'borrowing registered consumer signature' WARN。
+    两路都只写 stderr 不阻断(向后兼容,老调用零破坏)。"""
+    caller = (os.environ.get('DSH_SESSION_ID') or '').strip() or None
+    if caller is not None:
+        if frm_sid is not None and frm_sid != caller:
+            return (f"SESSION-SEND: FROM IDENTITY MISMATCH — from '{frm}' resolves to "
+                    f"{frm_sid} but calling session is {caller}; continuing (non-blocking)")
+        return None
+    if frm_sid is not None:
+        alias = registered_consumer_alias(registry_path, frm_sid)
+        if alias is not None:
+            return (f"SESSION-SEND: WARNING — borrowing registered consumer signature "
+                    f"'{alias}@{frm_sid}'; continuing (non-blocking)")
+    return None
+
+
 def append_jsonl(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'a', encoding='utf-8') as fh:
@@ -141,10 +190,17 @@ def main() -> None:
     frm, to, typ, ref, body = pos
     port = os.environ.get('DSH_PORT', '3080')
     fleet_path = os.environ.get('MAESTRO_FLEET', os.path.expanduser('~/.dsh/maestro/fleet.json'))
+    registry_path = os.environ.get('MAESTRO_BRIDGE_REGISTRY',
+                                   os.path.expanduser('~/.dsh/maestro/bridge/registry.json'))
     with open(fleet_path) as fh:
         fleet = json.load(fh)
     port = str(fleet.get('port', port))
     to_sid = resolve(to, fleet)
+    # IDX-2 from 身份告警(非阻断): 解析得到 from 指向的会话即注记,失配/借名只 WARN
+    frm_sid = best_effort_session(frm, fleet)
+    warn = identity_advisory(frm, frm_sid, registry_path)
+    if warn:
+        print(warn, file=sys.stderr)
     msgid = msgid or str(uuid.uuid4())
     ts = int(time.time() * 1000)
     if typ == 'steer':  # OF-002 控制面闸(仅 steer;其余类型零影响)
@@ -182,7 +238,8 @@ def main() -> None:
     if not result.get('ok'):
         print('session-send: RPC error:', json.dumps(result.get('error'), ensure_ascii=False))
         sys.exit(1)
-    print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}: mode={mode} accepted={result['value']['accepted']}")
+    resolved = f' resolved-session={frm_sid[:14]}…' if frm_sid else ''
+    print(f"sent {frm} -> {to}({to_sid[:14]}…) type={typ} ref={ref}:{resolved} mode={mode} accepted={result['value']['accepted']}")
 
 
 # ---------- selftest(临时目录;纯函数断言;绝不发真实 prompt/HTTP) ----------
@@ -315,6 +372,55 @@ def selftest():
                 os.environ.pop('MAESTRO_STATE', None)
             else:
                 os.environ['MAESTRO_STATE'] = saved
+
+    @check('se:best-effort-session')
+    def _():
+        fleet = {'fleet': {
+            '2437': {'sessionId': 'session-2437abcd-0000-0000-0000-000000000001'},
+            'orch1': {'sessionId': 'session-0fffaaaa-0000-0000-0000-000000000002'}}}
+        assert best_effort_session('session-full9', fleet) == 'session-full9'  # 完整 sid 原样
+        assert best_effort_session('2437', fleet) == 'session-2437abcd-0000-0000-0000-000000000001'
+        assert best_effort_session('2437ab', fleet) == 'session-2437abcd-0000-0000-0000-000000000001'
+        assert best_effort_session('zz99', fleet) is None  # 未命中 → None(不 exit,老调用零破坏)
+
+    @check('se:registered-consumer-alias')
+    def _():
+        reg = os.path.join(tmp, 'registry.json')
+        with open(reg, 'w') as fh:
+            json.dump({'consumers': {'session-abc': {'alias': 'orch-x', 'pid': 1}}}, fh)
+        assert registered_consumer_alias(reg, 'session-abc') == 'orch-x'
+        assert registered_consumer_alias(reg, 'session-other') is None
+        assert registered_consumer_alias(os.path.join(tmp, 'missing.json'), 'session-abc') is None
+        bad = os.path.join(tmp, 'bad.json')
+        with open(bad, 'w') as fh:
+            fh.write('not-json{')
+        assert registered_consumer_alias(bad, 'session-abc') is None  # 坏文件不炸
+
+    @check('se:identity-mismatch-warn')
+    def _():
+        reg = os.path.join(tmp, 'registry.json')  # se:registered-consumer-alias 写入的注册表(session-abc→orch-x)
+        saved = os.environ.get('DSH_SESSION_ID')
+        try:
+            os.environ['DSH_SESSION_ID'] = 'session-caller'
+            # from 指向别席 → 大写前缀 MISMATCH WARN(非阻断)
+            w = identity_advisory('af29', 'session-af29', reg)
+            assert w is not None and w.startswith('SESSION-SEND: FROM IDENTITY MISMATCH'), w
+            assert 'session-af29' in w and 'session-caller' in w and 'non-blocking' in w
+            # from 指向本席 → 零告警
+            assert identity_advisory('session-caller', 'session-caller', reg) is None
+            # from 解析不了(free-form)→ 零告警
+            assert identity_advisory('ghost', None, reg) is None
+            # 降级路: 无 env + from 命中 registry 已注册消费者 → borrowing WARN
+            os.environ.pop('DSH_SESSION_ID', None)
+            w2 = identity_advisory('af29', 'session-abc', reg)
+            assert w2 is not None and 'borrowing registered consumer signature' in w2, w2
+            # 降级路: from 未注册 → 零告警
+            assert identity_advisory('af29', 'session-unregistered', reg) is None
+        finally:
+            if saved is None:
+                os.environ.pop('DSH_SESSION_ID', None)
+            else:
+                os.environ['DSH_SESSION_ID'] = saved
 
     npass = 0
     for name, fn in results:

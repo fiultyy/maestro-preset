@@ -67,6 +67,38 @@ function steerGate(lib, frm, to, fleet, fleetPath, msgid, ts) {
     { msgid, from: frm, to, ts, reason })
 }
 
+// ---- from 身份告警(IDX-2,非阻断;事故锚 38c3 冒用 af29) ----
+// 主路径: 本进程带 DSH_SESSION_ID(harness 给每个会话的 shell 工具注入)且 ≠ from
+// 解析 → 大写 MISMATCH WARN;降级: 无 env 且 from 解析命中 bridge registry 已注册
+// 消费者签名 → borrowing WARN。两路只写 stderr,不阻断(老调用零破坏)。
+function registryConsumerAlias(registryPath, sessionId) {
+  try {
+    const data = JSON.parse(require('node:fs').readFileSync(registryPath, 'utf8'))
+    const ent = data && data.consumers ? data.consumers[sessionId] : undefined
+    if (ent && typeof ent === 'object') return ent.alias || ''
+    return null
+  } catch { return null }
+}
+
+function identityAdvisory(frm, frmSid, registryPath) {
+  const caller = (process.env.DSH_SESSION_ID ?? '').trim() || null
+  if (caller !== null) {
+    if (frmSid !== null && frmSid !== caller) {
+      return `SESSION-SEND: FROM IDENTITY MISMATCH — from '${frm}' resolves to `
+        + `${frmSid} but calling session is ${caller}; continuing (non-blocking)`
+    }
+    return null
+  }
+  if (frmSid !== null) {
+    const alias = registryConsumerAlias(registryPath, frmSid)
+    if (alias !== null) {
+      return `SESSION-SEND: WARNING — borrowing registered consumer signature `
+        + `'${alias}@${frmSid}'; continuing (non-blocking)`
+    }
+  }
+  return null
+}
+
 // ---- 参数解析(scan-and-delete;--msgid 单次,--via 可重复) ----
 function parseArgv(argv) {
   let msgid = null
@@ -134,6 +166,14 @@ async function main() {
     }
   }
 
+  // IDX-2 from 身份告警(非阻断): from 尽力解析(完整 sid 原样/fleet 梯,解析不了=undefined
+  // → free-form from 照发),失配/借名只 WARN;成功行注明 resolved-session。
+  const registryPath = process.env.MAESTRO_BRIDGE_REGISTRY ?? join(homedir(), '.dsh', 'maestro', 'bridge', 'registry.json')
+  const frmSid = frm.startsWith('session-') ? frm
+    : (() => { const e = lib.findFleetEntry(fleet, frm, { mode: 'prefix' }); return e && typeof e.sessionId === 'string' ? e.sessionId : null })()
+  const identityWarn = identityAdvisory(frm, frmSid ?? null, registryPath)
+  if (identityWarn) process.stderr.write(identityWarn + '\n')
+
   const finalMsgid = (msgid && msgid.length > 0) ? msgid : lib.forgeMsgid()
   const ts = Date.now()
 
@@ -185,7 +225,8 @@ async function main() {
     process.exit(1)
   }
   const accepted = result.value && result.value.accepted === true ? 'True' : 'False'
-  process.stdout.write(`sent ${frm} -> ${to}(${toSid.slice(0, 14)}…) type=${typ} ref=${ref}: mode=${mode} accepted=${accepted}\n`)
+  const resolvedNote = frmSid ? ` resolved-session=${frmSid.slice(0, 14)}…` : ''
+  process.stdout.write(`sent ${frm} -> ${to}(${toSid.slice(0, 14)}…) type=${typ} ref=${ref}:${resolvedNote} mode=${mode} accepted=${accepted}\n`)
 }
 
 main().catch((error) => {

@@ -64,6 +64,7 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
 |---|---|---|
 | 派任务并等回报 | `terminal send` + 末尾嵌上面的契约模板 | 见模板 |
 | 报"对方已开工/已完成" | 等回调(原生唤醒你的回合,不轮询) | ACK→节点 running;DONE→收口 |
+| **收到回调** | **先 `ref-guard <ref> --sender <from>` 验账(IDX-2):命中三账 nodes/tickets/flows 才信;未知 exit 1,`--nack` 自动回告 'unknown-ref rejected'** | 未派发的 ref 拒收:不落账、不派生动作 |
 | 回调超时(~10 分钟) | 机械校验: `terminal read --cursor` / `terminal wait --for tui-idle` | 握手协作,机械校验仲裁 |
 | 派大文本 | 拆段或落文件传路径 | 见规则 4 |
 | 换 pane 里的 harness | `answer <sid> --text "/quit" --enter` 再注入新别名 | — |
