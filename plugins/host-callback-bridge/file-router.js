@@ -12,6 +12,11 @@
  *   - IDX-5 死信二分类(deadClass 键,仅 noise 行追加,真幽灵行四键形状不变):
  *     目标会话的宿主原生 watcher 游标(.cursor.<sid>)已越过本行 = 并行道已投
  *     (noise-parallel-delivered);无原生游标/未越过 = true-ghost(无槽真失联);
+ *   - OBS1-fix 投递期 unrouted 死信档: deliverPending 每轮重读注册表,原在册目标
+ *     投递窗内换代/剪除/注销而跌落 unrouted 时——非 true-ghost(原生道已投)与
+ *     intake 死信同构留档(reason=unrouted during delivery: + 逐字 intake 措辞,
+ *     deadClass=noise-parallel-delivered),不再重复唤醒;true-ghost 不入此档,照旧
+ *     退避重投(at-least-once 不变,终态仍走既有 wake-failed 死信);
  *   - 轮转闸门: 本游标到尾 + 超 1MB/1000 行 → rename inbox.log.1,游标归零;
  *   - 投递经 sink.deliver(sessionId, line, info)(loopback session.prompt)。
  */
@@ -119,6 +124,7 @@ export function createFileRouter(config) {
     deadCount: 0,
     deadTrueGhost: 0, // IDX-5: 真幽灵死信(无槽且原生道未投)
     deadNoise: 0,     // IDX-5: 噪声死信(并行原生道已投,本面重复记账而已)
+    unrouted: 0,      // OBS1-fix: 投递期 unrouted 死信档(非 true-ghost 才落档)
     adaptiveSkip: 0,  // A-fix: 原生道已投实证后本道跳过(消重复)
     adaptiveDefer: 0, // A-fix: 让道窗口触发次数
     echoCount: 0,
@@ -200,6 +206,7 @@ export function createFileRouter(config) {
         deadCount: counters.deadCount,
         deadTrueGhost: counters.deadTrueGhost,
         deadNoise: counters.deadNoise,
+        unrouted: counters.unrouted,             // OBS1-fix: 投递期 unrouted 死信档计数
         adaptiveSkip: counters.adaptiveSkip,   // A-fix: 原生道已投实证后本道跳过数
         adaptiveDefer: counters.adaptiveDefer, // A-fix: 让道窗口触发数
         echoCount: counters.echoCount,
@@ -255,6 +262,60 @@ export function createFileRouter(config) {
     } catch {
       return false
     }
+  }
+
+  /**
+   * OBS1-fix: 投递期 unrouted 死因措辞——与 intake 死信同构。优先复用
+   * resolveHostRouting 对现注册表的逐字产出(stale/ghost 措辞+classification 不变);
+   * 广播/兜底面按 intake ghost 同款措辞补齐(目标 sessionId 恒在 reason 中)。
+   */
+  function unroutedReasonOf(registry, sid) {
+    const entry = registry.consumers[sid]
+    if (entry !== undefined && entry.stale !== null && entry.stale !== undefined) {
+      const routing = resolveHostRouting({ kind: 'qualified', alias: entry.alias ?? '', sessionId: sid }, registry)
+      return { reason: routing.reason, classification: routing.classification ?? 'stale address' }
+    }
+    const addr = parseAddress(rt.pending.to)
+    if (addr.kind === 'qualified' || addr.kind === 'bare') {
+      const routing = resolveHostRouting(addr, registry)
+      if (routing.action === 'dead') {
+        return { reason: routing.reason, classification: routing.classification ?? 'ghost address' }
+      }
+    }
+    return { reason: `unknown-addressee: no registered consumer with sessionId ${sid}`, classification: 'ghost address' }
+  }
+
+  /**
+   * OBS1-fix(投递期 unrouted 死信档): deliverPending 每轮对剩余目标重读注册表——
+   * 行被路由时在册,投递窗内(退避重试/让道窗)目标换代/剪除/注销而跌落 unrouted。
+   * 非 true-ghost(原生 watcher 游标已越过本行 = 原生道已投实证)→ 与 intake 死信
+   * 同构留档(reason=unrouted during delivery: + 逐字 intake 措辞, 原文随行,
+   * deadClass=noise-parallel-delivered)并停打本目标(再唤醒即双道重复);true-ghost
+   * (游标未越行)不入此档——不停止投递,落回 sink.deliver 退避,终态仍走既有
+   * wake-failed 死信(at-least-once 不变)。注册表不可读时视作仍 routed(不阻塞投递)。
+   * 返回本轮死信归档的目标数(记入 deadLettered,不占 wakeTargets)。
+   */
+  async function deadLetterUnroutedTargets(line, attempts) {
+    if (attempts.size === 0) return 0
+    let registry
+    try {
+      registry = await readRegistry(paths.registry)
+    } catch {
+      return 0
+    }
+    let lettered = 0
+    for (const sid of [...attempts.keys()]) {
+      const entry = registry.consumers[sid]
+      if (entry !== undefined && (entry.stale === null || entry.stale === undefined)) continue // 仍在册活槽
+      if (!(await nativeCursorPassed(sid, rt.cursor))) continue // true-ghost: 不死信不停投
+      const ctx = unroutedReasonOf(registry, sid)
+      counters.unrouted += 1
+      counters.deadNoise += 1
+      await appendDead(line, `unrouted during delivery: ${ctx.reason}`, ctx.classification, 'noise-parallel-delivered')
+      attempts.delete(sid)
+      lettered += 1
+    }
+    return lettered
   }
 
   /**
@@ -347,6 +408,9 @@ export function createFileRouter(config) {
     const { line, parsed, keys, broadcast } = rt.pending
     const attempts = rt.pending.attempts
     let deadLettered = 0
+    // OBS1-fix 投递期 unrouted 死信档(先于 A-fix 评估: unrouted+noise 若让
+    // adaptiveYield 先行会被 adaptiveSkip 静默吞掉,零留痕)。
+    deadLettered += await deadLetterUnroutedTargets(line, attempts)
     // A-fix 自适应让道(详见 adaptiveYield 注释): 原生道已投→跳过;有原生道未投→
     // 短窗让道;窗口尽→终检后兜底直投。deferUntil 三态: undefined=未评估,
     // 未来时刻=让道中, 过去时刻=窗口尽(终检一次)。

@@ -677,6 +677,95 @@ async function idx5Scene() {
   }
 }
 
+/**
+ * OBS1-fix: 投递期 unrouted 补死信档 —— 行被路由时目标在册,投递窗(退避重试)内
+ * 注册表换代后跌落 unrouted:
+ *   a) unrouted + 原生游标越行(非 true-ghost/noise)→ 与 intake 死信同构落档
+ *      (reason=unrouted during delivery: + 逐字 intake 措辞, deadClass=noise),
+ *      死档后不再重复唤醒(mock host 零第二次 prompt),行终态推进游标;
+ *   b) unrouted + 原生游标未越行(true-ghost)→ 不入此档不停止投递,照旧退避,
+ *      终态仍 wake-failed 死信(at-least-once 不变),unrouted 计数不记 b 面。
+ * 门②: router counters.unrouted 进 /status router 节 + state.json 持久化白名单。
+ */
+async function obs1Scene() {
+  // a) noise 面: 换代 + 原生游标越行。
+  {
+    const bridgeDir = makeBridgeDir()
+    const mockHost = makeMockHost({ failFor: 'session-obs1' })
+    const apiPort = await listen(mockHost.server)
+    let handle = null
+    try {
+      handle = await activate({ bridgeDir, apiPort, retryDelayMs: 200, maxWakeFailures: 3, adaptiveDeferMs: 10 })
+      const port = Number.parseInt(readFileSync(join(bridgeDir, 'http.port'), 'utf8').trim(), 10)
+      const reg = await httpJson(port, 'POST', '/register', { sessionId: 'session-obs1', alias: 'o1' })
+      assertEq('obs1a:target-registered', reg.status, 200)
+      appendFileSync(join(bridgeDir, 'inbox.log'), JSON.stringify({ type: 'ping', from: 'w', to: 'o1@session-obs1', body: '[ref:OBS1a] noise' }) + '\n')
+      // 首轮在册路由成立、必败唤醒到账;随后在投递窗内换代 + 原生游标越行。
+      ok('obs1a:first-round-wake-attempted', await waitFor(() => mockHost.calls.some((c) => c.sessionId === 'session-obs1' && c.text?.includes('[ref:OBS1a]')), { timeoutMs: 8000 }))
+      const succ = await httpJson(port, 'POST', '/register', { sessionId: 'session-obs1-next', alias: 'o1' })
+      assertEq('obs1a:successor-supersedes', [succ.status, succ.data?.superseded?.sessionId], [200, 'session-obs1'])
+      writeFileSync(join(bridgeDir, '.cursor.session-obs1'), '99')
+      const deadPath = join(bridgeDir, 'dead.log')
+      ok('obs1a:unrouted-dead-letter-archived', await waitFor(() => existsSync(deadPath) && readFileSync(deadPath, 'utf8').includes('[ref:OBS1a]'), { timeoutMs: 8000 }))
+      const entry = readFileSync(deadPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((e) => e.line?.includes('[ref:OBS1a]'))
+      ok('obs1a:reason-unrouted-with-intake-wording', typeof entry?.reason === 'string' && entry.reason.startsWith('unrouted during delivery: ') && entry.reason.includes('is a stale generation of alias o1'), entry?.reason)
+      assertEq('obs1a:classification-stale', entry?.classification, 'stale address')
+      assertEq('obs1a:deadclass-noise', entry?.deadClass, 'noise-parallel-delivered')
+      assertEq('obs1a:five-keys-intake-isomorphic', Object.keys(entry ?? {}).sort(), ['at', 'classification', 'deadClass', 'line', 'reason'])
+      await sleep(300) // 远大于退避/让道窗: 若档后未停打,此处必现第二次 prompt
+      assertEq('obs1a:no-second-wake-after-archive', mockHost.calls.filter((c) => c.sessionId === 'session-obs1' && c.text?.includes('[ref:OBS1a]')).length, 1)
+      ok('obs1a:line-terminated-cursor-advanced', handle.status().router.cursor === 1 && handle.status().router.pending === null, `cursor=${handle.status().router.cursor} pending=${JSON.stringify(handle.status().router.pending)}`)
+      // 门②: 计数三面一致(内存 / /status router 节 / state.json 持久化)。
+      const counters = handle.status().router.counters
+      ok('obs1a:unrouted-counted-in-memory', (counters.unrouted ?? 0) >= 1 && counters.deadNoise >= 1, `unrouted=${counters.unrouted} deadNoise=${counters.deadNoise}`)
+      const status = await httpJson(port, 'GET', '/status', undefined)
+      ok('obs1b:status-router-unrouted-node', (status.data?.router?.counters?.unrouted ?? 0) >= 1, JSON.stringify(status.data?.router?.counters))
+      const disk = JSON.parse(readFileSync(join(bridgeDir, 'state.json'), 'utf8'))
+      ok('obs1b:state-persisted-unrouted-whitelist', (disk.hostBridge?.counters?.unrouted ?? 0) >= 1, `disk.unrouted=${disk.hostBridge?.counters?.unrouted}`)
+      handle.stop()
+      handle = null
+    } finally {
+      if (handle !== null) handle.stop()
+      await close(mockHost.server)
+      rmSync(bridgeDir, { recursive: true, force: true })
+    }
+  }
+
+  // b) true-ghost 面: 换代但原生游标未越行 → 不入死信档、不停止投递。
+  {
+    const bridgeDir = makeBridgeDir()
+    const mockHost = makeMockHost({ failFor: 'session-obs2' })
+    const apiPort = await listen(mockHost.server)
+    let handle = null
+    try {
+      handle = await activate({ bridgeDir, apiPort, retryDelayMs: 150, maxWakeFailures: 2, adaptiveDeferMs: 10 })
+      const port = Number.parseInt(readFileSync(join(bridgeDir, 'http.port'), 'utf8').trim(), 10)
+      const reg = await httpJson(port, 'POST', '/register', { sessionId: 'session-obs2', alias: 'o2' })
+      assertEq('obs1c:target-registered', reg.status, 200)
+      appendFileSync(join(bridgeDir, 'inbox.log'), JSON.stringify({ type: 'ping', from: 'w', to: 'o2@session-obs2', body: '[ref:OBS1b] ghost' }) + '\n')
+      ok('obs1c:first-round-wake-attempted', await waitFor(() => mockHost.calls.some((c) => c.sessionId === 'session-obs2' && c.text?.includes('[ref:OBS1b]')), { timeoutMs: 8000 }))
+      const succ = await httpJson(port, 'POST', '/register', { sessionId: 'session-obs2-next', alias: 'o2' })
+      assertEq('obs1c:successor-supersedes', [succ.status, succ.data?.superseded?.sessionId], [200, 'session-obs2'])
+      // 原生游标不写(未越行) → true-ghost: 退避续投至 wake-failed 终态。
+      const deadPath = join(bridgeDir, 'dead.log')
+      ok('obs1c:wake-failed-terminal-still-reached', await waitFor(() => existsSync(deadPath) && readFileSync(deadPath, 'utf8').includes('[ref:OBS1b]'), { timeoutMs: 8000 }))
+      const entry = readFileSync(deadPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((e) => e.line?.includes('[ref:OBS1b]'))
+      ok('obs1c:true-ghost-keeps-wake-wording', typeof entry?.reason === 'string' && entry.reason.startsWith('wake failed ') && entry.reason.includes('(target session-obs2)') && !entry.reason.includes('unrouted during delivery'), entry?.reason)
+      assertEq('obs1c:wake-shape-unchanged', Object.keys(entry ?? {}).sort(), ['at', 'line', 'reason'])
+      ok('obs1c:no-deadclass-on-true-ghost', entry?.deadClass === undefined)
+      ok('obs1c:delivery-continued-after-unroute', mockHost.calls.filter((c) => c.sessionId === 'session-obs2' && c.text?.includes('[ref:OBS1b]')).length >= 2, `prompts=${mockHost.calls.filter((c) => c.sessionId === 'session-obs2').length}`)
+      const counters = handle.status().router.counters
+      assertEq('obs1c:unrouted-not-counted-for-true-ghost', [counters.unrouted ?? 0, counters.deadTrueGhost, counters.deadNoise], [0, 1, 0])
+      handle.stop()
+      handle = null
+    } finally {
+      if (handle !== null) handle.stop()
+      await close(mockHost.server)
+      rmSync(bridgeDir, { recursive: true, force: true })
+    }
+  }
+}
+
 /** IDX-4: G15(预部署面)/G16(剧本演练,沙箱 rendition);IDX-5 G15 白名单扩容。 */
 async function deployScene() {
   const pluginDir = dirname(new URL(import.meta.url).pathname)
@@ -765,6 +854,7 @@ async function main() {
   await epochScene()      // IDX-4: G1-G3, G5-G12 (ADDR-R1 + alias-epoch)
   await migrationScene()  // IDX-4: G13 (v4 懒迁移)
   await idx5Scene()       // IDX-5: X1-X4 (ceded 让渡 / 死信二分类 / 计数分立)
+  await obs1Scene()       // OBS1-fix: 投递期 unrouted 死信档(noise 落档 / true-ghost 不停投 / 计数三面)
   await deployScene()     // IDX-4: G15(预部署面)/G16(剧本演练) + G14 汇总于退出码
   const total = passed + failed
   console.log(`\nhost-callback-bridge selftest: ${passed}/${total} passed`)
