@@ -38,6 +38,12 @@
 // preset/cwd/title) — deliberately NO updatedAt/tokens, so the payload is
 // deterministic for same-upstream replays. dsh unreachable/timeout ->
 // 200 + pure fleet view + degraded:true + note, never 5xx.
+// Wire dual-chain contract (cutover seat-A, T0 probe verdict): OLD dh1-slim
+// serves the dot form POST /api/session.list with payload {}; NEW
+// rebase/dh1-slim-on-master serves only the slash form POST /api/session/list
+// with payload {args:{request:{...}}} and requires browser-session cookie
+// auth (401 otherwise; dot path answers 404 = no compat layer). DSH_WIRE
+// selects the form so one build serves both chains; default dot (live chain).
 // PM-005 (trace read projection, op=trace): direct read of the session
 // event log ~/.dsh/sessions/<bucket>/<sid>/session.jsonl.zstd (bucket scan
 // = session-purge findSessionDir pattern; NO disk writes, one in-memory
@@ -147,6 +153,7 @@ const CURSOR_FILE = `${STATE_DIR}/tickets.cursor.json`
 const FLEET_FILE = process.env.MAESTRO_FLEET ?? `${ROOT}/maestro/fleet.json`
 const FLEET_LIST_BIN = process.env.PM_HOST_SERVICE_FLEET_LIST ?? `${ROOT}/maestro/bin/fleet-list`
 const DSH_PORT = process.env.DSH_PORT ?? '3080'
+const DSH_WIRE = process.env.DSH_WIRE ?? 'dot' // 'dot' = OLD dh1-slim chain; 'slash' = NEW rebase chain (T0 probe verdict)
 const SESSIONS_ROOT = process.env.DSH_SESSIONS_ROOT ?? `${ROOT}/sessions`
 const FLOWS_ROOT = process.env.MAESTRO_FLOWS_ROOT ?? `${ROOT}/maestro/flows`
 const FLOWC_BIN = process.env.PM_HOST_SERVICE_FLOWC ?? `${ROOT}/maestro/bin/flowc`
@@ -316,14 +323,17 @@ function readSeats() { // fleet.json direct; bin/fleet-list CLI as fallback auth
 }
 
 let joinSeq = 0
-async function fetchSessionJoin() { // dsh loopback session.list -> Map(sid->session 投影); throw = 上游不可用/超时 (身份+活性投影, 波动指标不入射以保同上游重放字节一致)
+async function fetchSessionJoin() { // dsh loopback session list -> Map(sid->session 投影); throw = 上游不可用/超时 (身份+活性投影, 波动指标不入射以保同上游重放字节一致)
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), JOIN_DSH_TIMEOUT_MS)
   try {
-    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+    // Dual-chain wire (T0 probe): dot -> /api/session.list payload {}; slash ->
+    // /api/session/list payload {args:{request:{}}} (envelope type/rpcId identical).
+    const slash = DSH_WIRE === 'slash'
+    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/${slash ? 'session/list' : 'session.list'}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-fleet-${++joinSeq}`, method: 'session.list', payload: {} }),
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-fleet-${++joinSeq}`, method: 'session/list', payload: slash ? { args: { request: {} } } : {} }),
       signal: ctl.signal,
     })
     if (!res.ok) throw new Error(`http ${res.status}`)
@@ -1288,16 +1298,18 @@ function probeFlows() { // SQL self-walk: a flow is live only if its state.db op
   return { live: flows.length > 0 && readable === flows.length, root: FLOWS_ROOT, total: flows.length, readable, flows, degradedFlows: dead, note: dead.length ? `unreadable: ${dead.join(',')}` : '' }
 }
 
-async function probeDsh() { // PMW2-I: liveness 探针走廉价 workspace.list (同款 RPC wire, ~ms 级); session.list 数百会话全投影 ~5s 曾必超 1s 预算 → abort → 降级横幅间歇闪。只判活, 不取数。
+async function probeDsh() { // PMW2-I: liveness 探针只判活不取数。session.list 数百会话全投影 ~5s 曾必超 1s 预算 → abort → 降级横幅间歇闪，故走廉价端点。Dual-chain (T0 probe): dot 链 = workspace.list；slash 链无 workspace unary（workspace 域仅 ws 流 workspace/follow），改用 session/list 空 request（~ms 级，空库 items:[]）作廉价探针。
   const t0 = Date.now()
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), HEALTH_DSH_TIMEOUT_MS)
-  const url = `127.0.0.1:${DSH_PORT}/api/workspace.list`
+  const slash = DSH_WIRE === 'slash'
+  const path = slash ? 'session/list' : 'workspace.list'
+  const url = `127.0.0.1:${DSH_PORT}/api/${path}`
   try {
     const res = await fetch(`http://${url}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: 'workspace.list', payload: {} }),
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: path, payload: slash ? { args: { request: {} } } : {} }),
       signal: ctl.signal,
     })
     if (!res.ok) return { live: false, url, latency_ms: Date.now() - t0, note: `http ${res.status}` }
