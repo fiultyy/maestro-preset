@@ -7,6 +7,9 @@
  * 动作"的根据)。指针行复用 ORCA-CB] 信封(与 v3.5/v3.6 会话内 sink 投递的行格式
  * 逐字一致): text = `ORCA-CB] {原始 inbox 行 JSON}`。
  *
+ * 双链 wire(seatA-cut3-2): rpc/deliver 统一走 core/wire.js dshWire()——dot(默认)
+ * 逐字节现行为; DSH_WIRE=slash 走 NEW 链 /api/<ns>/<verb> + {args:{request}} + cookie。
+ *
  * 时效语义(2026-08-26 orch1 裁定"消息必须到达时 cancel 当前步"): 目标会话在飞时,
  * 投递前先 POST session.cancel 中断在飞 step,再以 queue 入列——agent loop 会把
  * 唤醒消息重类为 next-turn 并基于全量历史立即开新回合(即 steer-cancel 模式),
@@ -15,6 +18,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { dshWire } from './core/wire.js'
 
 /** 缺省请求超时: 与 bin/session-send 的 urlopen timeout=30 一致。 */
 export const REQUEST_TIMEOUT_MS = 30_000
@@ -60,17 +64,13 @@ export function createLoopbackSink(options = {}) {
     return 3080
   }
 
-  /** 单次 RPC: client-request 信封 → /api/<method>;非 ok 应答抛错。 */
+  /** 单次 RPC: 双形态 wire（dot 逐字节现行为; DSH_WIRE=slash 走 NEW 链+cookie）→ 非 ok 抛错。 */
   async function rpc(port, method, payload) {
-    const response = await doFetch(`http://127.0.0.1:${port}/api/${method}`, {
+    const wire = dshWire(method, payload, port)
+    const response = await doFetch(`http://127.0.0.1:${port}${wire.path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'client-request',
-        rpcId: randomUUID(),
-        method,
-        payload,
-      }),
+      headers: wire.headers,
+      body: JSON.stringify(wire.body),
       signal: AbortSignal.timeout(requestTimeoutMs),
     })
     let data = null
@@ -112,22 +112,17 @@ export function createLoopbackSink(options = {}) {
         console.error('host-callback-bridge session.cancel failed:', errorMessage(error))
       }
     }
-    const wire = {
-      type: 'client-request',
-      rpcId: randomUUID(),
-      method: 'session.prompt',
-      payload: {
-        sessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text }],
-      },
-    }
+    const wire = dshWire('session.prompt', {
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text }],
+    }, port)
     let response
     try {
-      response = await doFetch(`http://127.0.0.1:${port}/api/session.prompt`, {
+      response = await doFetch(`http://127.0.0.1:${port}${wire.path}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(wire),
+        headers: wire.headers,
+        body: JSON.stringify(wire.body),
         signal: AbortSignal.timeout(requestTimeoutMs),
       })
     } catch (error) {

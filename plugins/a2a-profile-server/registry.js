@@ -20,9 +20,72 @@
 // createRegistry({ fleetPath, journalPath?, loopback })
 //   loopback: async (method, payload) => value —— real.js rpc 同形制（注入；测试 mock）。
 //
+// Dual-chain wire (seatA-cut3-2, T0 探针裁决): dshWire() 把点号 method/payload 翻译成
+// 目标链线形——dot(默认)=/api/<method> payload 原样(OLD dh1-slim, 逐字节现行为);
+// DSH_WIRE=slash=/api/<ns>/<verb> + payload:{args:{request}} + 浏览器 cookie
+// (NEW rebase 链; cookie 按 client-connection/browser-auth.ts 契约自铸, secret 读
+// $DSH_HOME/.credentials.yaml 的 client-connection/browser-session, 铸败显式抛错)。
+// liveSessionIds 的 loopback 若由宿主注入则透传不分派——本 helper 只服务缺省自给路径。
+
+import { createHmac, createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { readFile, writeFile, rename, appendFile, mkdir, stat } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
+
+// ── dual-chain wire helper（seatA-cut3-2；与 host-callback-bridge/loopback-sink.js 同契约）──
+
+const B64U = (buf) => Buffer.from(buf).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
+const B64U_DEC = (s) => Buffer.from(s.replaceAll('-', '+').replaceAll('_', '/'), 'base64')
+/** 读 $DSH_HOME/.credentials.yaml 的 client-connection/browser-session secret（只读；零依赖缩进解析）。 */
+function readWireSecret(home = process.env.DSH_HOME ?? `${homedir()}/.dsh`) {
+  const file = `${home}/.credentials.yaml`
+  if (!existsSync(file)) return undefined
+  // 极简解析: 定位 client-connection/browser-session 块内 secret 行。
+  const m = readFileSync(file, 'utf8').match(/client-connection\/browser-session:[\s\S]*?secret:\s*(\S+)/)
+  return m?.[1]
+}
+
+/**
+ * 按目标链铸造浏览器会话 cookie（browser-auth.ts 契约）：
+ * name = dsh-auth-<b64url(sha256(authority))>；value = v1.<b64url(payload)>.<b64url(hmac)>，
+ * payload = {version:1, authority, issuedAt, expiresAt}，HMAC-SHA256 key = b64url-decode(secret)。
+ * 铸败（secret 缺失/形坏）显式抛错。
+ */
+function mintWireCookie(port, secretB64, now = Date.now()) {
+  if (!secretB64) throw new Error('dshWire: browser-session secret unavailable in $DSH_HOME/.credentials.yaml')
+  const secret = B64U_DEC(secretB64)
+  if (secret.length !== 32) throw new Error(`dshWire: secret must decode to 32 bytes, got ${secret.length}`)
+  const authority = `127.0.0.1:${port}`
+  const payload = { version: 1, authority, issuedAt: now, expiresAt: now + 24 * 3600 * 1000 }
+  const body = B64U(Buffer.from(JSON.stringify(payload), 'utf8'))
+  const sig = createHmac('sha256', secret).update(body).digest()
+  return `dsh-auth-${B64U(createHash('sha256').update(authority).digest())}=v1.${body}.${B64U(sig)}`
+}
+
+/**
+ * 单点 wire 翻译：dot(默认) 逐字节现行为；DSH_WIRE=slash 走新链形。
+ * @returns {path, body, headers}
+ */
+export function dshWire(method, payload, port) {
+  if (process.env.DSH_WIRE !== 'slash') {
+    return {
+      path: `/api/${method}`,
+      body: { type: 'client-request', rpcId: randomUUID(), method, payload },
+      headers: { 'content-type': 'application/json' },
+    }
+  }
+  const secret = readWireSecret()
+  const cookie = mintWireCookie(port, secret)
+  const [namespace, verb] = method.split('.')
+  return {
+    path: `/api/${namespace}/${verb}`,
+    body: { type: 'client-request', rpcId: randomUUID(), method: `${namespace}/${verb}`, payload: { args: { request: payload ?? {} } } },
+    headers: { 'content-type': 'application/json', cookie },
+  }
+}
+
 
 /** fleet 扩展五键（VO-002 孵化侧写入；本模块读写面按此对账）。 */
 export const FLEET_EXT_KEYS = ['role', 'project', 'mailbox', 'profile_version', 'spawned_at']
@@ -110,11 +173,23 @@ export function createRegistry({ fleetPath, journalPath = join(dirname(fleetPath
     return agent
   }
 
-  /** loopback session.list → 存活 sessionId 集（router 侧唯一探活通道）。 */
+  /** loopback session.list → 存活 sessionId 集（router 侧唯一探活通道）。
+   * 注入 loopback 时透传（测试 mock / 宿主定制）；缺省自给走 dshWire 双形态
+   * （DSH_WIRE=slash 时打 NEW 链并自铸 cookie，seatA-cut3-2）。 */
   async function liveSessionIds() {
-    if (!loopback) throw new Error('loopback not configured')
-    const value = await loopback('session.list', {})
-    return new Set((value?.items ?? []).map((it) => it.sessionId))
+    if (loopback) {
+      const value = await loopback('session.list', {})
+      return new Set((value?.items ?? []).map((it) => it.sessionId))
+    }
+    const wire = dshWire('session.list', {}, process.env.DSH_PORT ?? 3080)
+    const res = await fetch(`http://127.0.0.1:${process.env.DSH_PORT ?? 3080}${wire.path}`, {
+      method: 'POST',
+      headers: wire.headers,
+      body: JSON.stringify(wire.body),
+    })
+    const data = await res.json()
+    if (data?.result?.ok !== true) throw new Error(`session.list failed: ${JSON.stringify(data?.result?.error ?? res.status)}`)
+    return new Set((data.result.value?.items ?? []).map((it) => it.sessionId))
   }
 
   /**
@@ -185,7 +260,7 @@ export function createRegistry({ fleetPath, journalPath = join(dirname(fleetPath
   return {
     FLEET_EXT_KEYS,
     readFleet, writeFleet, updateEntry,
-    register, transition, reattach, heartbeat,
+    register, transition, reattach, heartbeat, liveSessionIds,
     agents: list,
   }
 }
