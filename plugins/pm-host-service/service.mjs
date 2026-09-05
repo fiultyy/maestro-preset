@@ -131,7 +131,7 @@
 // opens a ledger/sqlite for writing; writes go through maestro CLI (PM-008).
 import { createServer } from 'node:http'
 import { spawn, spawnSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { zstdDecompressSync } from 'node:zlib'
 import { accessSync, appendFileSync, chmodSync, closeSync, constants, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs'
@@ -154,6 +154,35 @@ const FLEET_FILE = process.env.MAESTRO_FLEET ?? `${ROOT}/maestro/fleet.json`
 const FLEET_LIST_BIN = process.env.PM_HOST_SERVICE_FLEET_LIST ?? `${ROOT}/maestro/bin/fleet-list`
 const DSH_PORT = process.env.DSH_PORT ?? '3080'
 const DSH_WIRE = process.env.DSH_WIRE ?? 'dot' // 'dot' = OLD dh1-slim chain; 'slash' = NEW rebase chain (T0 probe verdict)
+
+// NEW 链 browser-session cookie 自铸 (2026-09-05, 401 降级修复)。契约同
+// fleet-list/session-send-v4 (browser-auth.ts): 名 = dsh-auth-<b64url(sha256(authority))>，
+// 值 = v1.<b64url(payload)>.<b64url(HMAC-SHA256(secret, body))>。fail-open: 凭据缺失/
+// 畸形 → null → 请求照发 (NEW 宿主 401 → 走既有降级视图，绝不 crash)。缓存 12h。
+let _dshCookieCache = { v: null, at: 0 }
+function mintDshCookie() {
+  const now = Date.now()
+  if (_dshCookieCache.v && now - _dshCookieCache.at < 12 * 3600_000) return _dshCookieCache.v
+  try {
+    const credPath = `${process.env.DSH_HOME ?? homedir()}/.dsh/.credentials.yaml`
+    const m = readFileSync(credPath, 'utf8').match(/client-connection\/browser-session:[\s\S]*?secret:\s*(\S+)/)
+    if (!m) return null
+    const secret = Buffer.from(m[1], 'base64url')
+    if (secret.length !== 32) return null
+    const authority = `127.0.0.1:${DSH_PORT}`
+    const payload = { version: 1, authority, issuedAt: now, expiresAt: now + 24 * 3600_000 }
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url')
+    const sig = createHmac('sha256', secret).update(body).digest('base64url')
+    const name = 'dsh-auth-' + createHash('sha256').update(authority).digest('base64url')
+    _dshCookieCache = { v: `${name}=v1.${body}.${sig}`, at: now }
+    return _dshCookieCache.v
+  } catch { return null }
+}
+function dshHeaders(slash) { // slash 链才带 cookie (dot 宿主无鉴权闸)
+  const h = { 'content-type': 'application/json' }
+  if (slash) { const c = mintDshCookie(); if (c) h.Cookie = c }
+  return h
+}
 const SESSIONS_ROOT = process.env.DSH_SESSIONS_ROOT ?? `${ROOT}/sessions`
 const FLOWS_ROOT = process.env.MAESTRO_FLOWS_ROOT ?? `${ROOT}/maestro/flows`
 const FLOWC_BIN = process.env.PM_HOST_SERVICE_FLOWC ?? `${ROOT}/maestro/bin/flowc`
@@ -332,7 +361,7 @@ async function fetchSessionJoin() { // dsh loopback session list -> Map(sid->ses
     const slash = DSH_WIRE === 'slash'
     const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/${slash ? 'session/list' : 'session.list'}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: dshHeaders(slash),
       body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-fleet-${++joinSeq}`, method: 'session/list', payload: slash ? { args: { request: {} } } : {} }),
       signal: ctl.signal,
     })
@@ -604,10 +633,13 @@ async function fetchSessionMap() { // dsh loopback session.list -> Map(sid -> {r
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), JOIN_DSH_TIMEOUT_MS)
   try {
-    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/session.list`, {
+    // Dual-chain wire (T0 probe + 2026-09-05 补齐): 原本漏改仍纯 dot (NEW 宿主
+    // 先 401 后 404 双死), 现对齐 fetchSessionJoin 形态 + cookie。
+    const slash = DSH_WIRE === 'slash'
+    const res = await fetch(`http://127.0.0.1:${DSH_PORT}/api/${slash ? 'session/list' : 'session.list'}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-graph-${++graphJoinSeq}`, method: 'session.list', payload: {} }),
+      headers: dshHeaders(slash),
+      body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-graph-${++graphJoinSeq}`, method: slash ? 'session/list' : 'session.list', payload: slash ? { args: { request: {} } } : {} }),
       signal: ctl.signal,
     })
     if (!res.ok) throw new Error(`http ${res.status}`)
@@ -1308,7 +1340,7 @@ async function probeDsh() { // PMW2-I: liveness 探针只判活不取数。sessi
   try {
     const res = await fetch(`http://${url}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: dshHeaders(slash),
       body: JSON.stringify({ type: 'client-request', rpcId: `pm-host-service-health-${Date.now()}`, method: path, payload: slash ? { args: { request: {} } } : {} }),
       signal: ctl.signal,
     })
