@@ -81,14 +81,19 @@ function apply (ctx) {
     }
   }
 
+  // 双形态事件访问：NEW 链 Session 用 snapshotEvents()（无 .events 属性），OLD 链用 .events
+  const eventsOf = (session) =>
+    (typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : session.events) ?? []
+
   const blank = (session) =>
-    !session.events.some((e) => e?.type === 'turn/start')
+    !eventsOf(session).some((e) => e?.type === 'turn/start')
 
   /** 只读兜底：v1.1.x 写入日志的 persona/selected（已补 ignorable:true）。
    *  仅在 sessions.json 未命中时采用，绝不回写事件。 */
   const lastPersonaEvent = (session) => {
-    for (let i = session.events.length - 1; i >= 0; i -= 1) {
-      const e = session.events[i]
+    const events = eventsOf(session)
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i]
       if (e?.type === 'persona/selected') return e.data
     }
     return undefined
