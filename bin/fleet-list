@@ -23,9 +23,14 @@
 退出码: 0 = 成功 · 1 = loopback API 失败(--live/--archived) · 3 = fleet.json 缺失/损坏 · 2 = 用法错
 """
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
+import re
 import sys
+import time
 import urllib.request
 import uuid
 
@@ -51,14 +56,50 @@ def load_fleet(path):
     return data
 
 
+def _mint_cookie(port):
+    """按 client-connection/browser-auth.ts 契约铸 cookie; 铸败 die 5(seatA-cut3-2)。"""
+    cred = os.path.expanduser(os.environ.get('DSH_HOME', '~/.dsh') + '/.credentials.yaml')
+    secret_b64 = None
+    try:
+        with open(cred, encoding='utf-8') as fh:
+            m = re.search(r'client-connection/browser-session:[\s\S]*?secret:\s*(\S+)', fh.read())
+        secret_b64 = m.group(1) if m else None
+    except OSError:
+        pass
+    if not secret_b64:
+        die('slash wire 需要 $DSH_HOME/.credentials.yaml 里的 client-connection/browser-session secret', 5)
+    secret = base64.urlsafe_b64decode(secret_b64 + '=' * (-len(secret_b64) % 4))
+    if len(secret) != 32:
+        die(f'secret 须解码为 32 字节, 实得 {len(secret)}', 5)
+    authority = f'127.0.0.1:{port}'
+    now_ms = int(time.time() * 1000)
+    body = base64.urlsafe_b64encode(json.dumps(
+        {'version': 1, 'authority': authority, 'issuedAt': now_ms,
+         'expiresAt': now_ms + 24 * 3600 * 1000}).encode()).decode().rstrip('=')
+    sig = hmac.new(secret, body.encode(), hashlib.sha256).digest()
+    name = 'dsh-auth-' + base64.urlsafe_b64encode(hashlib.sha256(authority.encode()).digest()).decode().rstrip('=')
+    return name + '=v1.' + body + '.' + base64.urlsafe_b64encode(sig).decode().rstrip('=')
+
+
 def rpc(port, method, payload):
-    """loopback /api/<method> 单次调用; 失败 die 1(信封与 session-send 同款)。"""
+    """loopback 单次调用(双链 wire); 失败 die 1。
+    dot(默认)=/api/<method> payload 原样; DSH_WIRE=slash=/api/<ns>/<verb> +
+    payload {args:{request}} + cookie(NEW 链, T0 探针裁决)。"""
+    slash = os.environ.get('DSH_WIRE', 'slash') != 'dot'  # 2026-09-05 wireflip: live=NEW, slash 默认, dot=显式退路
+    if slash:
+        ns, _, verb = method.partition('.')
+        path, wire_method = f'/api/{ns}/{verb}', f'{ns}/{verb}'
+        wire_payload = {'args': {'request': payload if payload is not None else {}}}
+        headers = {'content-type': 'application/json', 'Cookie': _mint_cookie(port)}
+    else:
+        path, wire_method, wire_payload = f'/api/{method}', method, payload
+        headers = {'content-type': 'application/json'}
     wire = {'type': 'client-request', 'rpcId': str(uuid.uuid4()),
-            'method': method, 'payload': payload}
+            'method': wire_method, 'payload': wire_payload}
     req = urllib.request.Request(
-        f'http://127.0.0.1:{port}/api/{method}',
+        f'http://127.0.0.1:{port}{path}',
         data=json.dumps(wire, ensure_ascii=False).encode(),
-        headers={'content-type': 'application/json'})
+        headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read())['result']

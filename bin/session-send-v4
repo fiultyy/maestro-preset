@@ -254,12 +254,12 @@ def main() -> None:
             'content': [{'type': 'text', 'text': line}],
         }
         if slash:
-            request = dict(payload, requestId=str(uuid.uuid4()))  # NEW 契约必填（user message source.rpcId）；dot 支保持逐字节不变
+            payload = dict(payload, requestId=str(uuid.uuid4()))  # NEW session/prompt 必填 (#63; wireflip 时曾丢失, 09-05 补回)
             wire = {
                 'type': 'client-request',
                 'rpcId': str(uuid.uuid4()),
                 'method': 'session/prompt',
-                'payload': {'args': {'request': request}},
+                'payload': {'args': {'request': payload}},
             }
             headers = {'content-type': 'application/json', 'Cookie': _mint_cookie(port)}
             url = f'http://127.0.0.1:{port}/api/session/prompt'
