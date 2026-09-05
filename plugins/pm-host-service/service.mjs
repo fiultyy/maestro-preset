@@ -1281,7 +1281,10 @@ loadRegistry() // PM-008 boot recovery (flying -> interrupted) before serving
 // degrades ITS source only; the endpoint itself always answers 200.
 const CONFIG_DIR = process.env.XDG_CONFIG_HOME ?? `${homedir()}/.config`
 const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
-const HEALTH_DSH_TIMEOUT_MS = 1_000 // loopback RPC probe budget (health must stay snappy)
+// 2026-09-05: NEW 链 session/list 空 request 实测 0.94-1.6s (成本在 slim 投影,
+// limit:1 不省; detail 仅 slim|full 无更廉形态; workspace.list 已不存在) —
+// 1s 预算在边缘反复 abort → 横幅间歇常驻。slash 放宽 3s, dot 链 (ms 级) 不变。
+const HEALTH_DSH_TIMEOUT_MS = DSH_WIRE === 'slash' ? 3_000 : 1_000 // loopback RPC probe budget (health must stay snappy)
 const JOIN_DSH_TIMEOUT_MS = Number(process.env.PM_JOIN_TIMEOUT_MS) || 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness。PM_JOIN_TIMEOUT_MS 供沙箱门调参
 const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
 
