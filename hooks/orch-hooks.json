@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ORCH_DEBUG='/tmp/orch-debug-live.log' ORCH_SIG='orch-p0@session-af290650-4c34-4fb6-bc21-7cbc947bf706' ORCH_INBOX='/home/yy/.dsh/maestro/bridge/inbox.log' ORCH_INFLIGHT='/home/yy/.dsh/maestro/orch-hooks/inflight' /home/yy/.dsh/maestro/bin/ups-dispatch-watch.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "TurnEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ORCH_DEBUG='/tmp/orch-debug-live.log' ORCH_SIG='orch-p0@session-af290650-4c34-4fb6-bc21-7cbc947bf706' ORCH_INBOX='/home/yy/.dsh/maestro/bridge/inbox.log' ORCH_INFLIGHT='/home/yy/.dsh/maestro/orch-hooks/inflight' /home/yy/.dsh/maestro/bin/turn-end-pair.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
