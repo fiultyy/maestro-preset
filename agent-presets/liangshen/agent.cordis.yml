@@ -316,6 +316,10 @@
 # that reaches it shares one entry-local realm here, and a consumer left
 # outside would resolve a host registry this preset does not populate.
 #
+# NOTE 2026-09-05 (T5 post-audit): on the NEW chain (live, 0.1.2-alpha.5+) this concern is
+# obsolete - direct-child reporting is built into the subagent tool (continuable background
+# mode, live-probed) and no `tool-subagent-report` tool literal exists in NEW packages; the
+# host-plane registration caveat below is rc.2-era context kept for OLD-chain rollbacks.
 # `tool-subagent-report` is host-plane for the same reason as the registry,
 # not because a preset may not want it: it registers a CONTINUABLE SETUP on
 # that singleton rather than a tool this agent calls, and the setup list is
