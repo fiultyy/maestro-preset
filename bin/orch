@@ -439,7 +439,10 @@ def sweep_running_frames():
             continue
         to = fr.get('to')
         if to and (not sig or to != sig):
-            continue   # 寻址不符(他人帧)不消费
+            if sig and to == sig.split('@')[0]:
+                print(f'orch: WARN running 帧 to={to} 仅别名缺 @session(疑 hook 端 ORCH_SIG 未带全签名),未消费',
+                      file=sys.stderr)
+            continue   # 寻址不符(他人帧/半签帧)不消费
         ref = str(fr.get('ref') or '')
         m = re.search(r'\[task:([^\]\s]+)\]', fr.get('body') or '')
         node = None
@@ -1170,6 +1173,13 @@ def cmd_selftest(a):
                    body='[task:task_zzz] worker turn started', ref='T-006', msgid='rm3', ver=3)
         p = _orch(['status', '--ref', 'T-006', '--project', proj], env)
         c.check('S16b 错址帧(to=他人)不消费', get_node(proj, 'T-006')['status'] == 'dispatched', p.stderr)
+
+        # S16c 半签帧(裸别名缺 @session,hook 端 ORCH_SIG 退化形态) → WARN 不消费
+        push_frame(type='ticket-running', to='test-orch', **{'from': 'w4'},
+                   body='[task:task_zzz] worker turn started', ref='T-006', msgid='rm4', ver=3)
+        p = _orch(['status', '--ref', 'T-006', '--project', proj], env)
+        c.check('S16c 半签帧 WARN 且不消费', '未消费' in p.stderr
+                and get_node(proj, 'T-006')['status'] == 'dispatched', p.stderr)
 
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
