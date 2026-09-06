@@ -53,6 +53,15 @@ ORCA orchestration worker-release --dispatch <ctx>
 - 编排邮箱 send/check/ask/reply 走会话邮箱,**永不触终端输入**;要把字节打进终端 TUI 才轮到 `terminal send`。
 - 官方分界句(orca-ide guide 原文): "Use `orchestration dispatch --inject` to deliver a tracked task, or `terminal send` when an existing agent needs a free-form prompt." → **terminal send 降级条件**: 仅当 dispatch 不可用(目标非 recognized agent / `agent_unconfigured`,inject 链断)或裸 shell 自由注字。降级票无 worker_done 账,走下面的 cb-send 契约兜底;**不要建 Run/Task 壳事后伪装 orchestrated**。
 
+### recognized agent 判定与 inject 断链退化(原 orchestration-guide 已并入)
+
+- ✅ **recognized** = Orca agent-first 起的 terminal(`worktree create --agent <id>` / `worker-start --agent <id>`,claude/codex/omp/pi 等):可 `dispatch --inject` / `worker-start --terminal`。
+- ❌ **非 recognized** = 裸 agent CLI 直起的 TUI(`omp --resume <session>` 等):进程活着、能 terminal send 交互,但 Orca 不认——inject 链整条断,`dispatch --inject`/`worker-start --terminal` 报 `agent_unconfigured`("not running a recognized agent")。
+- 判定来源: `ORCA worktree ps --json` 的 `agents[].agentType`(**有值=recognized**);`terminal list --json` 的 `agentType` 常为 null,**不可单独判定**。
+- `agent_unconfigured` 唯一正确退化: `terminal send --text "<ASCII prompt>" --enter` + 手动监督——**无 dispatch provenance、无 worker_done**;严禁建 Run/Task 壳事后 `task-update` 伪装 orchestrated;要真 lifecycle 就 `worker-start --worktree <tracked> --agent <id>` 起 recognized agent,别复用裸 TUI。
+- terminal send 踩坑: 多字节 UTF-8 会失效、turn 提交键因 TUI 而异——降级注入正文尽量 ASCII;裸 git worktree 不在 Orca 树,其上 tab UI 不可见。
+- "开 N 个终端执行 X"决策树浓缩: 要监督/多票 DAG/等结果→本节正统链;只发一句/读回复不等→terminal send/read;全交接所有权(不等不盯不追踪)→orca-cli handoff。终端创建走 `ORCA terminal create`(tracked worktree 才可见)。
+
 **串行批票面工艺(两条实战教训)**:
 
 1. **基线禁 stamp 绝对 sha** —— 串行逐票落地会前移 HEAD,第二批起必然停题;票面基线一律写"本批线性链规则"(第 N 票基于第 N-1 票落定后的链头),不写 commit sha。
