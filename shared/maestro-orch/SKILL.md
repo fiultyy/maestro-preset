@@ -25,6 +25,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 | 我要… | 走哪面 | 入口 |
 |---|---|---|
+| **一次调用完成派发/收尾+自动记账**(dispatch/wait/reply/status;ledger+状态机硬机制) | **orch CLI** | `~/.dsh/maestro/bin/orch`(下节"orch 高抽象入口");免拼底层链 |
 | 结构化派发 / 要 worker_done 账 / 多票 DAG / ask 应答 | **Orca 编排面(正统)** | 下节"编排邮箱正统链" |
 | 派活给 dais GUI 里的终端 worker | **dais 面** | worker-up 三步链(下);全表 load skill `dais-orchestration` |
 | 跨面向回报(Orca 终端/dais pane/cron/任意进程 → 编排席) | **cb-send** | 契约模板(下);全表 load skill `cb-send` |
@@ -32,6 +33,20 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 | 桥死了/注册丢了 | **内部调用** | bridge-rearm(下) |
 
 **与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;本节是编排席固化的工作流(链序/禁令/票面工艺),**不缓存命令表**——旗标细节以 `skills get orchestration` 动态加载为准,与本节冲突时动态 guide 赢。
+
+## orch 高抽象入口 — 一次调用 = 一个生命周期动作(债#9×#11)
+
+`~/.dsh/maestro/bin/orch` 把正统链封装为编排席级动作,并硬机制强制 ledger 记账(规则7/8)+node/ticket 状态机+deliveryId 幂等;**默认零实弹**(测试经 `ORCH_BIN` 注 stub,`--dry-run` 打印命令序列):
+
+```bash
+orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID> [--json] [--dry-run]   # run→task→dispatch→建账(含 tickets 环)
+orch wait  [--run <run_id>]         # check --wait+自动收尾: done→ack+release+记账;escalation→ack+release,exit3;question→不动,exit2;超时→exit4 检查点
+orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;成功后重挂 wait
+orch status [--run r] [--ref r] [--json]             # run/task/ctx+ledger 节点并排(离线)
+orch selftest                       # 离线全链自测(fake stub,43 断言)
+```
+
+细节(`--force` 重复派发/`--no-ticket`/退出码表/状态机表)看 `orch --help` 与源码头注;首次实弹冒烟归编排席。
 
 ## Orca 面 — 编排邮箱正统链(派发主路径)
 

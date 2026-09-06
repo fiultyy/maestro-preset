@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""orch — Orca 编排面高抽象入口 CLI(债#9×#11):一次调用 = 一个生命周期动作 + ledger 自动建账
+用法:
+  orch dispatch --spec <file|-> [--to <handle>] [--run <run_id> | --new-run "<objective>"]
+                [--title <t>] [--ref <ref>] [--project <key|path>] [--force]
+                [--no-ticket] [--dry-run] [--json]
+  orch wait     [--run <run_id>] [--timeout-ms 1500000]
+                [--types worker_done,escalation,question] [--json]
+  orch reply    --msg <msg_id> (--body <text> | --body-file <f>) [--run <run_id>] [--json]
+  orch status   [--run <run_id>] [--ref <ref>] [--project <key|path>] [--json]
+  orch selftest                       # 离线自测(fake ORCH_BIN stub 全链走查,零实弹)
+  orch _transition --project <k> --node <id> --to <status> [--source s]
+                                      # 内部: 显式状态机迁移(自测/人工修复用)
+机制:
+  - 正统链封装(链序固化): run-create/run-use → task-create → dispatch --inject →
+    check --wait → (worker_done: check --ack + worker-release | escalation: ack+release |
+    question: 不动,等编排席 reply) ;旗标以 orca-ide 动态 guide 为准,链序以本文件为准。
+  - ledger 自动建账(编排席规则7/8 硬机制): dispatch → node(dispatched)+event;
+    收果 → node done/blocked + outcome 事件(≤300字);tickets 环(ticket add/lease/state)
+    同步勾稽 —— pm-host-service PM-003 票源 = `ledger ticket list --json`(ledger.db
+    tickets 表,db 签名是 freshness authority),写 tickets 环 pm-web 票面才自然更新。
+  - 状态机在代码里强制(node status 为准): dispatched→{running,blocked};
+    running→{done,failed,blocked};blocked→{running,done,failed};done/failed 终态;
+    同态重写=幂等 no-op;表外流转一律拒绝(exit 1)。ledger ticket 侧另有内置状态机,
+    本工具按其迁移表求最短合法路径逐步迁移,拒绝即 fail-loud。
+  - 幂等: deliveryId 记账于 <state>/orch-deliveries.json(原子写),重复 wait 收到同一
+    delivery 不二次 ack/收尾/记账;同一 ref 重复 dispatch 默认拒(--force 放行并记 duplicate)。
+  - 零实弹默认: 所有 orca-ide 调用可经 ORCH_BIN 注入 stub;--dry-run 只打印命令序列,
+    零 orca/ledger 写路径调用。实弹冒烟归编排席。
+  - fail-loud(ops 工具非 hook): 失败非零退出 + 明确 stderr,不静默吞;不打印任何 token/secret。
+环境:
+  ORCH_BIN          覆盖 orca CLI(测试 stub 注入口;最高优先)
+  ORCA_CLI_COMMAND  orca CLI 覆盖(既有惯例,次优先)
+  (缺省)            /opt/Orca/resources/bin/orca-ide —— 绝对禁止裸调 `orca`(GNOME 读屏器)
+  MAESTRO_HOME      默认 ~/.dsh;maestro 面 = $MAESTRO_HOME/maestro
+  MAESTRO_LEDGER    ledger.db 路径覆盖(透传给 ledger CLI,自测隔离用)
+  ORCH_STATE_DIR    状态文件目录覆盖(默认 <maestro>/state;自测隔离用)
+退出码: 0 成功 · 1 状态机/重复拒绝 · 2 question(等裁决) · 3 escalation(已 ack+release)
+        4 超时检查点(不记失败) · 5 运行失败 · 64 用法错误
+"""
+import argparse, json, os, sqlite3, subprocess, sys, tempfile
+from datetime import datetime, timezone
+
+# ── 路径与 CLI 解析 ───────────────────────────────────────────────────────────
+MAESTRO_HOME = os.environ.get('MAESTRO_HOME', os.path.expanduser('~/.dsh'))
+MAESTRO_DIR = os.path.join(MAESTRO_HOME, 'maestro')
+LEDGER_BIN = os.path.join(MAESTRO_DIR, 'bin', 'ledger')
+DB = os.environ.get('MAESTRO_LEDGER', os.path.join(MAESTRO_DIR, 'ledger.db'))
+STATE_DIR = os.environ.get('ORCH_STATE_DIR', os.path.join(MAESTRO_DIR, 'state'))
+DEFAULT_ORCA = '/opt/Orca/resources/bin/orca-ide'
+
+def orca_bin():
+    return os.environ.get('ORCH_BIN') or os.environ.get('ORCA_CLI_COMMAND') or DEFAULT_ORCA
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+def die(msg, code=1):
+    print(f'orch: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+def require_ledger():
+    if not os.path.isfile(LEDGER_BIN):
+        die(f'ledger CLI 不存在: {LEDGER_BIN}(编排面未部署?)', 5)
+
+# ── 状态机(硬机制,代码强制) ──────────────────────────────────────────────────
+# node 侧(ledger nodes.status,本工具强制;ledger 本体对 node 不设状态机):
+NODE_TRANSITIONS = {
+    'dispatched': {'running', 'blocked'},
+    'running':    {'done', 'failed', 'blocked'},
+    'blocked':    {'running', 'done', 'failed'},
+    'done':       set(),
+    'failed':     set(),
+}
+NODE_TERMINAL = {'done', 'failed'}
+# ticket 侧(ledger 内置状态机,~/.dsh/maestro/bin/ledger TICKET_TRANSITIONS 的镜像;
+# 镜像仅用于求最短合法路径,真实校验仍由 ledger 拒绝兜底 —— 漂移即 fail-loud):
+TICKET_TRANSITIONS = {
+    'dispatched':  {'running', 'rejected'},
+    'running':     {'blocked', 'done', 'rejected'},
+    'blocked':     {'running', 'done', 'rejected'},
+    'done':        {'running', 'merged', 'rejected'},
+    'merged':      {'rolled-back'},
+    'rejected':    set(),
+    'rolled-back': set(),
+}
+
+def check_node_transition(cur, nxt):
+    """严格单边校验(_transition 手工迁移用): 同态=幂等 no-op;表外流转拒绝。"""
+    if cur == nxt:
+        return 'noop'
+    if nxt not in NODE_TRANSITIONS.get(cur, set()):
+        die(f"非法状态流转: {cur} -> {nxt}(合法: {', '.join(sorted(NODE_TRANSITIONS.get(cur, set()))) or '无(终态)'})", 1)
+    return 'ok'
+
+def _bfs_path(transitions, cur, target):
+    """BFS 最短合法路径;重构止于 cur(不含起点),不可达返回 None,同态 []。"""
+    if cur == target:
+        return []
+    from collections import deque
+    q, prev = deque([cur]), {cur: None}
+    while q:
+        s = q.popleft()
+        for t in transitions.get(s, set()):
+            if t in prev:
+                continue
+            prev[t] = s
+            if t == target:
+                chain = [t]
+                while chain[-1] != cur:          # 回溯到起点为止
+                    chain.append(prev[chain[-1]])
+                return list(reversed(chain[:-1]))  # 丢掉起点: 步序表只含迁移目标
+            q.append(t)
+    return None
+
+def ticket_path(cur, target):
+    """ledger ticket 状态机最短合法路径(镜像表求导;真校验仍由 ledger 拒绝兜底)。"""
+    return _bfs_path(TICKET_TRANSITIONS, cur, target)
+
+def node_path(cur, target):
+    """node 状态机最短合法路径(wait 收尾自动补中间态用)。"""
+    return _bfs_path(NODE_TRANSITIONS, cur, target)
+
+# ── 原子状态文件(幂等账: deliveries / last-run) ──────────────────────────────
+def _atomic_write_json(path, data):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.orch-state-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except (json.JSONDecodeError, OSError) as e:
+        die(f'状态文件损坏: {path}: {e}', 5)
+
+def state_file(name):
+    return os.path.join(STATE_DIR, name)
+
+def load_deliveries():
+    return _read_json(state_file('orch-deliveries.json'), {})
+
+def delivery_seen(run, delivery_id):
+    return delivery_id in load_deliveries().get(run, {})
+
+def record_delivery(run, delivery_id, mtype, outcome):
+    data = load_deliveries()
+    data.setdefault(run, {})[delivery_id] = {'type': mtype, 'outcome': (outcome or '')[:300], 'at': now()}
+    _atomic_write_json(state_file('orch-deliveries.json'), data)
+
+def load_last_run():
+    return _read_json(state_file('orch-last-run.json'), None)
+
+def save_last_run(rec):
+    rec = dict(rec)
+    rec['updated_at'] = now()
+    _atomic_write_json(state_file('orch-last-run.json'), rec)
+
+# ── orca-ide 调用(命令序列可 dry-run 打印) ────────────────────────────────────
+PLAN = []   # dry-run 收集将执行的命令序列
+
+def plan(cmd_argv):
+    PLAN.append(cmd_argv)
+    print('[dry] ' + ' '.join(cmd_argv), file=sys.stderr)
+
+def run_orca(argv, timeout=90):
+    """执行 orca CLI 子命令(argv 为去二进制的参数表);返回 (rc, stdout, stderr)。"""
+    cmd = [orca_bin(), *argv]
+    if os.environ.get('ORCH_DRYRUN'):   # dry-run 深度:只打印不执行
+        plan(cmd)
+        return 0, '', ''
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        die(f'orca CLI 不可执行: {orca_bin()}(检查 ORCH_BIN/ORCA_CLI_COMMAND 或安装面)', 5)
+    except subprocess.TimeoutExpired:
+        die(f'orca CLI 超时: {" ".join(cmd)}', 5)
+
+def orca_json(argv, what, timeout=90):
+    """执行并解析 --json 输出;失败 fail-loud(exit 5)。"""
+    rc, out, err = run_orca(argv + ['--json'], timeout=timeout)
+    if rc != 0:
+        die(f'{what} 失败(rc={rc}): {(err or out).strip()[:400]}', 5)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        die(f'{what} 输出非 JSON: {(out or err).strip()[:400]}', 5)
+
+# ── 灵活字段提取(orca-ide JSON 形态以键名优先+值模式双路匹配) ─────────────────
+def _walk(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k, v
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+def find_prefixed(doc, prefix):
+    """递归找首个以 prefix 开头的字符串值(run_/task_/ctx_ 等)。"""
+    for _k, v in _walk(doc):
+        if isinstance(v, str) and v.startswith(prefix):
+            return v
+    return None
+
+def find_key(doc, *names):
+    """递归找首个命中键名的值(键名优先,大小写/下标不敏感)。"""
+    want = {n.lower() for n in names}
+    for k, v in _walk(doc):
+        if isinstance(k, str) and k.lower() in want and v not in (None, '', [], {}):
+            return v
+    return None
+
+def find_delivery_id(doc):
+    v = find_key(doc, 'deliveryId', 'delivery_id', 'delivery')
+    return v if isinstance(v, str) else None
+
+def find_messages(doc):
+    v = find_key(doc, 'messages')
+    if isinstance(v, list):
+        return [m for m in v if isinstance(m, dict)]
+    # 扁平形态: doc 本身就是单条消息
+    if isinstance(doc, dict) and 'type' in doc and ('id' in doc or 'body' in doc):
+        return [doc]
+    return []
+
+def msg_payload_dict(msg):
+    p = msg.get('payload', msg.get('body'))
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except json.JSONDecodeError:
+            return {}
+    return p if isinstance(p, dict) else {}
+
+# ── ledger 调用(复用既有工具,零直写) ─────────────────────────────────────────
+def run_ledger(args, check=True):
+    require_ledger()
+    cmd = [sys.executable, LEDGER_BIN, *args]
+    if os.environ.get('ORCH_DRYRUN'):
+        plan(cmd)
+        return ''
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if check and p.returncode != 0:
+        die(f'ledger {" ".join(args[:2])} 失败(rc={p.returncode}): {(p.stderr or p.stdout).strip()[:400]}', 5)
+    return p.stdout
+
+def read_only_db():
+    """只读连接(读路径不建 schema 不落锁,同 ledger 读侧纪律)。"""
+    return sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
+
+def resolve_project_key(ident):
+    """复刻 ledger resolve_project 语义(只读): key 或 path → key。找不到返回 None。"""
+    try:
+        c = read_only_db()
+    except sqlite3.OperationalError as e:
+        die(f'ledger.db 不可读: {e}', 5)
+    try:
+        row = c.execute("SELECT key FROM projects WHERE key=? OR path=?", (ident, ident)).fetchone()
+        return row[0] if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+
+def get_node(project_ident, node_id):
+    """只读取 node 行;无表/无行返回 None。"""
+    key = resolve_project_key(project_ident)
+    if not key:
+        return None
+    try:
+        c = read_only_db()
+        row = c.execute("SELECT node_id,kind,title,status,owner,refs,updated_at FROM nodes WHERE project_key=? AND node_id=?",
+                        (key, node_id)).fetchone()
+        return dict(zip(['node_id', 'kind', 'title', 'status', 'owner', 'refs', 'updated_at'], row)) if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+
+def find_node_by_run(run_id):
+    """跨项目按 refs.run 找 orch 节点(wait 无 last-run 时兜底)。"""
+    try:
+        c = read_only_db()
+        rows = c.execute("SELECT project_key,node_id,kind,title,status,refs FROM nodes WHERE refs LIKE ?",
+                         (f'%{run_id}%',)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+    for r in rows:
+        try:
+            refs = json.loads(r[5] or '{}')
+        except json.JSONDecodeError:
+            continue
+        if refs.get('run') == run_id:
+            return {'project': r[0], 'node_id': r[1], 'kind': r[2], 'title': r[3], 'status': r[4], 'refs': refs}
+    return None
+
+def get_ticket(tid):
+    try:
+        c = read_only_db()
+        row = c.execute("SELECT ticket_id,state,lease_owner FROM tickets WHERE ticket_id=?", (tid,)).fetchone()
+        return {'state': row[1], 'lease_owner': row[2]} if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+
+def ticket_exists(tid):
+    try:
+        c = read_only_db()
+        return c.execute("SELECT 1 FROM tickets WHERE ticket_id=?", (tid,)).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        c.close()
+
+# ── node/ticket 迁移执行(先查现态,同态幂等) ──────────────────────────────────
+def node_transition(project, node_id, to_status, event_type, detail, source='orch', auto_path=False):
+    """node 状态机迁移: 查现态 → 校验 → ledger node upsert + event。
+    auto_path=False(手工/_transition): 严格单边,表外即拒(状态机硬门)。
+    auto_path=True(wait 收尾记账): 允许自动补中间态(worker_done 先于 running 观测到达时
+    dispatched→running→done 补齐),每步均合法,事件只记目标一步;同态=幂等 no-op 零写。"""
+    row = get_node(project, node_id)
+    if not row:
+        die(f'node 不存在: {node_id} @ {project}(先 orch dispatch 建账)', 1)
+    cur = row['status']
+    if cur == to_status:
+        return f'noop({cur})'
+    if auto_path:
+        path = node_path(cur, to_status)
+        if path is None:
+            die(f"非法状态流转: {cur} -> {to_status}(状态机无路径)", 1)
+    else:
+        check_node_transition(cur, to_status)
+        path = [to_status]
+    for i, step in enumerate(path):
+        run_ledger(['node', project, node_id, row['kind'], row['title'] or node_id, step,
+                    '--owner', row['owner'] or '', '--refs', row['refs'] or '{}'])
+        if i == len(path) - 1:
+            run_ledger(['event', project, node_id, event_type, f'{cur} -> {to_status} | {detail}', '--source', source])
+    return f'{cur} -> {to_status}'
+
+def _transition_cmd(a):
+    """内部显式迁移(自测/人工修复)。kind/title 取现行,不外泄写路径细节。"""
+    row = get_node(a.project, a.node)
+    if not row:
+        die(f'node 不存在: {a.node} @ {a.project}', 1)
+    res = node_transition(a.project, a.node, a.to, 'state', f'manual/_transition (source={a.source})', source=a.source)
+    print(f'{a.node}: {res}')
+
+def ticket_transition(tid, target, source='orch'):
+    """ticket 状态机: 求最短合法路径逐步迁移;票不存在则跳过(返回 None)。"""
+    row = get_ticket(tid)
+    if row is None:
+        return None
+    path = ticket_path(row['state'], target)
+    if path is None:
+        die(f"ticket 状态机无路径: {tid} {row['state']} -> {target}", 1)
+    for step in path:
+        run_ledger(['ticket', 'state', tid, step, '--source', source])
+
+# ── 终端发现(缺 --to 时给选择面) ──────────────────────────────────────────────
+def list_connected_terminals():
+    doc = orca_json(['terminal', 'list'], 'terminal list')
+    items = doc if isinstance(doc, list) else find_key(doc, 'terminals') or []
+    out = []
+    for t in items:
+        if not isinstance(t, dict):
+            continue
+        conn = t.get('connected', t.get('connected'))
+        if conn is True or (isinstance(conn, str) and conn.lower() == 'true'):
+            out.append({'id': t.get('id') or t.get('terminal') or t.get('handle'), 'title': t.get('title') or ''})
+    return [t for t in out if t['id']]
+
+def die_no_target():
+    terms = list_connected_terminals()
+    lines = '\n'.join(f"  {t['id']}  {t['title']}" for t in terms) or '  (无 connected 终端)'
+    die(f'缺 --to 目标。活体 terminal(connected:true):\n{lines}\n→ orch dispatch --to <handle> ...', 64)
+
+# ── 子命令: dispatch ─────────────────────────────────────────────────────────
+def cmd_dispatch(a):
+    if a.spec == '-':
+        spec = sys.stdin.read()
+    else:
+        try:
+            with open(a.spec, encoding='utf-8') as f:
+                spec = f.read()
+        except OSError as e:
+            die(f'--spec 不可读: {e}', 64)
+    if not spec.strip():
+        die('--spec 内容为空', 64)
+    if not a.to and not a.dry_run:
+        die_no_target()
+    if bool(a.run) == bool(a.new_run):
+        die('--run <run_id> 与 --new-run "<objective>" 二选一', 64)
+
+    title = a.title or (a.ref or '').strip() or ' '.join(spec.strip().splitlines()[0].split())[:60] or 'orch task'
+
+    # 1. run 绑定/创建
+    if a.new_run:
+        if a.dry_run:
+            plan([orca_bin(), 'orchestration', 'run-create', '--objective', a.new_run, '--json'])
+            run_id = '<run_id>'
+        else:
+            doc = orca_json(['orchestration', 'run-create', '--objective', a.new_run], 'run-create')
+            run_id = (find_key(doc, 'runId', 'run_id', 'run') if isinstance(find_key(doc, 'runId', 'run_id', 'run'), str)
+                      else find_prefixed(doc, 'run_'))
+            if not run_id:
+                die(f'run-create 输出无 run id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
+    else:
+        run_id = a.run
+        if a.dry_run:
+            plan([orca_bin(), 'orchestration', 'run-use', '--id', run_id, '--json'])
+        else:
+            orca_json(['orchestration', 'run-use', '--id', run_id], 'run-use')
+
+    # 2. task-create
+    if a.dry_run:
+        plan([orca_bin(), 'orchestration', 'task-create', '--spec', spec, '--task-title', title,
+              '--run', run_id, '--json'])
+        task_id = '<task_id>'
+    else:
+        doc = orca_json(['orchestration', 'task-create', '--spec', spec, '--task-title', title, '--run', run_id],
+                        'task-create')
+        task_id = (find_key(doc, 'taskId', 'task_id', 'task') if isinstance(find_key(doc, 'taskId', 'task_id', 'task'), str)
+                   else find_prefixed(doc, 'task_'))
+        if not task_id:
+            die(f'task-create 输出无 task id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
+
+    # 3. dispatch --inject
+    if a.dry_run:
+        plan([orca_bin(), 'orchestration', 'dispatch', '--task', task_id, '--to', a.to or '<handle>',
+              '--inject', '--json'])
+        ctx = '<ctx_id>'
+    else:
+        doc = orca_json(['orchestration', 'dispatch', '--task', task_id, '--to', a.to, '--inject'], 'dispatch')
+        ctx = (find_key(doc, 'dispatchId', 'dispatch_id', 'ctx', 'dispatch')
+               if isinstance(find_key(doc, 'dispatchId', 'dispatch_id', 'ctx', 'dispatch'), str)
+               else find_prefixed(doc, 'ctx_'))
+        if not ctx:
+            die(f'dispatch 输出无 ctx id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
+
+    if a.dry_run:
+        sys.exit(0)
+
+    # 4. ledger 自动建账(编排席规则7: 派发→node dispatched+事件;tickets 环勾稽 #11)
+    project = a.project or os.getcwd()
+    node_id = a.ref or task_id
+    refs = {'run': run_id, 'task': task_id, 'dispatch': ctx, 'to': a.to}
+    if a.ref:
+        refs['ref'] = a.ref
+    refs_json = json.dumps(refs, ensure_ascii=False)
+
+    if resolve_project_key(project) is None:   # 项目未登记才补注册(幂等 upsert)
+        run_ledger(['project', project, os.path.basename(str(project).rstrip('/')) or 'proj'])
+    cur = get_node(project, node_id)
+    duplicate = False
+    if cur and cur['status'] not in NODE_TERMINAL:
+        if not a.force:
+            die(f"重复派发拒绝: node {node_id} 现态 {cur['status']}(--force 放行并记 duplicate)", 1)
+        duplicate = True
+    run_ledger(['node', project, node_id, 'dispatch', title, 'dispatched', '--owner', a.to or '', '--refs', refs_json])
+    run_ledger(['event', project, node_id, 'dispatched',
+                f'orch dispatch -> {a.to} ctx={ctx} run={run_id} task={task_id}'
+                + (' | duplicate(--force)' if duplicate else ''),
+                '--source', 'orch'])
+    # tickets 环(#11): 票源=ledger.db tickets 表(PM-003),写它 pm-web 才更新
+    ticket_note = ''
+    if a.ref and not a.no_ticket:
+        if not ticket_exists(a.ref):
+            run_ledger(['ticket', 'add', a.ref, title, '--source', 'orch', '--refs', refs_json])
+        run_ledger(['ticket', 'lease', a.ref, a.to, '--source', 'orch'])
+        ticket_note = f'ticket {a.ref} +lease({a.to})'
+
+    save_last_run({'run': run_id, 'project': project, 'node': node_id, 'ref': a.ref,
+                   'task': task_id, 'ctx': ctx, 'to': a.to, 'title': title})
+    summary = {'run': run_id, 'task': task_id, 'ctx': ctx, 'node': node_id,
+               'project': project, 'to': a.to, 'duplicate': duplicate}
+    if a.json:
+        print(json.dumps(summary, ensure_ascii=False))
+    else:
+        print(f"dispatched: {node_id} -> {a.to} (run={run_id} task={task_id} ctx={ctx})"
+              + (' [duplicate]' if duplicate else ''))
+        if ticket_note:
+            print(ticket_note)
+        print(f"下一步: orch wait --run {run_id}")
+
+# ── 子命令: wait ─────────────────────────────────────────────────────────────
+def settle_node(project, node_id, to_status, event_type, detail):
+    """收果记账(规则8): node 迁移(自动补 running 中间态已由路径求导覆盖 node 侧表)+
+    ≤300字 outcome 事件。node 迁移被拒(如终态后再收果) → WARN 跳过,不阻塞 ack/release。"""
+    try:
+        res = node_transition(project, node_id, to_status, event_type, detail[:300], auto_path=True)
+        return res
+    except SystemExit as e:
+        print(f'orch: WARN ledger node 记账跳过({e.code}): {node_id}', file=sys.stderr)
+        return None
+
+def resolve_wait_target(a):
+    run = a.run
+    rec = None
+    if not run:
+        rec = load_last_run()
+        if not rec or not rec.get('run'):
+            die('缺 --run 且无 last-run 记录(先 orch dispatch,或显式 --run)', 64)
+        run = rec['run']
+    project, node_id, ref = a.project, None, None
+    if not project:
+        if rec and rec.get('project'):
+            project, node_id, ref = rec['project'], rec.get('node'), rec.get('ref')
+        else:
+            hit = find_node_by_run(run)
+            if hit:
+                project, node_id = hit['project'], hit['node_id']
+                ref = (hit.get('refs') or {}).get('ref')
+    if not project:
+        project = os.getcwd()
+    if node_id and not get_node(project, node_id):
+        node_id = None   # last-run 指向的节点已被清库等: 退化为按 refs 兜底
+    if not node_id:
+        hit = find_node_by_run(run)
+        if hit:
+            project, node_id = hit['project'], hit['node_id']
+            ref = ref or (hit.get('refs') or {}).get('ref')
+    return run, project, node_id, ref
+
+def settle_message(msg, run, project, node_id, ref, top_delivery):
+    """单条消息收尾。次序硬约定: 先 ledger 记账(失败 exit5,orca 侧未动,可整链重放)
+    → 再 ack(fail-loud) → release(WARN) → 记幂等账(deliveryId)。
+    返回 (action, exit_code_contrib)。action ∈ done|escalation|question|status|skip。"""
+    mtype = (msg.get('type') or '').strip()
+    delivery_id = top_delivery or find_delivery_id(msg) or (str(msg['id']) if msg.get('id') else '')
+    payload = msg_payload_dict(msg)
+    ctx = payload.get('dispatchId') or payload.get('dispatch') or (load_last_run() or {}).get('ctx')
+    outcome = str(payload.get('outcome') or msg.get('subject') or '')[:300]
+
+    if delivery_id and delivery_seen(run, delivery_id):
+        print(f'already settled, skip: {delivery_id} ({mtype})')
+        return ('skip', 0)
+
+    if mtype == 'worker_done':
+        if project and node_id:
+            settle_node(project, node_id, 'done', 'worker_done', outcome or f'delivery={delivery_id}')
+        if ref:
+            ticket_transition(ref, 'done')
+            if get_ticket(ref) and get_ticket(ref)['lease_owner']:
+                run_ledger(['ticket', 'lease', ref, '--release', '--source', 'orch'])
+        if delivery_id:
+            orca_json(['orchestration', 'check', '--ack', delivery_id, '--run', run],
+                      f'check --ack {delivery_id}')
+        if ctx:
+            rc, _, err = run_orca(['orchestration', 'worker-release', '--dispatch', ctx])
+            if rc != 0:
+                print(f'orch: WARN worker-release 失败(rc={rc}): {(err or "").strip()[:200]}(账已记 done)', file=sys.stderr)
+        if delivery_id:
+            record_delivery(run, delivery_id, mtype, outcome)
+        print(f"worker_done 收口: node={'done' if node_id else '?'} delivery={delivery_id} outcome={outcome[:80]}")
+        return ('done', 0)
+
+    if mtype == 'escalation':
+        if project and node_id:
+            settle_node(project, node_id, 'blocked', 'escalation', outcome or f'delivery={delivery_id}')
+        if ref:
+            ticket_transition(ref, 'blocked')
+        if delivery_id:
+            orca_json(['orchestration', 'check', '--ack', delivery_id, '--run', run],
+                      f'check --ack {delivery_id}')
+        if ctx:
+            run_orca(['orchestration', 'worker-release', '--dispatch', ctx])
+        if delivery_id:
+            record_delivery(run, delivery_id, mtype, outcome)
+        print(f'escalation: 已 ack+release, node=blocked, 需编排席介入. outcome={outcome[:80]}')
+        return ('escalation', 3)
+
+    if mtype == 'question':
+        # 不动 orca 侧(不 ack 不 release,等编排席裁决);只记账 blocked
+        if project and node_id:
+            settle_node(project, node_id, 'blocked', 'question', outcome or msg.get('subject') or '')
+        if ref:
+            ticket_transition(ref, 'blocked')
+        msg_id = msg.get('id') or ''
+        print(f'question 待裁决: msg_id={msg_id}')
+        print(f'  应答: orch reply --msg {msg_id} --body "<text>" --run {run}')
+        print(f'  然后重挂: orch wait --run {run}')
+        return ('question', 2)
+
+    # status/heartbeat/未知类型: ack 即可,不动账
+    if delivery_id:
+        rc, _, err = run_orca(['orchestration', 'check', '--ack', delivery_id, '--run', run])
+        if rc != 0:
+            print(f'orch: WARN ack 失败(rc={rc}): {(err or "").strip()[:200]}', file=sys.stderr)
+        else:
+            record_delivery(run, delivery_id, mtype, outcome)
+    print(f'{mtype or "unknown"}: ack, 账不动')
+    return ('status', 0)
+
+def cmd_wait(a):
+    run, project, node_id, ref = resolve_wait_target(a)
+    types = a.types
+    argv = ['orchestration', 'check', '--wait', '--run', run, '--types', types,
+            '--timeout-ms', str(a.timeout_ms)]
+    rc, out, err = run_orca(argv + ['--json'], timeout=a.timeout_ms / 1000.0 + 30)
+    if rc != 0:
+        blob = (err or out or '').strip()
+        if not blob or any(k in blob.lower() for k in ('timeout', 'timed out', 'deadline', '超时')):
+            print(f'checkpoint: check --wait 超时/无消息(rc={rc}),续滚: orch wait --run {run}', file=sys.stderr)
+            sys.exit(4)
+        die(f'check --wait 失败(rc={rc}): {blob[:400]}', 5)
+    if not out.strip():
+        print(f'checkpoint: 无消息返回,续滚: orch wait --run {run}', file=sys.stderr)
+        sys.exit(4)
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        die(f'check --wait 输出非 JSON: {out.strip()[:400]}', 5)
+    delivery_id = find_delivery_id(doc)
+    messages = find_messages(doc)
+    if not messages:
+        print(f'checkpoint: delivery={delivery_id or "?"} 无消息,续滚: orch wait --run {run}', file=sys.stderr)
+        sys.exit(4)
+    worst, actions = 0, []
+    for msg in messages:
+        action, code = settle_message(msg, run, project, node_id, ref, delivery_id)
+        actions.append(action)
+        worst = max(worst, code)
+    if a.json:
+        print(json.dumps({'run': run, 'delivery': delivery_id, 'actions': actions, 'exit': worst,
+                          'project': project, 'node': node_id}, ensure_ascii=False))
+    sys.exit(worst)
+
+# ── 子命令: reply ────────────────────────────────────────────────────────────
+def cmd_reply(a):
+    if bool(a.body) == bool(a.body_file):
+        die('--body <text> 与 --body-file <f> 二选一', 64)
+    body = a.body
+    if a.body_file:
+        try:
+            with open(a.body_file, encoding='utf-8') as f:
+                body = f.read()
+        except OSError as e:
+            die(f'--body-file 不可读: {e}', 64)
+    run = a.run
+    if not run:
+        rec = load_last_run()
+        if not rec or not rec.get('run'):
+            die('缺 --run 且无 last-run 记录', 64)
+        run = rec['run']
+    if a.dry_run:
+        plan([orca_bin(), 'orchestration', 'reply', '--id', a.msg, '--body', body, '--run', run, '--json'])
+        return
+    orca_json(['orchestration', 'reply', '--id', a.msg, '--body', body, '--run', run], 'reply')
+    print(f'replied: {a.msg} (run={run})')
+    print(f'重挂: orch wait --run {run} 收后续 worker_done')
+
+# ── 子命令: status(离线合并视图: node 生命周期 + refs(run/task/ctx) 并排) ─────
+def cmd_status(a):
+    project = a.project or os.getcwd()
+    key = resolve_project_key(project)
+    rows = []
+    if key:
+        try:
+            c = read_only_db()
+            sql = ("SELECT node_id,kind,title,status,owner,refs,updated_at FROM nodes "
+                   "WHERE project_key=?")
+            params = [key]
+            if a.ref:
+                sql += ' AND node_id=?'
+                params.append(a.ref)
+            sql += ' ORDER BY updated_at DESC'
+            rows = c.execute(sql, params).fetchall()
+            evmap = {}
+            for nid, in c.execute("SELECT DISTINCT node_id FROM events WHERE project_key=?", (key,)):
+                evmap[nid] = c.execute(
+                    "SELECT ts,event_type,detail FROM events WHERE project_key=? AND node_id=? ORDER BY id DESC LIMIT 3",
+                    (key, nid)).fetchall()
+        except sqlite3.OperationalError as e:
+            die(f'ledger.db 读失败: {e}', 5)
+        finally:
+            c.close()
+    out, shown = [], 0
+    last = load_last_run()
+    for r in rows:
+        node_id, kind, title, status, owner, refs_raw, updated = r
+        try:
+            refs = json.loads(refs_raw or '{}')
+        except json.JSONDecodeError:
+            refs = {}
+        if a.run and refs.get('run') != a.run:
+            continue
+        shown += 1
+        if a.json:
+            out.append({'node': node_id, 'kind': kind, 'status': status, 'owner': owner,
+                        'title': title, 'updated_at': updated, 'refs': refs,
+                        'events': [{'ts': e[0], 'type': e[1], 'detail': e[2]} for e in evmap.get(node_id, [])]})
+        else:
+            print(f"{status:<12} {node_id:<20} {kind:<9} owner={owner or '—'} {updated}")
+            print(f"  title: {title or '—'}")
+            print(f"  refs : run={refs.get('run', '—')} task={refs.get('task', '—')} "
+                  f"ctx={refs.get('dispatch', '—')} to={refs.get('to', '—')}")
+            if last and last.get('node') == node_id:
+                print(f"  last-run 指针: run={last.get('run')} ctx={last.get('ctx')} to={last.get('to')}")
+            for e in evmap.get(node_id, []):
+                print(f"  · [{e[0][5:16]}] {e[1]}: {str(e[2])[:90]}")
+    if not shown:
+        print(f'(无匹配节点: project={project}' + (f' run={a.run}' if a.run else '') + (f' ref={a.ref}' if a.ref else '') + ')')
+        if last:
+            print(f"last-run 指针: run={last.get('run')} node={last.get('node')} project={last.get('project')}")
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+
+# ── 子命令: selftest(离线全链走查,fake ORCH_BIN stub,零实弹) ─────────────────
+SELFTEST_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+log = os.environ['ORCH_FAKE_LOG']
+with open(log, 'a') as f:
+    f.write(json.dumps(argv, ensure_ascii=False) + '\n')
+def out(doc):
+    print(json.dumps(doc, ensure_ascii=False))
+if argv[:2] == ['terminal', 'list']:
+    out({'terminals': [{'id': 'term_a', 'title': 'A', 'connected': True},
+                       {'id': 'term_b', 'title': 'B', 'connected': False}]})
+elif argv[:2] == ['orchestration', 'run-create']:
+    n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
+    open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
+    rid = f'run_fake{n}'
+    out({'run': rid, 'runId': rid, 'id': rid, 'objective': 'x'})
+elif argv[:2] == ['orchestration', 'run-use']:
+    rid = argv[argv.index('--id') + 1]
+    out({'ok': True, 'run': rid})
+elif argv[:2] == ['orchestration', 'task-create']:
+    n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
+    open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
+    tid = f'task_fake{n}'
+    out({'task': tid, 'taskId': tid, 'id': tid})
+elif argv[:2] == ['orchestration', 'dispatch']:
+    n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
+    open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
+    cid = f'ctx_fake{n}'
+    out({'ctx': cid, 'dispatchId': cid, 'injected': True})
+elif argv[:2] == ['orchestration', 'check'] and '--wait' in argv:
+    fx = os.environ.get('ORCH_FAKE_DELIVERY')
+    if not fx:
+        sys.stderr.write('check --wait: timed out after 100ms\n')
+        sys.exit(124)
+    sys.stdout.write(open(fx).read())
+elif argv[:2] == ['orchestration', 'check'] and '--ack' in argv:
+    with open(os.environ['ORCH_FAKE_ACKS'], 'a') as f:
+        f.write(argv[argv.index('--ack') + 1] + '\n')
+    out({'ok': True})
+elif argv[:2] == ['orchestration', 'worker-release']:
+    with open(os.environ['ORCH_FAKE_RELEASES'], 'a') as f:
+        f.write(argv[argv.index('--dispatch') + 1] + '\n')
+    out({'ok': True})
+elif argv[:2] == ['orchestration', 'reply']:
+    with open(os.environ['ORCH_FAKE_REPLIES'], 'a') as f:
+        f.write(json.dumps({'id': argv[argv.index('--id') + 1], 'run': argv[argv.index('--run') + 1]}) + '\n')
+    out({'ok': True})
+else:
+    sys.stderr.write('fake-orca: 未模拟: ' + ' '.join(argv) + '\n')
+    sys.exit(9)
+'''
+
+class Case:
+    def __init__(self):
+        self.n_pass = 0
+        self.n_fail = 0
+    def check(self, name, cond, hint=''):
+        tag = 'PASS' if cond else 'FAIL'
+        print(f'  [{tag}] {name}' + (f' — {hint}' if hint and not cond else ''))
+        if cond:
+            self.n_pass += 1
+        else:
+            self.n_fail += 1
+        return cond
+
+def _orch(args, env, cwd=None):
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                       capture_output=True, text=True, timeout=120, env=env, cwd=cwd)
+    return p
+
+def cmd_selftest(a):
+    global DB   # 父进程断言用例(get_node/get_ticket)必须与子进程同库,防误读真账
+    import shutil
+    tmp = tempfile.mkdtemp(prefix='orch-selftest-')
+    c = Case()
+    print(f'== orch selftest(离线,零实弹) sandbox={tmp}')
+    try:
+        # 环境隔离: fake orca + 独立 ledger.db + 独立 state
+        bindir = os.path.join(tmp, 'bin')
+        os.makedirs(bindir)
+        stub = os.path.join(bindir, 'fake-orca')
+        with open(stub, 'w') as f:
+            f.write(SELFTEST_STUB)
+        os.chmod(stub, 0o755)
+        db = os.path.join(tmp, 'ledger.db')
+        # 生产 schema 镜像(只建表不落数据;ledger 写路径所需)
+        con = sqlite3.connect(db)
+        con.executescript("""
+          CREATE TABLE IF NOT EXISTS projects(
+            key TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL,
+            repo_id TEXT, status TEXT NOT NULL DEFAULT 'unknown', summary TEXT, updated_at TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS nodes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project_key TEXT NOT NULL, node_id TEXT NOT NULL,
+            kind TEXT NOT NULL, title TEXT, status TEXT NOT NULL DEFAULT 'pending', owner TEXT,
+            refs TEXT, updated_at TEXT NOT NULL, UNIQUE(project_key, node_id));
+          CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, project_key TEXT,
+            node_id TEXT, event_type TEXT NOT NULL, source TEXT, detail TEXT);
+        """)
+        con.commit()
+        con.close()
+        DB = db
+        proj = os.path.join(tmp, 'proj')
+        os.makedirs(proj)
+        with open(os.path.join(proj, 'spec.md'), 'w') as f:
+            f.write('实现某功能\n细节若干行\n')
+        env = dict(os.environ)
+        env.update(ORCH_BIN=stub, MAESTRO_LEDGER=db, ORCH_STATE_DIR=os.path.join(tmp, 'state'),
+                   ORCH_FAKE_LOG=os.path.join(tmp, 'calls.log'), ORCH_FAKE_SEQ=os.path.join(tmp, 'seq'),
+                   ORCH_FAKE_ACKS=os.path.join(tmp, 'acks.log'), ORCH_FAKE_RELEASES=os.path.join(tmp, 'releases.log'),
+                   ORCH_FAKE_REPLIES=os.path.join(tmp, 'replies.log'))
+        open(env['ORCH_FAKE_SEQ'], 'w').write('0')
+
+        def calls():
+            try:
+                return [json.loads(l) for l in open(env['ORCH_FAKE_LOG'])]
+            except FileNotFoundError:
+                return []
+        def resetspy():
+            for f in ('ORCH_FAKE_LOG', 'ORCH_FAKE_ACKS', 'ORCH_FAKE_RELEASES', 'ORCH_FAKE_REPLIES'):
+                if os.path.exists(env[f]):
+                    os.unlink(env[f])
+
+        def delivery(messages, delivery_id):
+            fx = os.path.join(tmp, f'dlv-{delivery_id}.json')
+            with open(fx, 'w') as f:
+                json.dump({'deliveryId': delivery_id, 'messages': messages}, f, ensure_ascii=False)
+            return fx
+
+        # S1 dispatch 全链建账
+        resetspy()
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a',
+                   '--new-run', '做某事', '--ref', 'T-001', '--project', proj, '--json'], env, cwd=proj)
+        ok = p.returncode == 0
+        c.check('S1 dispatch 全链 rc=0', ok, p.stderr)
+        try:
+            s = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:
+            s = {}
+        c.check('S1 摘要含 run/task/ctx', s.get('run', '').startswith('run_fake')
+                and s.get('task', '').startswith('task_fake') and s.get('ctx', '').startswith('ctx_fake'), p.stdout)
+        node = get_node(proj, 'T-001')
+        refs_ok = all((json.loads(node['refs'] or '{}')).get(k)
+                      for k in ('run', 'task', 'dispatch', 'to')) if node else False
+        c.check('S1 node dispatched+refs 全量', bool(node) and node['status'] == 'dispatched' and refs_ok,
+                json.dumps(node, ensure_ascii=False))
+        c.check('S1 ticket add+lease', get_ticket('T-001') == {'state': 'dispatched', 'lease_owner': 'term_a'},
+                str(get_ticket('T-001')))
+        c.check('S1 orca 链序 run→task→dispatch', [x[:2] for x in calls()].count(['orchestration', 'run-create']) == 1
+                and [x[:2] for x in calls()].count(['orchestration', 'task-create']) == 1
+                and [x[:2] for x in calls()].count(['orchestration', 'dispatch']) == 1, str(calls()))
+
+        # S2 缺 --to → 列活体并拒
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'x', '--project', proj], env)
+        c.check('S2 缺 --to 拒绝 exit=64 且列出 term_a', p.returncode == 64 and 'term_a' in p.stderr, p.stderr)
+
+        # S3 重复 dispatch 拒 / --force 放
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--run', s['run'],
+                   '--ref', 'T-001', '--project', proj], env)
+        c.check('S3 重复 dispatch 默认拒 exit=1', p.returncode == 1, p.stderr)
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--run', s['run'],
+                   '--ref', 'T-001', '--project', proj, '--force'], env)
+        c.check('S3 --force 放行 rc=0', p.returncode == 0, p.stderr)
+        con = sqlite3.connect(db)
+        dup = con.execute("SELECT COUNT(*) FROM events WHERE node_id='T-001' AND detail LIKE '%duplicate(--force)%'").fetchone()[0]
+        con.close()
+        c.check('S3 duplicate 已记账', dup >= 1)
+
+        # S4 wait worker_done → ack+release+node done+ticket done+lease release
+        resetspy()
+        fx = delivery([{'id': 'm1', 'type': 'worker_done',
+                        'payload': json.dumps({'taskId': s['task'], 'dispatchId': s['ctx'], 'outcome': '全部落地'})}],
+                      'dlv_1')
+        env['ORCH_FAKE_DELIVERY'] = fx
+        p = _orch(['wait', '--run', s['run']], env)
+        c.check('S4 worker_done rc=0', p.returncode == 0, p.stderr + p.stdout)
+        c.check('S4 node done', get_node(proj, 'T-001')['status'] == 'done')
+        c.check('S4 ticket done+lease 释放', get_ticket('T-001') == {'state': 'done', 'lease_owner': None},
+                str(get_ticket('T-001')))
+        c.check('S4 ack 恰一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
+        c.check('S4 release 恰一次 ctx', open(env['ORCH_FAKE_RELEASES']).read().split() == [s['ctx']],
+                open(env['ORCH_FAKE_RELEASES']).read())
+        # S5 幂等重放: 同 delivery 再 wait 不二次 ack/记账
+        p = _orch(['wait', '--run', s['run']], env)
+        c.check('S5 重放 rc=0 且 skip', p.returncode == 0 and 'already settled' in p.stdout, p.stdout + p.stderr)
+        c.check('S5 ack 仍一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
+        c.check('S5 node 仍 done(未重复迁移)', get_node(proj, 'T-001')['status'] == 'done')
+
+        # S6 question → 不 ack, node/ticket blocked, 打印 reply 模板
+        resetspy()
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'q',
+                   '--ref', 'T-002', '--project', proj, '--json'], env)
+        s2 = json.loads(p.stdout.strip().splitlines()[-1])
+        fx = delivery([{'id': 'm2', 'type': 'question', 'subject': '用 A 还是 B?', 'payload': ''}], 'dlv_2')
+        env['ORCH_FAKE_DELIVERY'] = fx
+        p = _orch(['wait', '--run', s2['run'], '--json'], env)
+        c.check('S6 question rc=2', p.returncode == 2, p.stdout + p.stderr)
+        acks = open(env['ORCH_FAKE_ACKS']).read().split() if os.path.exists(env['ORCH_FAKE_ACKS']) else []
+        c.check('S6 不 ack', 'dlv_2' not in acks and not acks, str(acks))
+        c.check('S6 node blocked', get_node(proj, 'T-002')['status'] == 'blocked')
+        c.check('S6 ticket blocked', get_ticket('T-002')['state'] == 'blocked', str(get_ticket('T-002')))
+        c.check('S6 打印 reply 模板', f"orch reply --msg m2" in p.stdout and 'wait' in p.stdout, p.stdout)
+
+        # S7 escalation → ack+release+blocked, rc=3
+        resetspy()
+        fx = delivery([{'id': 'm3', 'type': 'escalation', 'payload': json.dumps({'dispatchId': s2['ctx'],
+                                                                                'outcome': '卡在依赖'})}], 'dlv_3')
+        env['ORCH_FAKE_DELIVERY'] = fx
+        p = _orch(['wait', '--run', s2['run']], env)
+        c.check('S7 escalation rc=3', p.returncode == 3, p.stdout + p.stderr)
+        c.check('S7 已 ack', 'dlv_3' in open(env['ORCH_FAKE_ACKS']).read().split())
+        c.check('S7 已 release', s2['ctx'] in open(env['ORCH_FAKE_RELEASES']).read().split())
+        c.check('S7 node blocked', get_node(proj, 'T-002')['status'] == 'blocked')
+
+        # S8 超时 → checkpoint rc=4, 账不动
+        resetspy()
+        env.pop('ORCH_FAKE_DELIVERY')
+        p = _orch(['wait', '--run', s2['run']], env)
+        c.check('S8 超时 checkpoint rc=4', p.returncode == 4, p.stdout + p.stderr)
+        c.check('S8 零 ack', not os.path.exists(env['ORCH_FAKE_ACKS']))
+        c.check('S8 node 态不变(blocked)', get_node(proj, 'T-002')['status'] == 'blocked')
+
+        # S9/S10 状态机: 非法拒/合法链通/同态幂等
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'm',
+                   '--ref', 'T-003', '--project', proj, '--json'], env)
+        c.check('S9 前置 dispatch T-003 rc=0', p.returncode == 0, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
+        c.check('S9 dispatched→done 非法拒绝 exit=1', p.returncode == 1 and '非法状态流转' in p.stderr, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'running'], env)
+        c.check('S10 dispatched→running 合法 rc=0', p.returncode == 0, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
+        c.check('S10 running→done 合法 rc=0', p.returncode == 0, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
+        c.check('S10 同态重写幂等 no-op rc=0', p.returncode == 0 and 'noop' in p.stdout, p.stdout)
+
+        # S11 reply → stub 记录 + 提示重挂
+        resetspy()
+        p = _orch(['reply', '--msg', 'm2', '--body', '选 A', '--run', s2['run']], env)
+        c.check('S11 reply rc=0 + 重挂提示', p.returncode == 0 and 'wait' in p.stdout, p.stdout + p.stderr)
+        rep = [json.loads(l) for l in open(env['ORCH_FAKE_REPLIES'])]
+        c.check('S11 reply 抵达 stub', len(rep) == 1 and rep[0]['id'] == 'm2', str(rep))
+
+        # S12 dry-run: 打印命令序列,零写路径调用(spec 走 stdin '-')
+        resetspy()
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), 'dispatch', '--spec', '-', '--to',
+                            'term_a', '--new-run', 'dry', '--ref', 'T-DRY', '--project', proj, '--dry-run'],
+                           input='dry spec\n', capture_output=True, text=True, timeout=60, env=env, cwd=proj)
+        c.check('S12 dry-run rc=0 且打印 [dry] 序列', p.returncode == 0 and '[dry]' in p.stderr, p.stderr)
+        c.check('S12 零 stub 写路径调用', calls() == [], str(calls()))
+        c.check('S12 dry-run 未落账', get_node(proj, 'T-DRY') is None)
+
+        # S13 status 合并视图
+        p = _orch(['status', '--ref', 'T-002', '--project', proj], env)
+        c.check('S13 status 含 node 态+refs', p.returncode == 0 and 'T-002' in p.stdout
+                and 'blocked' in p.stdout and 'run=' in p.stdout, p.stdout)
+        p = _orch(['status', '--project', proj, '--json'], env)
+        try:
+            rows = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:
+            rows = []
+        c.check('S13 --json 结构化', isinstance(rows, list) and len(rows) >= 3
+                and all('refs' in r for r in rows), p.stdout[:200])
+
+        # S14 同 run 不同 delivery 正常处理(幂等按 deliveryId 键,不误吞)
+        resetspy()
+        fx = delivery([{'id': 'm4', 'type': 'worker_done',
+                        'payload': json.dumps({'dispatchId': 'ctx_x', 'outcome': 'S14'})}], 'dlv_4')
+        env['ORCH_FAKE_DELIVERY'] = fx
+        p = _orch(['wait', '--run', s2['run']], env)
+        c.check('S14 新 delivery 正常收口 rc=0', p.returncode == 0, p.stdout + p.stderr)
+        c.check('S14 ack 到位', 'dlv_4' in open(env['ORCH_FAKE_ACKS']).read().split())
+
+        print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
+        return 0 if c.n_fail == 0 else 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# ── 参数面 ────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(prog='orch', description='Orca 编排面高抽象入口(债#9×#11)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('dispatch', help='run绑定/创建→task→dispatch→ledger 建账,一次调用全链')
+    p.add_argument('--spec', required=True, help='任务正文文件路径或 - (stdin)')
+    p.add_argument('--to', help='目标 terminal handle(缺省时列出活体终端并退出)')
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('--run', help='续用既有 run')
+    g.add_argument('--new-run', help='新建 run,值为 objective 文本')
+    p.add_argument('--title', help='task/票标题(默认 ref 或 spec 首行)')
+    p.add_argument('--ref', help='业务票号(node/ticket id;缺省用 task_id,且不写 tickets 环)')
+    p.add_argument('--project', help='项目 key 或路径(默认 cwd)')
+    p.add_argument('--force', action='store_true', help='重复派发放行(记 duplicate)')
+    p.add_argument('--no-ticket', action='store_true', help='跳过 tickets 环(不写 pm-web 票面)')
+    p.add_argument('--dry-run', action='store_true', help='只打印命令序列,零执行')
+    p.add_argument('--json', action='store_true', help='机器可读摘要')
+    p.set_defaults(f=cmd_dispatch)
+    p = sub.add_parser('wait', help='check --wait + 收到即自动收尾(ack/release/记账)')
+    p.add_argument('--run', help='run id(缺省用 last-run 指针)')
+    p.add_argument('--timeout-ms', type=int, default=1500000)
+    p.add_argument('--types', default='worker_done,escalation,question')
+    p.add_argument('--project', help='覆盖项目解析(默认 last-run/refs 兜底)')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(f=cmd_wait)
+    p = sub.add_parser('reply', help='应答 question;成功后提示重挂 wait')
+    p.add_argument('--msg', required=True, help='message id')
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('--body')
+    g.add_argument('--body-file')
+    p.add_argument('--run')
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(f=cmd_reply)
+    p = sub.add_parser('status', help='run/task/dispatch 生命周期 + ledger 节点并排(离线)')
+    p.add_argument('--run')
+    p.add_argument('--ref')
+    p.add_argument('--project')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(f=cmd_status)
+    p = sub.add_parser('selftest', help='离线自测(fake ORCH_BIN stub 全链走查)')
+    p.set_defaults(f=cmd_selftest)
+    p = sub.add_parser('_transition', help=argparse.SUPPRESS)
+    p.add_argument('--project', required=True)
+    p.add_argument('--node', required=True)
+    p.add_argument('--to', required=True)
+    p.add_argument('--source', default='orch')
+    p.set_defaults(f=_transition_cmd)
+    a = ap.parse_args()
+    a.f(a)
+
+if __name__ == '__main__':
+    main()
