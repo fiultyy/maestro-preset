@@ -43,6 +43,8 @@ orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID
 orch wait  [--run <run_id>]         # check --wait+自动收尾: done→ack+release+记账;escalation→ack+release,exit3;question→不动,exit2;超时→exit4 检查点
 orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;成功后重挂 wait
 orch status [--run r] [--ref r] [--json]             # run/task/ctx+ledger 节点并排(离线)
+# wait/status 进门兼收 running 帧(worker hook sidecar <maestro>/orch-hooks/running.log):
+# ticket-running → dispatch 节点 dispatched→running(幂等,现态非 dispatched 跳过)
 orch selftest                       # 离线全链自测(fake stub,43 断言)
 ```
 

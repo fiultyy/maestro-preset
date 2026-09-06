@@ -23,6 +23,10 @@
     running→{done,failed,blocked};blocked→{running,done,failed};done/failed 终态;
     同态重写=幂等 no-op;表外流转一律拒绝(exit 1)。ledger ticket 侧另有内置状态机,
     本工具按其迁移表求最短合法路径逐步迁移,拒绝即 fail-loud。
+  - running 帧消费(orch-hooks sidecar,worker 侧 turn-start hook 产出;桥 inbox 不涉及):
+    wait/status 进门先 tail 增量(字节游标,原子推进)收 type=ticket-running 帧 →
+    dispatch 节点(及 ticket 环)dispatched→running;寻址(to==ORCH_SIG)+ref/task 双路
+    解析(ref→node_id;task_*→refs.task;body [task:..] 兜底)+现态幂等(已 running/done 跳过)。
   - 幂等: deliveryId 记账于 <state>/orch-deliveries.json(原子写),重复 wait 收到同一
     delivery 不二次 ack/收尾/记账;同一 ref 重复 dispatch 默认拒(--force 放行并记 duplicate)。
   - 零实弹默认: 所有 orca-ide 调用可经 ORCH_BIN 注入 stub;--dry-run 只打印命令序列,
@@ -35,10 +39,12 @@
   MAESTRO_HOME      默认 ~/.dsh;maestro 面 = $MAESTRO_HOME/maestro
   MAESTRO_LEDGER    ledger.db 路径覆盖(透传给 ledger CLI,自测隔离用)
   ORCH_STATE_DIR    状态文件目录覆盖(默认 <maestro>/state;自测隔离用)
+  ORCH_RUNNING_LOG  running 帧 sidecar 覆盖(默认 <maestro>/orch-hooks/running.log)
+  ORCH_SIG          本席签名(to 寻址匹配;缺省 MAESTRO_ORCH_SIGNATURE 或 bridge/orch.signature)
 退出码: 0 成功 · 1 状态机/重复拒绝 · 2 question(等裁决) · 3 escalation(已 ack+release)
         4 超时检查点(不记失败) · 5 运行失败 · 64 用法错误
 """
-import argparse, json, os, sqlite3, subprocess, sys, tempfile
+import argparse, json, os, re, sqlite3, subprocess, sys, tempfile
 from datetime import datetime, timezone
 
 # ── 路径与 CLI 解析 ───────────────────────────────────────────────────────────
@@ -48,6 +54,8 @@ LEDGER_BIN = os.path.join(MAESTRO_DIR, 'bin', 'ledger')
 DB = os.environ.get('MAESTRO_LEDGER', os.path.join(MAESTRO_DIR, 'ledger.db'))
 STATE_DIR = os.environ.get('ORCH_STATE_DIR', os.path.join(MAESTRO_DIR, 'state'))
 DEFAULT_ORCA = '/opt/Orca/resources/bin/orca-ide'
+# running 帧 sidecar(worker 侧 turn-start hook 追加;桥 inbox 不涉及 running 帧):
+RUNNING_LOG = os.environ.get('ORCH_RUNNING_LOG', os.path.join(MAESTRO_DIR, 'orch-hooks', 'running.log'))
 
 def orca_bin():
     return os.environ.get('ORCH_BIN') or os.environ.get('ORCA_CLI_COMMAND') or DEFAULT_ORCA
@@ -329,6 +337,127 @@ def ticket_exists(tid):
         return False
     finally:
         c.close()
+
+# ── running 帧消费(orch-hooks sidecar → dispatch 节点 running 段记账) ─────────
+# worker 侧 turn-start hook(编排席维护)对 dispatch 注入票发 {"type":"ticket-running",
+# "from":<worker session>,"to":ORCH_SIG,"body":"[task:task_..] worker turn started…",
+# "ref":<ref,不可得则 task_id>,"msgid","ts","ver":3} 到 <maestro>/orch-hooks/running.log。
+# CLI 消费形态: wait/status 进门先 tail 增量(字节游标,原子推进),寻址校验+双路解析
+# (ref→node_id;task_*→refs.task)→ 仅 dispatched 现态迁 running(node+ticket 环),
+# 已 running/done 等一律幂等跳过。游标+现态双保险,同帧/同 task 不重复记账。
+
+def orch_sig():
+    sig = os.environ.get('ORCH_SIG') or os.environ.get('MAESTRO_ORCH_SIGNATURE')
+    if sig:
+        return sig.strip()
+    try:
+        with open(os.path.join(MAESTRO_DIR, 'bridge', 'orch.signature'), encoding='utf-8') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+def _node_hit(r):
+    try:
+        refs = json.loads(r[3] or '{}')
+    except json.JSONDecodeError:
+        refs = {}
+    return {'project': r[0], 'node_id': r[1], 'status': r[2], 'refs': refs}
+
+def find_dispatch_node(ref=None, task_id=None):
+    """跨项目找 dispatch 节点: ref→node_id 精确;task_id→refs.task(LIKE 预滤+python 精核)。
+    多命中取 updated_at 最新;无命中 None。"""
+    try:
+        c = read_only_db()
+    except sqlite3.OperationalError as e:
+        die(f'ledger.db 不可读: {e}', 5)
+    try:
+        if ref:
+            rows = c.execute("SELECT project_key,node_id,status,refs FROM nodes "
+                             "WHERE node_id=? AND kind='dispatch' ORDER BY updated_at DESC", (ref,)).fetchall()
+            if rows:
+                return _node_hit(rows[0])
+        if task_id:
+            cands = c.execute("SELECT project_key,node_id,status,refs FROM nodes "
+                              "WHERE kind='dispatch' AND refs LIKE ? ORDER BY updated_at DESC",
+                              (f'%{task_id}%',)).fetchall()
+            for r in cands:
+                hit = _node_hit(r)
+                if hit['refs'].get('task') == task_id:
+                    return hit
+        return None
+    finally:
+        c.close()
+
+def book_running(node, frame_from, note):
+    """仅 dispatched 现态迁 running(node+ticket 环);已 running/done 等幂等跳过。"""
+    nid, project, refs = node['node_id'], node['project'], node['refs'] or {}
+    if node['status'] == 'running':
+        return f'running 帧幂等跳过(已 running): {nid}'
+    if node['status'] != 'dispatched':
+        return f'running 帧跳过(现态 {node["status"]},晚帧不追): {nid}'
+    node_transition(project, nid, 'running', 'running',
+                    f'worker turn started | from={frame_from} | {note[:200]}')
+    tref = refs.get('ref')
+    if tref:
+        row = get_ticket(tref)
+        if row and row['state'] == 'dispatched':
+            run_ledger(['ticket', 'state', tref, 'running', '--source', 'orch'])
+    return f'running: {nid} (from={frame_from})'
+
+def sweep_running_frames():
+    """tail 增量消费 running.log(字节游标存 orch-running-cursor.json,原子推进);
+    半行(写入中)留给下次;截断/轮转从头重扫(现态幂等兜底)。返回动作说明列表。"""
+    results = []
+    if not os.path.isfile(RUNNING_LOG):
+        return results
+    cur_map = _read_json(state_file('orch-running-cursor.json'), {})
+    off = cur_map.get(RUNNING_LOG, 0)
+    try:
+        size = os.path.getsize(RUNNING_LOG)
+    except OSError:
+        return results
+    if size < off:
+        off = 0
+    with open(RUNNING_LOG, 'rb') as f:
+        f.seek(off)
+        blob = f.read()
+    if not blob:
+        return results
+    pieces = blob.split(b'\n')
+    if blob.endswith(b'\n'):
+        complete, processed = pieces[:-1], off + len(blob)
+    else:
+        complete = pieces[:-1]
+        processed = off + (len(blob) - len(pieces[-1])) if pieces[:-1] else off
+    sig = orch_sig()
+    for raw in complete:
+        try:
+            fr = json.loads(raw.decode('utf-8', errors='replace'))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(fr, dict) or fr.get('type') != 'ticket-running':
+            continue
+        to = fr.get('to')
+        if to and (not sig or to != sig):
+            continue   # 寻址不符(他人帧)不消费
+        ref = str(fr.get('ref') or '')
+        m = re.search(r'\[task:([^\]\s]+)\]', fr.get('body') or '')
+        node = None
+        if ref and not ref.startswith('task_'):
+            node = find_dispatch_node(ref=ref)
+        if node is None:
+            tid = ref if ref.startswith('task_') else (m.group(1) if m else '')
+            if tid:
+                node = find_dispatch_node(task_id=tid)
+        if node is None:
+            results.append(f'running 帧跳过(无匹配节点): ref={ref or "-"}')
+            continue
+        results.append(book_running(node, str(fr.get('from') or '-'),
+                                    f'{fr.get("body") or ""} msgid={fr.get("msgid", "-")}'))
+    if processed > off:
+        cur_map[RUNNING_LOG] = processed
+        _atomic_write_json(state_file('orch-running-cursor.json'), cur_map)
+    return results
 
 # ── node/ticket 迁移执行(先查现态,同态幂等) ──────────────────────────────────
 def node_transition(project, node_id, to_status, event_type, detail, source='orch', auto_path=False):
@@ -612,10 +741,14 @@ def settle_message(msg, run, project, node_id, ref, top_delivery):
 
 def cmd_wait(a):
     run, project, node_id, ref = resolve_wait_target(a)
+    for line in sweep_running_frames():   # 进门先收 running 帧(hook sidecar)
+        print(f'orch: {line}', file=sys.stderr)
     types = a.types
     argv = ['orchestration', 'check', '--wait', '--run', run, '--types', types,
             '--timeout-ms', str(a.timeout_ms)]
     rc, out, err = run_orca(argv + ['--json'], timeout=a.timeout_ms / 1000.0 + 30)
+    for line in sweep_running_frames():   # 阻塞期间到达的帧一并收掉
+        print(f'orch: {line}', file=sys.stderr)
     if rc != 0:
         blob = (err or out or '').strip()
         if not blob or any(k in blob.lower() for k in ('timeout', 'timed out', 'deadline', '超时')):
@@ -670,6 +803,8 @@ def cmd_reply(a):
 
 # ── 子命令: status(离线合并视图: node 生命周期 + refs(run/task/ctx) 并排) ─────
 def cmd_status(a):
+    for line in sweep_running_frames():   # 只读视图也顺手收 running 帧(幂等合法流转)
+        print(f'orch: {line}', file=sys.stderr)
     project = a.project or os.getcwd()
     key = resolve_project_key(project)
     rows = []
@@ -831,8 +966,11 @@ def cmd_selftest(a):
         os.makedirs(proj)
         with open(os.path.join(proj, 'spec.md'), 'w') as f:
             f.write('实现某功能\n细节若干行\n')
+        runlog = os.path.join(tmp, 'running.log')
+        open(runlog, 'w').close()
         env = dict(os.environ)
         env.update(ORCH_BIN=stub, MAESTRO_LEDGER=db, ORCH_STATE_DIR=os.path.join(tmp, 'state'),
+                   ORCH_RUNNING_LOG=runlog, ORCH_SIG='test-orch@test-session',
                    ORCH_FAKE_LOG=os.path.join(tmp, 'calls.log'), ORCH_FAKE_SEQ=os.path.join(tmp, 'seq'),
                    ORCH_FAKE_ACKS=os.path.join(tmp, 'acks.log'), ORCH_FAKE_RELEASES=os.path.join(tmp, 'releases.log'),
                    ORCH_FAKE_REPLIES=os.path.join(tmp, 'replies.log'))
@@ -997,6 +1135,42 @@ def cmd_selftest(a):
         c.check('S14 新 delivery 正常收口 rc=0', p.returncode == 0, p.stdout + p.stderr)
         c.check('S14 ack 到位', 'dlv_4' in open(env['ORCH_FAKE_ACKS']).read().split())
 
+        # S15/S16 running 帧消费(orch-hooks sidecar;契约形态见 docstring)
+        def push_frame(**kw):
+            with open(env['ORCH_RUNNING_LOG'], 'a') as f:
+                f.write(json.dumps(kw, ensure_ascii=False) + '\n')
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'r15',
+                   '--ref', 'T-004', '--project', proj, '--json'], env)
+        s4 = json.loads(p.stdout.strip().splitlines()[-1])
+        push_frame(type='ticket-running', to='test-orch@test-session', **{'from': 'worker-sess-1'},
+                   body=f"[task:{s4['task']}] worker turn started (dispatch-injected) session=worker-sess-1",
+                   ref=s4['task'], msgid='rm1', ts='t', ver=3)
+        p = _orch(['status', '--ref', 'T-004', '--project', proj], env)
+        c.check('S15 running 帧 node→running', get_node(proj, 'T-004')['status'] == 'running', p.stderr)
+        c.check('S15 ticket→running', (get_ticket('T-004') or {}).get('state') == 'running', str(get_ticket('T-004')))
+        push_frame(type='ticket-running', to='test-orch@test-session', **{'from': 'worker-sess-1'},
+                   body=f"[task:{s4['task']}] worker turn started", ref=s4['task'], msgid='rm1', ts='t', ver=3)
+        p = _orch(['status', '--ref', 'T-004', '--project', proj], env)
+        con = sqlite3.connect(db)
+        n_run_ev = con.execute("SELECT COUNT(*) FROM events WHERE node_id='T-004' AND event_type='running'").fetchone()[0]
+        con.close()
+        c.check('S15 幂等: 重复帧/已 running 不重记', n_run_ev == 1, f'running 事件数={n_run_ev}')
+
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'r16a',
+                   '--ref', 'T-005', '--project', proj, '--json'], env)
+        s5 = json.loads(p.stdout.strip().splitlines()[-1])
+        push_frame(type='ticket-running', to='test-orch@test-session', **{'from': 'w2'},
+                   body=f"[task:{s5['task']}] worker turn started", msgid='rm2', ver=3)   # 无 ref 字段
+        p = _orch(['status', '--ref', 'T-005', '--project', proj], env)
+        c.check('S16a ref 缺失走 body-task 兜底', get_node(proj, 'T-005')['status'] == 'running', p.stderr)
+
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'r16b',
+                   '--ref', 'T-006', '--project', proj, '--json'], env)
+        push_frame(type='ticket-running', to='other-orch@other-session', **{'from': 'w3'},
+                   body='[task:task_zzz] worker turn started', ref='T-006', msgid='rm3', ver=3)
+        p = _orch(['status', '--ref', 'T-006', '--project', proj], env)
+        c.check('S16b 错址帧(to=他人)不消费', get_node(proj, 'T-006')['status'] == 'dispatched', p.stderr)
+
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
     finally:
@@ -1020,7 +1194,7 @@ def main():
     p.add_argument('--dry-run', action='store_true', help='只打印命令序列,零执行')
     p.add_argument('--json', action='store_true', help='机器可读摘要')
     p.set_defaults(f=cmd_dispatch)
-    p = sub.add_parser('wait', help='check --wait + 收到即自动收尾(ack/release/记账)')
+    p = sub.add_parser('wait', help='check --wait + 收到即自动收尾(ack/release/记账);进门兼收 running 帧')
     p.add_argument('--run', help='run id(缺省用 last-run 指针)')
     p.add_argument('--timeout-ms', type=int, default=1500000)
     p.add_argument('--types', default='worker_done,escalation,question')
@@ -1036,7 +1210,7 @@ def main():
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--json', action='store_true')
     p.set_defaults(f=cmd_reply)
-    p = sub.add_parser('status', help='run/task/dispatch 生命周期 + ledger 节点并排(离线)')
+    p = sub.add_parser('status', help='run/task/dispatch 生命周期 + ledger 节点并排(离线);进门兼收 running 帧')
     p.add_argument('--run')
     p.add_argument('--ref')
     p.add_argument('--project')
