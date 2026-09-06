@@ -300,6 +300,20 @@ def get_node(project_ident, node_id):
     finally:
         c.close()
 
+def refs_as_dict(raw):
+    """refs 字段安全归一(实测定界: 账内存有 list/标量/null 字面量/非 JSON 多形态):
+    dict→原样;list/标量(None 字面量解析出非 dict 等)→{}+WARN;SQL NULL/空→{} 无 WARN;
+    坏 JSON→{}+WARN。绝不 raise,坏值原样进 WARN 由调用方渲染,不中断。"""
+    if raw is None or raw == '':
+        return {}, None
+    try:
+        v = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}, f'refs 非 JSON: {str(raw)[:60]!r}'
+    if isinstance(v, dict):
+        return v, None
+    return {}, f'refs 为 {type(v).__name__} 非 dict: {str(raw)[:60]}'
+
 def find_node_by_run(run_id):
     """跨项目按 refs.run 找 orch 节点(wait 无 last-run 时兜底)。"""
     try:
@@ -311,10 +325,7 @@ def find_node_by_run(run_id):
     finally:
         c.close()
     for r in rows:
-        try:
-            refs = json.loads(r[5] or '{}')
-        except json.JSONDecodeError:
-            continue
+        refs, _warn = refs_as_dict(r[5])
         if refs.get('run') == run_id:
             return {'project': r[0], 'node_id': r[1], 'kind': r[2], 'title': r[3], 'status': r[4], 'refs': refs}
     return None
@@ -357,10 +368,7 @@ def orch_sig():
         return None
 
 def _node_hit(r):
-    try:
-        refs = json.loads(r[3] or '{}')
-    except json.JSONDecodeError:
-        refs = {}
+    refs, _warn = refs_as_dict(r[3])
     return {'project': r[0], 'node_id': r[1], 'status': r[2], 'refs': refs}
 
 def find_dispatch_node(ref=None, task_id=None):
@@ -835,22 +843,23 @@ def cmd_status(a):
     last = load_last_run()
     for r in rows:
         node_id, kind, title, status, owner, refs_raw, updated = r
-        try:
-            refs = json.loads(refs_raw or '{}')
-        except json.JSONDecodeError:
-            refs = {}
+        refs, rwarn = refs_as_dict(refs_raw)   # list/标量/坏JSON 归一 {} + WARN,绝不崩
         if a.run and refs.get('run') != a.run:
             continue
         shown += 1
         if a.json:
             out.append({'node': node_id, 'kind': kind, 'status': status, 'owner': owner,
                         'title': title, 'updated_at': updated, 'refs': refs,
+                        'refs_warn': rwarn,
                         'events': [{'ts': e[0], 'type': e[1], 'detail': e[2]} for e in evmap.get(node_id, [])]})
         else:
             print(f"{status:<12} {node_id:<20} {kind:<9} owner={owner or '—'} {updated}")
             print(f"  title: {title or '—'}")
+            if rwarn:
+                print(f"orch: WARN {node_id}: {rwarn}(原样: {str(refs_raw)[:80]})", file=sys.stderr)
             print(f"  refs : run={refs.get('run', '—')} task={refs.get('task', '—')} "
-                  f"ctx={refs.get('dispatch', '—')} to={refs.get('to', '—')}")
+                  f"ctx={refs.get('dispatch', '—')} to={refs.get('to', '—')}"
+                  + (" [!异常形态,见 WARN]" if rwarn else ''))
             if last and last.get('node') == node_id:
                 print(f"  last-run 指针: run={last.get('run')} ctx={last.get('ctx')} to={last.get('to')}")
             for e in evmap.get(node_id, []):
@@ -1180,6 +1189,25 @@ def cmd_selftest(a):
         p = _orch(['status', '--ref', 'T-006', '--project', proj], env)
         c.check('S16c 半签帧 WARN 且不消费', '未消费' in p.stderr
                 and get_node(proj, 'T-006')['status'] == 'dispatched', p.stderr)
+
+        # S17 refs 异形态防御(实测定界: 账内存有 list/null 字面量/坏JSON/SQL NULL)
+        con = sqlite3.connect(db)
+        for nid, refs_val in (('BAD-LIST', '["flow:x","run_fake0"]'), ('BAD-NULLLIT', 'null'),
+                              ('BAD-STR', 'not-json{'), ('BAD-NULL', None)):
+            con.execute("INSERT INTO nodes(project_key,node_id,kind,title,status,owner,refs,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)", (proj, nid, 'session', f'bad {nid}', 'running', None, refs_val, 't'))
+        con.commit()
+        con.close()
+        p = _orch(['status', '--project', proj], env)
+        c.check('S17 status 全量渲染不崩 rc=0', p.returncode == 0, p.stderr[-300:])
+        c.check('S17 坏行 WARN×3 不中断且好行照渲', p.stderr.count('WARN') >= 3
+                and 'BAD-LIST' in p.stdout and 'BAD-NULL' in p.stdout, p.stderr[-300:])
+        p = _orch(['status', '--project', proj, '--json'], env)
+        c.check('S17 --json 亦不崩且带 refs_warn', p.returncode == 0 and '"refs_warn"' in p.stdout, p.stdout[:120])
+        # S17b wait 解析面(find_node_by_run 扫到 list 型 refs)不崩
+        env.pop('ORCH_FAKE_DELIVERY', None)
+        p = _orch(['wait', '--run', 'run_fake0'], env)
+        c.check('S17b wait 解析面遇坏 refs 不崩(exit4 检查点)', p.returncode == 4, p.stdout + p.stderr)
 
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
