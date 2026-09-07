@@ -534,12 +534,24 @@ function wireActForm() {
 
 /* ---- tab 切换 ---- */
 
+// tab 激活单一入口: 切视图 + 落 hash (boot 时按 hash 恢复, 非法回退 view-tickets; 审计 #108)
 function wireTabs() {
   const buttons = document.querySelectorAll('#tabs button')
-  buttons.forEach((b) => b.addEventListener('click', () => {
-    buttons.forEach((x) => x.classList.toggle('active', x === b))
-    for (const sec of document.querySelectorAll('.view')) sec.hidden = sec.id !== `view-${b.dataset.view}`
-  }))
+  const known = new Set([...buttons].map((b) => b.dataset.view))
+  const hashView = () => {
+    const m = /^view-([a-z]+)$/.exec(location.hash.slice(1))
+    return m && known.has(m[1]) ? m[1] : null
+  }
+  const activate = (name, { viaHash = false } = {}) => {
+    if (!known.has(name)) name = 'tickets'
+    buttons.forEach((x) => x.classList.toggle('active', x.dataset.view === name))
+    for (const sec of document.querySelectorAll('.view')) sec.hidden = sec.id !== `view-${name}`
+    if (!viaHash && `#view-${name}` !== location.hash) location.hash = `view-${name}`
+    window.scrollTo({ top: 0 }) // 切 tab 回顶 (168 卡列表滚到深处切 tab 不再留在页底)
+  }
+  buttons.forEach((b) => b.addEventListener('click', () => activate(b.dataset.view)))
+  window.addEventListener('hashchange', () => activate(hashView() ?? 'tickets', { viaHash: true }))
+  activate(hashView() ?? 'tickets', { viaHash: true }) // boot: hash 合法即恢复, 否则回票视图
 }
 
 /* ---- 启动 ---- */

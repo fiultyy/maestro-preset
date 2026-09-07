@@ -114,6 +114,11 @@ main { flex: 1; min-width: 0; padding: 14px 16px; }
   word-break: break-all;
 }
 
+/* .view 自带 display 的 author 规则不得击穿 hidden 语义 (审计 #108: #view-canvas/#view-dag
+   的 display:flex 曾压过 UA [hidden] → 图/画布恒显, 五 tab 三视图同屏堆叠;
+   与下方 :452 #cv-drawer 修复同款, 覆盖全部 .view) */
+.view[hidden] { display: none !important; }
+
 /* ---- 票视图: kanban ---- */
 #view-tickets .kanban {
   display: flex;
@@ -126,6 +131,8 @@ main { flex: 1; min-width: 0; padding: 14px 16px; }
   flex: 1 1 200px;
   min-width: 200px;
   max-width: 340px;
+  max-height: calc(100vh - 240px); /* 列独立滚动 (审计 #108: 168 卡曾把文档撑到 22089px) */
+  overflow-y: auto;
 }
 
 .kanban .col > h3 {
@@ -136,6 +143,11 @@ main { flex: 1; min-width: 0; padding: 14px 16px; }
   letter-spacing: 0.4px;
   display: flex;
   justify-content: space-between;
+  position: sticky; /* 列头钉在列滚动容器顶, 卡片滚动时不没入 */
+  top: 0;
+  z-index: 1;
+  background: var(--bg);
+  padding: 4px 0;
 }
 
 .ticket-card {
@@ -540,6 +552,7 @@ button.cv-chip:hover { border-color: var(--accent); }
 #dag-svg { width: 100%; height: 100%; display: block; cursor: grab; }
 #dg-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
 #dg-empty .empty-note { pointer-events: auto; background: var(--bg-soft); }
+#dg-empty[hidden] { display: none !important; } /* 空态浮层自带 display:flex 同机理击穿 hidden (审计 #108: canvas.js ov.hidden=true 后曾永钉; 与 #cv-drawer 修复同款) */
 
 /* 图 tab: 簇 list */
 .dg-cluster { border: 1px solid var(--line); border-radius: 8px; background: var(--bg-card); margin-bottom: 6px; overflow: hidden; }
