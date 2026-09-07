@@ -172,7 +172,7 @@ async function refetchGraph() {
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), 15_000) // PMW2-H: 传输楔死兜底 — refetching 不得永久 true (否则 exit 回放 kick 与 3s 对账轮询全被门死, 数据面冻结)
   try {
-    const res = await fetch('/op/graph', { signal: ctl.signal })
+    const res = await fetch('op/graph', { signal: ctl.signal })
     const g = await res.json()
     C.lastRefetchAt = Date.now()
     if (!g || g.op !== 'graph') throw new Error('bad /op/graph payload')
@@ -668,7 +668,7 @@ async function loadReplay() {
       const ctl = new AbortController()
       const timer = setTimeout(() => ctl.abort(), 10_000) // 活体大 trace 慢载兜底: 单会话超时降级为空, 整条流必结算 (按钮不永久卡载入中)
       try {
-        const res = await fetch(`/op/trace?sessionId=${encodeURIComponent(sid)}`, { signal: ctl.signal })
+        const res = await fetch(`op/trace?sessionId=${encodeURIComponent(sid)}`, { signal: ctl.signal })
         const j = await res.json()
         // PMW2-H: 活体 trace 的 time 是字符串 ("1788172761057") — 必须数值化,
         // 否则拖拽 R.min+(R.max-R.min)*v/1000 变字符串拼接 → 游标垃圾 → 全灰。
@@ -964,7 +964,7 @@ async function submitAct(node, cmd) {
   hist(node.id).push(entry)
   renderDrawer()
   try {
-    const res = await fetch('/op/act', {
+    const res = await fetch('op/act', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ tool: cmd.tool, args: cmd.args }),
@@ -1001,7 +1001,7 @@ function pollAct(ref, nodeId, entry) {
       return
     }
     try {
-      const res = await fetch(`/op/act?ref=${encodeURIComponent(ref)}`)
+      const res = await fetch(`op/act?ref=${encodeURIComponent(ref)}`)
       const j = await res.json()
       if (j?.found && j.entry && j.entry.status !== 'flying') return settleAct(ref, j.entry)
     } catch {}
@@ -1180,7 +1180,7 @@ async function refetchDag() {
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), 15_000) // 传输楔死兜底 (同 refetchGraph 惯例)
   try {
-    const res = await fetch('/op/tickets', { signal: ctl.signal })
+    const res = await fetch('op/tickets', { signal: ctl.signal })
     const d = await res.json()
     D2.lastRefetchAt = Date.now()
     const list = Array.isArray(d?.tickets) ? d.tickets : []

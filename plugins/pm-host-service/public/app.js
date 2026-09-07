@@ -66,28 +66,28 @@ const SSE_KINDS = 'tickets,fleet,flow,act' // act: PW-005 完成事件对账所�
 /* ---- 数据加载 ---- */
 
 async function loadTickets() {
-  state.tickets = await fetchJson('/op/tickets')
+  state.tickets = await fetchJson('op/tickets')
   renderTickets()
 }
 
 async function loadFleet() {
-  state.fleet = await fetchJson('/op/fleet')
+  state.fleet = await fetchJson('op/fleet')
   renderFleet()
 }
 
 async function loadFlow() {
-  state.flow = await fetchJson('/op/flow')
+  state.flow = await fetchJson('op/flow')
   renderFlow()
 }
 
 // PMWEB-DAG: /op/graph 只为席位组织图供血缘 (callback 边 = worker→head 会话血缘)。
 async function loadGraph() {
-  state.graph = await fetchJson('/op/graph')
+  state.graph = await fetchJson('op/graph')
   renderFleet() // 血缘到齐后重绘席位组织图 (票/流程视图不依赖它)
 }
 
 async function pollHealth() {
-  state.health = await fetchJson('/health')
+  state.health = await fetchJson('health')
   renderHealth()
 }
 
@@ -413,7 +413,7 @@ function logEvent(ev) {
 function connectSse() {
   const badge = $('#sse-badge')
   $('#consumer-name').textContent = TAB_ID
-  const es = new EventSource(`/subscribe?consumer=${encodeURIComponent(TAB_ID)}&kinds=${SSE_KINDS}`)
+  const es = new EventSource(`subscribe?consumer=${encodeURIComponent(TAB_ID)}&kinds=${SSE_KINDS}`)
   es.onopen = () => {
     state.sseOpen = true
     badge.textContent = 'SSE 已订阅'
@@ -486,7 +486,7 @@ function onActEvent(ev) { // SSE 完成事件：ref 对账（PM-008 契约）
 }
 
 async function submitAct(tool, args) {
-  const res = await fetchJson('/op/act', {
+  const res = await fetchJson('op/act', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ tool, args }),
