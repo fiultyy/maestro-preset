@@ -55,6 +55,7 @@ const state = {
   graph: null, // PMWEB-DAG: /op/graph (席位组织图血缘源; 只读)
   health: null,
   acts: new Map(), // ref -> entry（页面内存态，可丢；服务侧 registry 为权威）
+  sseOpen: null, // PMWEB-DAG: SSE 初态记账 —— canvas.js 是 module（晚于 classic 执行），断连事件可能先于其监听注册到达，初态由此回放
 }
 
 // PW-003: consumer 每 tab 随机 —— 重载即全量快照回放；tab 内 EventSource
@@ -414,12 +415,14 @@ function connectSse() {
   $('#consumer-name').textContent = TAB_ID
   const es = new EventSource(`/subscribe?consumer=${encodeURIComponent(TAB_ID)}&kinds=${SSE_KINDS}`)
   es.onopen = () => {
+    state.sseOpen = true
     badge.textContent = 'SSE 已订阅'
     badge.className = 'badge ok'
     window.dispatchEvent(new CustomEvent('pm:sse-state', { detail: { open: true } })) // PMW2-2 画布: 断线轮询窗
   }
   es.onerror = () => {
     // 浏览器原生自动重连；此处只亮态，不造数据（降级优先）
+    state.sseOpen = false
     badge.textContent = 'SSE 断连，自动重连中…'
     badge.className = 'badge err'
     window.dispatchEvent(new CustomEvent('pm:sse-state', { detail: { open: false } })) // PMW2-2 画布: 转 30s 轮询

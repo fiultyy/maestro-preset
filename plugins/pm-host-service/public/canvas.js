@@ -1615,6 +1615,15 @@ window.addEventListener('pm:sse-state', (e) => {
   else if (!D2.pollTimer) D2.pollTimer = setInterval(refetchDag, 30_000) // SSE 断: 30s 轮询兜底
 })
 const dagRefetchDebounced = (() => { let t = 0; return () => { clearTimeout(t); t = setTimeout(refetchDag, 400) } })() // 400ms 去抖
+// PMWEB-DAG: SSE 初态回放 —— app.js (classic) 先于本 module 执行，若订阅在两个监听器
+// 注册完成之前就断开（本页新增 cluster.js 静态导入会拉长 module 取回链，放大此窗口），
+// pm:sse-state 事件会无人接听而丢失；按记账初态补发一次，保证轮询兜底与横幅不缺位。
+// 回放延后到本任务之后: 监听器 render 依赖 boot() 注入的 DOM (#cv-counts 等)。
+setTimeout(() => {
+  if (state.sseOpen != null) {
+    window.dispatchEvent(new CustomEvent('pm:sse-state', { detail: { open: state.sseOpen } }))
+  }
+}, 0)
 
 // ---- boot ----
 async function boot() {

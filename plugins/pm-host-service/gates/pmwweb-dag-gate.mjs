@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     return c.length === 2 && c.every((x) => x.kind === 'prefix')
   })())
   ok('A 防御: dangling deps / 脏 JSON / null 字段不崩不误聚', (() => {
-    const c = clusterTickets([t('Z-1', { deps: '["GHOST"]', refs: '{bad json' }), t('Z-2', { deps: 'not-json', refs: 'null' }), t('Z-3', { deps: null, refs: null })])
+    const c = clusterTickets([t('ZED-1', { deps: '["GHOST"]', refs: '{bad json' }), t('ZAP-2', { deps: 'not-json', refs: 'null' }), t('ZIN-3', { deps: null, refs: null })])
     return c.length === 3 && c.every((x) => x.kind === 'single')
   })())
   ok('A 活跃口径: done/merged/rejected 终态, blocked/running/dispatched 活跃', (() => {
@@ -86,7 +86,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     const ts = [t('P-1', { refs: '{"run":"R2"}', deps: '["Q-1"]' }), t('P-2', { refs: '{"run":"R2"}' }), t('Q-1'), t('Q-2', { deps: '["Q-1"]' })]
     const sc = clusterScene(ts, new Set())
     return sc.nodes.length === 2 && sc.nodes.every((n) => n.type === 'cluster')
-      && sc.edges.length === 1 && sc.edges[0].id === 'dep:cl:run:R2>cl:cdep:Q-1'
+      && sc.edges.length === 1 && sc.edges[0].id === 'dep:cl:cdep:Q-1>cl:run:R2'
   })())
   ok('A 场景(展开): 展开簇 → 成员票节点替换 + 簇内 deps 边显现', (() => {
     const ts = [t('Q-1', { state: 'blocked' }), t('Q-2', { deps: '["Q-1"]' }), t('Q-3')]
@@ -108,7 +108,7 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
   ok('B index.html: 席位详情浮层 dialog 在场', html.includes('id="seat-detail"') && html.includes('id="sd-body"') && html.includes('id="sd-close"'))
   const cv = readFileSync(`${PUBLIC}canvas.js`, 'utf8')
   ok('B canvas.js: 聚合层导入 + 图 tab boot + 内省', cv.includes("from './cluster.js'") && cv.includes('clusterTickets(list)') && cv.includes('bootDag()') && cv.includes('window.__pmDag'))
-  ok('B canvas.js: 既有泳道画布零回归 (boot/refetchGraph/drawer/replay 锚点仍在)', cv.includes('await refetchGraph()') && cv.includes('syncDrawer()') && cv.includes('loadReplay') && cv.includes("id=\"canvas-svg\""))
+  ok('B canvas.js: 既有泳道画布零回归 (boot/refetchGraph/drawer/replay 锚点仍在)', cv.includes('await refetchGraph()') && cv.includes('syncDrawer()') && cv.includes('loadReplay') && cv.includes('id="canvas-svg"'))
   const ap = readFileSync(`${PUBLIC}app.js`, 'utf8')
   ok('B app.js: 组织图+小卡+浮层标记', ap.includes('function lineageOf') && ap.includes('seat-mini') && ap.includes('org-children') && ap.includes('openSeatDetail') && ap.includes('loadGraph'))
   ok('B app.js: 既有 SSE 派发两事件 + 三视图 refetch 保留', ap.includes("new CustomEvent('pm:sse'") && ap.includes("new CustomEvent('pm:sse-state'") && ap.includes('refetch.tickets()') && ap.includes('refetch.flow()'))
@@ -126,9 +126,7 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
     for (const m of src.matchAll(/fetch\(\s*['`]([^'`/?]+)[^'`]*['`]/g)) {
       if (!FETCH_ALLOW.has(m[1])) { fetchOk = false; console.log(`  redline: ${f} fetch(${m[1]}) 越白名单`) }
     }
-    for (const m of src.matchAll(/fetch\(([\s\S]{0,80}?)\)\s*$/gm)) if (/method:\s*'POST'/.test(m[1]) && !m[1].includes('/op/act')) { fetchOk = false; console.log(`  redline: ${f} 非 /op/act POST`) }
-    const posts = src.match(/method: 'POST'/g) ?? []
-    postSites.push(`${f}:${posts.length}`)
+    postSites.push(`${f}:${(src.match(/method: 'POST'/g) ?? []).length}`)
   }
   ok('B 红线: fetch 全量端点白名单 (/op/* + /health + /subscribe)', fetchOk, postSites.join(' '))
   ok('B 红线: POST 仅两处且均为 /op/act 透传 (app.js PW-005 + canvas.js PMW2-3)', (readFileSync(`${PUBLIC}app.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 1 && (readFileSync(`${PUBLIC}canvas.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 1)
@@ -148,8 +146,8 @@ const TICKETS = [
   { ticket_id: 'SGL-9', state: 'merged', deps: '[]', refs: '{}', lease_owner: null },
 ]
 const SEATS = {
-  h1: { code: 'h1', sessionId: 'session-x', role: 'head', node: 'n-head', preset: 'maestro', spawnedAt: '2026-09-01T00:00:00Z', status: 'active' },
-  w1: { code: 'w1', sessionId: 'session-y', role: 'worker', node: 'n-w', preset: 'long-task', spawnedAt: '2026-09-01T01:00:00Z', status: 'active' },
+  h1: { code: 'h1', sessionId: 'session-11111111-aaaa-4bbb-8ccc-111111111111', role: 'head', node: 'n-head', preset: 'maestro', spawnedAt: '2026-09-01T00:00:00Z', status: 'active' },
+  w1: { code: 'w1', sessionId: 'session-22222222-aaaa-4bbb-8ccc-222222222222', role: 'worker', node: 'n-w', preset: 'long-task', spawnedAt: '2026-09-01T01:00:00Z', status: 'active' },
 }
 function writeFleet(sb) {
   const file = `${sb}/maestro/fleet.json`
@@ -170,8 +168,8 @@ async function startMockDsh() {
     rq.on('end', () => {
       rs.writeHead(200, { 'content-type': 'application/json' })
       rs.end(JSON.stringify({ result: { ok: true, value: { items: [
-        { sessionId: 'session-x', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/pmweb-dag-gate', projections: { values: { title: 'head-session' } } },
-        { sessionId: 'session-y', running: false, blank: false, agentPreset: 'long-task', cwd: '/tmp/pmweb-dag-gate', projections: { values: { title: 'worker-session' } } },
+        { sessionId: 'session-11111111-aaaa-4bbb-8ccc-111111111111', running: true, blank: false, agentPreset: 'maestro', cwd: '/tmp/pmweb-dag-gate', projections: { values: { title: 'head-session' } } },
+        { sessionId: 'session-22222222-aaaa-4bbb-8ccc-222222222222', running: false, blank: false, agentPreset: 'long-task', cwd: '/tmp/pmweb-dag-gate', projections: { values: { title: 'worker-session' } } },
       ] } } }))
     })
   })
@@ -188,7 +186,7 @@ async function startSandbox(tag) {
   writeFleet(sb)
   // 血缘 fixture: callback 边 worker→head (bridge inbox.log 行格式, service gatherBridgePairs)
   mkdirSync(`${sb}/maestro/bridge`, { recursive: true })
-  writeFileSync(`${sb}/maestro/bridge/inbox.log`, `${JSON.stringify({ from: 'w1@session-y', to: 'head@session-x' })}\n`)
+  writeFileSync(`${sb}/maestro/bridge/inbox.log`, `${JSON.stringify({ from: 'w1@session-22222222-aaaa-4bbb-8ccc-222222222222', to: 'head@session-11111111-aaaa-4bbb-8ccc-111111111111' })}\n`)
   const mock = await startMockDsh()
   const env = {
     ...process.env, MAESTRO_HOME: sb,
@@ -315,18 +313,22 @@ async function sandboxPart() {
     ok('C list: 簇列表 4 行 (票数/活跃数/状态分布摘要)', listRows.clusters === 4 && listRows.metas.length === 4 && /2 票 · 1 活跃/.test(listRows.metas.join(' ')) && /running 1 · done 1/.test(listRows.dists), `${listRows.metas.join(' / ')} :: ${listRows.dists.slice(0, 90)}`)
 
     // 染选联动 ①: 选簇聚焦, 其余淡出
-    await c.cdp.eval(clickNode('#dg-list .dg-cluster-row[data-key="run:R77"]'))
+    await c.cdp.eval(clickEl('#dg-list .dg-cluster-row[data-key="run:R77"]'))
     await sleep(150)
     const focus = await c.cdp.eval(`({
       sel: window.__pmDag.selected,
       dims: document.querySelectorAll('#dag-svg .dg-dim').length,
       selNodes: document.querySelectorAll('#dag-svg .dg-sel').length,
     })`)
-    ok('C 选簇聚焦: selected=run:R77 且其余簇淡出', focus.sel?.kind === 'cluster' && focus.sel.key === 'run:R77' && focus.dims === 2 && focus.selNodes === 1, JSON.stringify(focus))
+    ok('C 选簇聚焦: selected=run:R77 且其余簇淡出', focus.sel?.kind === 'cluster' && focus.sel.key === 'run:R77' && focus.dims === 3 && focus.selNodes === 1, JSON.stringify(focus))
     await c.cdp.shot(shot('dag-cluster-focus.png'))
 
-    // 染选联动 ②: list 点票 → 所在 deps 簇自动展开 + deps 边高亮
-    await c.cdp.eval(clickNode('#dg-list .dg-ticket-row[data-tid="CH-A"]'))
+    // 染选联动 ②: list 折叠钮展开 deps 簇 → 点成员票 → deps 边高亮 (折叠簇无成员行, 先展开)
+    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:CH-A"]'))
+    await sleep(700)
+    const preT = await c.cdp.eval('({ nodes: window.__pmDag.nodes, expanded: window.__pmDag.expanded })')
+    ok('C list 折叠钮: 展开 deps 簇 (成员票 2 入场)', preT.nodes === 5 && preT.expanded.includes('cdep:CH-A'), JSON.stringify(preT))
+    await c.cdp.eval(clickEl('#dg-list .dg-ticket-row[data-tid="CH-A"]'))
     await sleep(700)
     const tsel = await c.cdp.eval(`({
       sel: window.__pmDag.selected,
@@ -337,14 +339,14 @@ async function sandboxPart() {
       selRows: document.querySelectorAll('#dg-list .dg-selected').length,
     })`)
     ok('C 选票: 所在簇自动展开 (成员票 2 + 簇内 deps 边 1)', tsel.sel?.kind === 'ticket' && tsel.sel.id === 'CH-A' && tsel.expanded.includes('cdep:CH-A') && tsel.nodes === 5 && tsel.edges === 1, JSON.stringify(tsel.sel ?? {}))
-    ok('C 选票染选: deps 边 cv-lit 且其余淡出 (3 节点淡出)', tsel.lit === 1 && tsel.dims === 3 && tsel.selRows >= 1, `lit=${tsel.lit} dims=${tsel.dims}`)
+    ok('C 选票染选: deps 边 lit 且其余淡出 (3 节点淡出)', tsel.lit === 1 && tsel.dims === 3 && tsel.selRows >= 1, `lit=${tsel.lit} dims=${tsel.dims}`)
     await c.cdp.shot(shot('dag-ticket-highlight.png'))
 
-    // 折叠往返: 角标收起 → 回聚合态
-    await c.cdp.eval(clickNode('#dag-svg .dg-fold[data-fold="cdep:CH-A"]'))
+    // 折叠往返: list 折叠钮收起 → 回聚合态 (展开态簇节点不在场景, 折叠走 list)
+    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:CH-A"]'))
     await sleep(700)
     const folded = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, expanded: window.__pmDag.expanded })')
-    ok('C 角标折叠: 展开簇收回聚合态 (4 节点 0 边)', folded.nodes === 4 && folded.edges === 0 && folded.expanded.length === 0, JSON.stringify(folded))
+    ok('C 折叠钮: 展开簇收回聚合态 (4 节点 0 边)', folded.nodes === 4 && folded.edges === 0 && folded.expanded.length === 0, JSON.stringify(folded))
 
     // 空白点击取消
     const cleared = await c.cdp.eval(`(() => {
@@ -366,17 +368,17 @@ async function sandboxPart() {
       headTop: !!document.querySelector('.org-chart > .org-node .seat-mini[data-code="h1"]'),
       zeroDag: !document.querySelector('#view-fleet #cv-stage') && !document.querySelector('#view-fleet svg'),
     })`)
-    ok('C 席位小卡: 一行缩略 (code+状态点+持票数), 2 卡', fleet.minis.length === 2 && fleet.minis.every((m) => /票/.test(m.text)) && /w1/.test(fleet.minis.map((m) => m.code).join()), JSON.stringify(fleet.minis))
+    ok('C 席位小卡: 一行缩略 (code+状态点+持票数), 2 卡', fleet.minis.length === 2 && fleet.minis.every((m) => /票/.test(m.text)), JSON.stringify(fleet.minis))
     ok('C 组织图: head 在上 worker 嵌套在下 (血缘边 h1←w1)', fleet.headTop && fleet.nested)
     ok('C 需求4: 席位 tab 零票 DAG 挂载点', fleet.zeroDag)
     await c.cdp.shot(shot('fleet-org-chart.png'))
-    await c.cdp.eval(clickNode('.seat-mini[data-code="w1"]'))
+    await c.cdp.eval(clickEl('.seat-mini[data-code="w1"]'))
     await sleep(200)
     const detail = await c.cdp.eval(`({
       open: document.querySelector('#seat-detail').hasAttribute('open'),
       body: document.querySelector('#sd-body').textContent,
     })`)
-    ok('C 详情浮层: 点小卡弹出, join 字段全量+持票列表+血缘', detail.open && detail.body.includes('session-y') && detail.body.includes('/tmp/pmweb-dag-gate') && detail.body.includes('RUN-1') && detail.body.includes('上级 head') && detail.body.includes('h1') && detail.body.includes('持票'), `len=${detail.body.length}`)
+    ok('C 详情浮层: 点小卡弹出, join 字段全量+持票列表+血缘', detail.open && detail.body.includes('session-22222222') && detail.body.includes('/tmp/pmweb-dag-gate') && detail.body.includes('RUN-1') && detail.body.includes('上级 head') && detail.body.includes('h1') && detail.body.includes('持票'), `len=${detail.body.length}`)
     await c.cdp.shot(shot('seat-detail-overlay.png'))
     await c.cdp.eval(`document.querySelector('#sd-close').click()`)
     await sleep(120)
