@@ -801,7 +801,7 @@ function gatherTicketGraph(seatCodes) { // ticket nodes via the PM-003 cache ins
     }
     const owner = n.leaseOwner // 派发/持有 子源①: st:<code> -> tk:<id>, label "lease"
     if (typeof owner === 'string' && owner) {
-      const code = owner.split('/')[0].trim() // recorded forms: "<code>" or "<code>/<budget>" (e.g. af29/240min)
+      const code = owner.split(/[/@]/)[0].trim() // PMWEB-DATA: 认 "<code>" / "<code>/<budget>" / "<code>@<sub>" 三形态, 剥 '/' 与 '@' 后段取 code 前缀 (与 app.js leaseCode 同规则; 仍匹配不到 → 下行 discard+note 不变)
       if (seatCodes.has(code)) edges.push({ id: `dispatch:st:${code}>${n.id}`, kind: 'dispatch', from: `st:${code}`, to: n.id, label: 'lease' })
       else notes.push(`dangling lease owner ${owner} of ${n.ticketId} dropped`)
     }
@@ -1284,7 +1284,10 @@ const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
 // 2026-09-05: NEW 链 session/list 空 request 实测 0.94-1.6s (成本在 slim 投影,
 // limit:1 不省; detail 仅 slim|full 无更廉形态; workspace.list 已不存在) —
 // 1s 预算在边缘反复 abort → 横幅间歇常驻。slash 放宽 3s, dot 链 (ms 级) 不变。
-const HEALTH_DSH_TIMEOUT_MS = DSH_WIRE === 'slash' ? 3_000 : 1_000 // loopback RPC probe budget (health must stay snappy)
+// PMWEB-DATA: 闪断防抖参数集中此处可配 — PM_HEALTH_DSH_TIMEOUT_MS (探针预算,
+// 缺省随 wire 形态) + PM_HEALTH_DSH_FAIL_STREAK (连续失败才 degraded 的阈值, 缺省 2)。
+const HEALTH_DSH_TIMEOUT_MS = Number(process.env.PM_HEALTH_DSH_TIMEOUT_MS) || (DSH_WIRE === 'slash' ? 3_000 : 1_000) // loopback RPC probe budget (health must stay snappy)
+const HEALTH_DSH_FAIL_STREAK = Math.max(1, Number(process.env.PM_HEALTH_DSH_FAIL_STREAK) || 2) // 连续 ≥N 次探针失败才降级; 单次失败保留上一态 (PMWEB-DATA 防抖)
 const JOIN_DSH_TIMEOUT_MS = Number(process.env.PM_JOIN_TIMEOUT_MS) || 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness。PM_JOIN_TIMEOUT_MS 供沙箱门调参
 const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
 
@@ -1358,6 +1361,35 @@ async function probeDsh() { // PMW2-I: liveness 探针只判活不取数。sessi
   }
 }
 
+// PMWEB-DATA: dsh_api 闪断防抖 — 审计 #108: 单次探针失败即 degraded → 负载下
+// /api 1.5s+ 瞬时超时令横幅误导性闪现。改为: 单次失败保留上一态 + lastError 记录,
+// 连续 ≥ HEALTH_DSH_FAIL_STREAK 次才 degraded, 恢复即清。dshGateNext 为纯函数
+// (prev 态 + 本次探针 → 下一态 + health source 对象), 便于文本级直调单测 (A2)。
+function dshGateNext(prev, probe, streakNeeded) {
+  const note = probe.note ?? ''
+  if (probe.live) return { live: true, failStreak: 0, lastError: null, source: { live: true, url: probe.url, latency_ms: probe.latency_ms } }
+  const failStreak = ((prev && prev.failStreak) || 0) + 1
+  const kept = !!(prev && prev.live === true) // 有上一态且上一态 live → 单次失败不降级
+  if (failStreak >= streakNeeded) {
+    return { live: false, failStreak, lastError: note, source: { live: false, url: probe.url, latency_ms: probe.latency_ms, note: `probe failed x${failStreak}/${streakNeeded} (degraded): ${note}`, failStreak, lastError: note } }
+  }
+  return { live: kept, failStreak, lastError: note, source: { live: kept, url: probe.url, latency_ms: probe.latency_ms, note: kept ? `transient probe failure x${failStreak}/${streakNeeded} — kept last live state (lastError: ${note})` : `probe failed x${failStreak}/${streakNeeded} (no last live state to keep): ${note}`, failStreak, lastError: note } }
+}
+
+const dshGateState = { live: null, failStreak: 0, lastError: null } // live:null = 未探 (首探失败无上一态可保留 → 如实 degraded)
+let dshProbeInflight = null // 并发 /health 合流: 同一时刻至多一个探针在途 (防 failStreak 双计)
+async function probeDshGated() {
+  if (dshProbeInflight) return dshProbeInflight
+  dshProbeInflight = (async () => {
+    const next = dshGateNext(dshGateState, await probeDsh(), HEALTH_DSH_FAIL_STREAK)
+    dshGateState.live = next.live
+    dshGateState.failStreak = next.failStreak
+    dshGateState.lastError = next.lastError
+    return next.source
+  })()
+  try { return await dshProbeInflight } finally { dshProbeInflight = null }
+}
+
 let bootCache = { at: 0, enabled: 'unknown', active: 'unknown', systemctl: 'unprobed' }
 function probeBootstrap() { // G3: unit file + systemctl --user is-enabled / is-active (5s cache)
   const unitFile = probeFile(UNIT_FILE)
@@ -1393,7 +1425,7 @@ async function serveHealth() {
     state: lockState,
     note: lockState === 'held' ? 'flock(2) singleton held in-daemon (PM-002)' : 'flock unavailable — SINGLE INSTANCE NOT GUARANTEED; fail-open is now a degraded, visible state (HF-014)',
   }))
-  sources.dsh_api = await probeDsh() // PM-004 join plane (always guarded internally)
+  sources.dsh_api = await probeDshGated() // PM-004 join plane (always guarded internally; PMWEB-DATA 闪断防抖)
   const bootstrap = (() => { try { return probeBootstrap() } catch (e) { return { enabled: 'unknown', active: 'unknown', note: errBrief(e) } } })()
   const degraded = Object.entries(sources).filter(([, s]) => !s?.live).map(([k]) => k)
   return {

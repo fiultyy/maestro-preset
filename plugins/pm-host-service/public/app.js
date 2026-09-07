@@ -18,6 +18,12 @@ const parseJsonField = (s, fallback) => {
   try { return JSON.parse(s) } catch { return fallback }
 }
 
+// PMWEB-DATA: lease_owner→席位 code 归一 — 认 '<code>' / '<code>/<budget>' /
+// '<code>@<sub>' 三形态，剥 '/' 与 '@' 后段取 code 前缀；与 service.mjs
+// gatherTicketsGraph join 侧同规则（两侧镜像，零共享模块）。归一后仍匹配不到
+// 席位的票计入「未分配」，不虚标到任何席位。
+const leaseCode = (v) => (typeof v === 'string' && v ? v.split(/[/@]/)[0].trim() : '')
+
 const debounce = (fn, ms) => {
   let t = 0
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) }
@@ -68,6 +74,7 @@ const SSE_KINDS = 'tickets,fleet,flow,act' // act: PW-005 完成事件对账所�
 async function loadTickets() {
   state.tickets = await fetchJson('op/tickets')
   renderTickets()
+  renderFleet() // PMWEB-DATA: 持票计数/「未分配」注记依赖票面 — boot 并行加载下 fleet 先渲染时票面未到会缺计, 票面到齐即重渲 (与 loadGraph→renderFleet 同理; renderFleet 自身对 fleet 未到有加载中守卫)
 }
 
 async function loadFleet() {
@@ -91,13 +98,14 @@ async function pollHealth() {
   renderHealth()
 }
 
-// SSE 事件驱动重取（去抖：watcher+2s reconcile 双通道在服务端已去重，
-// 这里再挡一层突发）
+// SSE 事件驱动重取（PMWEB-DATA: 同事件窗口合并拉取 — 每 500ms 窗口内同资源至多
+// 一次 fetch：tickets 突发 / fleet 复合事件 / act 对账互撞均并成一轮，单事件窗口
+// 内 /op/tickets ≤1；watcher+2s reconcile 双通道在服务端已去重，这里再挡一层突发）
 const refetch = {
-  tickets: debounce(loadTickets, 400),
-  fleet: debounce(loadFleet, 400),
-  flow: debounce(loadFlow, 400),
-  graph: debounce(loadGraph, 400),
+  tickets: debounce(loadTickets, 500),
+  fleet: debounce(loadFleet, 500),
+  flow: debounce(loadFlow, 500),
+  graph: debounce(loadGraph, 500),
 }
 
 /* ---- 渲染：票视图 (kanban by state + deps + lease_owner) ---- */
@@ -226,19 +234,25 @@ function renderFleet() {
     el.innerHTML = note + emptyNote(`0 席位${d.note ? ' —— ' + esc(d.note) : '（fleet.json 空：无在场 worker）'}`)
     return
   }
-  // 持票计数 + 持票列表 (票面 lease_owner -> seat code;/op/tickets 可得时)
+  // 持票计数 + 持票列表 (PMWEB-DATA: 票面 lease_owner 先归一为席位 code 再计数;
+  // 命中席位 → 小卡持票数 + 浮层持票列表; 归一后无席位认领 → 计入「未分配」注记,
+  // 不虚标到任何席位。/op/tickets 可得时)
+  const seatsByCode = new Map(seats.map((s) => [s.code, s]))
   const heldCounts = new Map()
   const heldBy = new Map()
+  const unassigned = new Map() // 归一 code -> [tickets]（席位外）
   const tk = state.tickets
   if (tk && tk.ok && Array.isArray(tk.data.tickets)) {
     for (const t of tk.data.tickets) {
       if (!t.lease_owner) continue
-      heldCounts.set(t.lease_owner, (heldCounts.get(t.lease_owner) || 0) + 1)
-      if (!heldBy.has(t.lease_owner)) heldBy.set(t.lease_owner, [])
-      heldBy.get(t.lease_owner).push(t)
+      const code = leaseCode(t.lease_owner)
+      if (!code) continue
+      const bucket = seatsByCode.has(code) ? heldBy : unassigned
+      if (!bucket.has(code)) bucket.set(code, [])
+      bucket.get(code).push(t)
+      if (bucket === heldBy) heldCounts.set(code, heldBy.get(code).length)
     }
   }
-  const seatsByCode = new Map(seats.map((s) => [s.code, s]))
   const { headOf, childrenOf } = lineageOf(seats)
   const rendered = new Set()
   const roots = seats.filter((s) => !headOf.has(s.code)).map((s) => s.code)
@@ -248,7 +262,11 @@ function renderFleet() {
   const lineageNote = (state.graph && state.graph.ok)
     ? ''
     : viewNote('血缘源 (/op/graph) 不可达 —— 组织图退化为平铺小卡（降级优先，CLI/账本不受影响）')
-  el.innerHTML = note + lineageNote + `<div class="org-chart">${tree}${missed}</div>`
+  // PMWEB-DATA: 归一后无席位认领的持票 → 「未分配」如实注记，不虚标到任何席位小卡
+  const unassignedNote = unassigned.size
+    ? viewNote(`未分配持票 ${[...unassigned.values()].reduce((a, l) => a + l.length, 0)} 张（归一 code: ${[...unassigned.keys()].map((c) => esc(c)).join(', ')} —— 无席位认领，不计入任何席位）`)
+    : ''
+  el.innerHTML = note + lineageNote + unassignedNote + `<div class="org-chart">${tree}${missed}</div>`
 }
 
 /* ---- 席位详情浮层 (需求 7: join 现成字段全量 + 持票列表 + 血缘, 关闭返回) ---- */
@@ -271,11 +289,11 @@ function seatDetailHtml(code) {
   if (s.session && typeof s.session === 'object') {
     for (const [k, v] of Object.entries(s.session)) rows.push(sdRow(`session.${k}`, k === 'title' ? `<span class="small">${sdVal(v)}</span>` : sdVal(v)))
   }
-  // 持票列表 (持票边 lease_owner→seat)
+  // 持票列表 (持票边 lease_owner→seat; PMWEB-DATA: 同 renderFleet 归一口径)
   const held = []
   const tk = state.tickets
   if (tk && tk.ok && Array.isArray(tk.data.tickets)) {
-    for (const t of tk.data.tickets) if (t.lease_owner === code) held.push(t)
+    for (const t of tk.data.tickets) if (leaseCode(t.lease_owner) === code) held.push(t)
   }
   const heldHtml = held.length
     ? held.map((t) => `<li><span class="mono">${esc(t.ticket_id)}</span> <span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span> <span class="dim small">${esc(t.title || '')}</span></li>`).join('')
