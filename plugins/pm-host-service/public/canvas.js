@@ -33,12 +33,13 @@ const STATE_COLORS = {
   active: '#3fbf7f', verified: '#3fbf7f', probing: '#e0a93e', stale: '#e0a93e',
 }
 const colorOf = (s) => STATE_COLORS[s] || '#7f8da0'
-const EDGE_STYLE = { // §1.2 样式列照抄: 实线/虚线(6 4)/点线(2 4), dispatch 终点箭头
-  dep: { color: '#6b7688', dash: '', width: 1.5, arrow: false },
+const EDGE_STYLE = { // §1.2 样式列照抄: 实线/虚线(6 4)/点线(2 4); PMWEB-GRAPH: 四类边全接 marker-end (方向可读, 逐类同色箭头)
+  dep: { color: '#6b7688', dash: '', width: 1.5, arrow: true },
   dispatch: { color: '#4da3ff', dash: '', width: 1.5, arrow: true },
-  callback: { color: '#9d7cd8', dash: '6 4', width: 1.5, arrow: false },
-  'cb-send': { color: '#e0a93e', dash: '2 4', width: 1.5, arrow: false },
+  callback: { color: '#9d7cd8', dash: '6 4', width: 1.5, arrow: true },
+  'cb-send': { color: '#e0a93e', dash: '2 4', width: 1.5, arrow: true },
 }
+const ZOOM_MIN = 0.12 // PMWEB-GRAPH: fit/缩放下限 0.5(泳道)/0.3(DAG) → 0.12 (16 泳道全可见), 上限 2 不变
 
 // PMW2-3 动作面: 快捷动作仅两类, 均走既有 POST /op/act (服务端零改动)。
 // flow-node → `flowc advance <flow> <node> --result done|failed`;
@@ -78,6 +79,8 @@ const C = {
   edges: new Map(), // id -> edge json
   pos: new Map(), // id -> {x, y, w, h} 世界坐标
   local: new Map(), // laneId -> Map(id -> {x, y}) 泳道内局部布局 (未受影响泳道复用)
+  routes: new Map(), // laneId -> Map(edgeId -> [x,y][]) 泳道内局部 elk 边路由 (与 local 同生命周期复用)
+  edgeRoutes: new Map(), // edgeId -> [x,y][] 世界坐标 elk 路由折线 (sections 消费, PMWEB-GRAPH)
   lanes: [], // [{ id, title, nodeIds, w, h, x, y }]
   laneIndex: new Map(), // id -> lane
   laneBounds: {}, // gate/证据取景用 (只读数据面)
@@ -162,7 +165,26 @@ async function layoutLane(lane) {
     w = Math.max(w, (c.x ?? 0) + (c.width ?? 0))
     h = Math.max(h, (c.y ?? 0) + (c.height ?? 0))
   }
-  return { pos, w: Math.ceil(w), h: Math.ceil(h), inner: new Set(inner.map((e) => e.id)) }
+  // PMWEB-GRAPH: 消费 elk 边路由 sections (start/bends/end 折线) —— 曾只取节点坐标弃边路由,
+  // 自算右出左入 bezier 穿无关节点盒 (审计 #108: 22/189 边 73 次穿盒)。
+  // bendPoints 形态兼容: elk JSON 协议为 [{x,y}] 对象数组, 扁平 [x1,y1,…] 旧形亦收。
+  const routes = new Map()
+  const pushPt = (arr, x, y) => { if (Number.isFinite(x) && Number.isFinite(y)) arr.push([x, y]) }
+  for (const e of out.edges ?? []) {
+    const pts = []
+    for (const sec of e.sections ?? []) {
+      if (!sec.startPoint || !sec.endPoint) continue
+      const n0 = pts.length
+      pushPt(pts, sec.startPoint.x, sec.startPoint.y)
+      const b = sec.bendPoints ?? []
+      if (b.length && typeof b[0] === 'object') for (const bp of b) pushPt(pts, bp.x, bp.y)
+      else for (let i = 0; i + 1 < b.length; i += 2) pushPt(pts, b[i], b[i + 1])
+      pushPt(pts, sec.endPoint.x, sec.endPoint.y)
+      if (pts.length - n0 < 2) pts.length = n0 // 残缺 section 不入 (退化交兜底)
+    }
+    if (pts.length >= 2) routes.set(e.id, pts)
+  }
+  return { pos, w: Math.ceil(w), h: Math.ceil(h), inner: new Set(inner.map((e) => e.id)), routes }
 }
 
 // ---- refetch + diff (§4 item 7: 按 id diff, 只重排受影响泳道) ----
@@ -231,6 +253,7 @@ async function computeLanes(changedLanes) {
         const probe = await layoutLane({ id, nodeIds })
         local = probe.pos
         C.local.set(id, local)
+        C.routes.set(id, probe.routes ?? new Map()) // PMWEB-GRAPH: 路由与局部布局同生命周期复用
         innerSet = probe.inner
       } catch (e) { // elk 加载失败或布局抛错 → 列表回退 (spec §5)
         listFallback(`布局引擎不可用(${String(e?.message ?? e).slice(0, 60)})——已回退列表视图; 下轮事件自动重试 layout`)
@@ -268,12 +291,13 @@ async function updateScene(changedLanes) {
   }
   for (const n of C.nodes.values()) { const s = nodeSize(n); const p = pos.get(n.id); if (p) { p.w = s.w; p.h = s.h } }
   C.pos = pos
+  flattenRoutes()
   reconcileDom()
 }
 
 // 首帧/成员变化: 全量重建容器, 节点元素仍按 id 持久化
 async function buildScene(changedLanes) {
-  C.nodeEls.clear(); C.edgeEls.clear(); C.local.clear()
+  C.nodeEls.clear(); C.edgeEls.clear(); C.local.clear(); C.routes.clear()
   const built = await computeLanes(changedLanes || new Set())
   if (!built) return
   C.lanes = built.lanes
@@ -287,7 +311,19 @@ async function buildScene(changedLanes) {
     }
   }
   C.pos = pos
+  flattenRoutes()
   drawScene()
+}
+
+// PMWEB-GRAPH: 泳道局部路由 → 世界坐标展平 (edge id 全局唯一; 节点世界位 = lane.x+pad + 局部位)
+function flattenRoutes() {
+  C.edgeRoutes = new Map()
+  for (const lane of C.lanes) {
+    const routes = C.routes.get(lane.id)
+    if (!routes) continue
+    const ox = lane.x + lane.pad; const oy = lane.y + lane.head
+    for (const [eid, pts] of routes) C.edgeRoutes.set(eid, pts.map(([x, y]) => [x + ox, y + oy]))
+  }
 }
 
 // ---- DOM: 场景搭建 (一次) + 调和 (持久节点元素) ----
@@ -296,8 +332,10 @@ function drawScene() {
   const s = svg()
   s.textContent = ''
   const defs = svgEl('defs')
-  defs.appendChild(svgEl('marker', { id: 'cv-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }))
-    .appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: EDGE_STYLE.dispatch.color }))
+  for (const [kind, st] of Object.entries(EDGE_STYLE)) { // PMWEB-GRAPH: 逐类同色 marker (userSpaceOnUse)
+    defs.appendChild(svgEl('marker', { id: `cv-arrow-${kind}`, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 10, markerHeight: 10, markerUnits: 'userSpaceOnUse', orient: 'auto-start-reverse' }))
+      .appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: st.color }))
+  }
   s.appendChild(defs)
   const viewport = svgEl('g', { id: 'cv-viewport' })
   s.appendChild(viewport)
@@ -314,9 +352,9 @@ function drawScene() {
   const gEdges = svgEl('g', { id: 'cv-edges' })
   for (const e of C.edges.values()) {
     const st = EDGE_STYLE[e.kind] || EDGE_STYLE.dep
-    const p = svgEl('path', { class: `cv-edge k-${e.kind}`, d: edgePath(e), fill: 'none', stroke: st.color, 'stroke-width': st.width })
+    const p = svgEl('path', { class: `cv-edge k-${e.kind}`, d: edgePath(e), fill: 'none', stroke: st.color, 'stroke-width': st.width, 'data-edge': e.id })
     if (st.dash) p.setAttribute('stroke-dasharray', st.dash)
-    if (st.arrow) p.setAttribute('marker-end', 'url(#cv-arrow)')
+    if (st.arrow) p.setAttribute('marker-end', `url(#cv-arrow-${e.kind})`)
     C.edgeEls.set(e.id, p)
     gEdges.appendChild(p)
   }
@@ -351,10 +389,16 @@ function reconcileDom() {
   for (const [id, p] of C.edgeEls) if (!C.edges.has(id)) { p.remove(); C.edgeEls.delete(id) }
   for (const e of C.edges.values()) if (!C.edgeEls.has(e.id)) {
     const st = EDGE_STYLE[e.kind] || EDGE_STYLE.dep
-    const p = svgEl('path', { class: `cv-edge k-${e.kind}`, d: edgePath(e), fill: 'none', stroke: st.color, 'stroke-width': st.width })
+    const p = svgEl('path', { class: `cv-edge k-${e.kind}`, d: edgePath(e), fill: 'none', stroke: st.color, 'stroke-width': st.width, 'data-edge': e.id })
     if (st.dash) p.setAttribute('stroke-dasharray', st.dash)
-    if (st.arrow) p.setAttribute('marker-end', 'url(#cv-arrow)')
+    if (st.arrow) p.setAttribute('marker-end', `url(#cv-arrow-${e.kind})`)
     C.edgeEls.set(e.id, p); gEdges.appendChild(p)
+  }
+  for (const e of C.edges.values()) { // 既有边直接落最终 d (无位移场景也要跟上新布局/新路由)
+    const p = C.edgeEls.get(e.id)
+    if (!p) continue
+    const d = edgePath(e)
+    if (d) p.setAttribute('d', d)
   }
   for (const [id, g] of C.nodeEls) if (!C.nodes.has(id)) { g.remove(); C.nodeEls.delete(id); C.pos.delete(id) }
   for (const n of C.nodes.values()) if (!C.nodeEls.has(n.id)) {
@@ -401,8 +445,21 @@ function nodeEl(n) {
   return g
 }
 
-// ---- 边几何: 右出左入 bezier; 反向时换侧 ----
+// ---- 边几何 (PMWEB-GRAPH): ① elk 路由折线 (sections 消费, 泳道内/DAG 全覆盖);
+// ② 跨泳道边 elk 不可见 → 通道绕行直角折线 (行间空隙带 + 全泳道右侧外部盒区, 零穿盒);
+// ③ 兜底右出左入 bezier (elk 失败/退化)。----
+const pathFromPoints = (pts) => pts.map(([x, y], i) => `${i ? 'L' : 'M'} ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ')
+const hash32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) } return h >>> 0 }
+
 function edgePath(e) {
+  const routed = C.edgeRoutes.get(e.id)
+  if (routed) return pathFromPoints(routed)
+  const ortho = crossLanePath(e)
+  if (ortho) return pathFromPoints(ortho)
+  return legacyEdgePath(e)
+}
+
+function legacyEdgePath(e) { // 旧右出左入 bezier; 反向时换侧
   const a = C.pos.get(e.from); const b = C.pos.get(e.to)
   if (!a || !b) return ''
   let sx; let sy; let tx; let ty
@@ -410,6 +467,54 @@ function edgePath(e) {
   const dx = Math.max(46, Math.abs(tx - sx) / 2)
   const dir = tx >= sx ? 1 : -1
   return `M ${sx} ${sy} C ${sx + dx * dir} ${sy}, ${tx - dx * dir} ${ty}, ${tx} ${ty}`
+}
+
+// 跨泳道正交绕行: 走「行间空隙带」(同泳道相邻两行节点之间纵向全宽无盒带) 与
+// 「全泳道右侧外部」(所有泳道 rect 之外) 两条通道, 全程不进任何节点盒。
+// boxAt 参数供 300ms 位移过渡期传入动画盒; 返回点列或 null (同泳道/无泳道 → 交兜底)。
+function crossLanePath(e, boxAt = null) {
+  const get = (id) => (boxAt ? boxAt(id) : C.pos.get(id))
+  const a = get(e.from); const b = get(e.to)
+  if (!a || !b || !C.lanes.length) return null
+  const laneOf = (p) => C.lanes.find((l) => p.y >= l.y - 1 && p.y + p.h <= l.y + l.h + 1)
+  const la = laneOf(a); const lb = laneOf(b)
+  if (!la || !lb || la.id === lb.id) return null
+  const rowEdges = (lane, p) => { // 与 p 纵向重叠的同行节点 → [最大底边, 最小顶边]
+    let bot = p.y + p.h; let top = p.y
+    for (const nid of lane.nodeIds) {
+      const q = get(nid)
+      if (q && q.y < p.y + p.h && q.y + q.h > p.y) { bot = Math.max(bot, q.y + q.h); top = Math.min(top, q.y) }
+    }
+    return { bot, top }
+  }
+  const nextTop = (lane, y) => { // y 带之下最近一行顶 (无 → 泳道内底)
+    let m = Infinity
+    for (const nid of lane.nodeIds) { const q = get(nid); if (q && q.y >= y - 0.5) m = Math.min(m, q.y) }
+    return m === Infinity ? lane.y + lane.h - 6 : m
+  }
+  const prevBottom = (lane, y) => { // y 带之上最近一行底 (无 → 泳道头之下)
+    let m = -Infinity
+    for (const nid of lane.nodeIds) { const q = get(nid); if (q && q.y + q.h <= y + 0.5) m = Math.max(m, q.y + q.h) }
+    return m === -Infinity ? lane.y + lane.head + 6 : m
+  }
+  const clampX = (lane, x) => clamp(x, lane.x + lane.pad + 6, Math.max(lane.x + lane.pad + 6, lane.x + lane.w - lane.pad - 6))
+  const maxRight = C.lanes.reduce((m, l) => Math.max(m, l.x + l.w), 0)
+  const ch = maxRight + 14 + (hash32(e.id) % 5) * 6 // 外部通道: 全泳道 rect 之外, 按 edge id 散列微错开
+  const acx = clampX(la, a.x + a.w / 2); const bcx = clampX(lb, b.x + b.w / 2)
+  const dedupe = (pts) => pts.filter((p, i) => !i || Math.abs(p[0] - pts[i - 1][0]) + Math.abs(p[1] - pts[i - 1][1]) > 0.5)
+  if (lb.y > la.y) { // B 在下方: 出 A 底 → 行间空隙带 → 外部通道 → B 上方空隙带 → 入 B 顶
+    const ra = rowEdges(la, a)
+    const gapA = Math.max((ra.bot + nextTop(la, ra.bot)) / 2, a.y + a.h + 4)
+    const rb = rowEdges(lb, b)
+    const gapB = Math.min((prevBottom(lb, rb.top) + rb.top) / 2, b.y - 4)
+    return dedupe([[acx, a.y + a.h], [acx, gapA], [ch, gapA], [ch, gapB], [bcx, gapB], [bcx, b.y]])
+  }
+  // B 在上方: 出 A 顶 → A 上方空隙带 → 外部通道 → B 下方空隙带 → 入 B 底
+  const ra = rowEdges(la, a)
+  const gapA = Math.min((prevBottom(la, ra.top) + ra.top) / 2, a.y - 4)
+  const rb = rowEdges(lb, b)
+  const gapB = Math.max((rb.bot + nextTop(lb, rb.bot)) / 2, b.y + b.h + 4)
+  return dedupe([[acx, a.y], [acx, gapA], [ch, gapA], [ch, gapB], [bcx, gapB], [bcx, b.y + b.h]])
 }
 
 // ---- 300ms 位移过渡 (节点 + 边同步重算, spec §4 item 7) ----
@@ -435,10 +540,27 @@ function tweenTo(ms = 300) {
       const y = from.y + (to.y - from.y) * k
       g.style.transform = `translate(${x}px, ${y}px)`
     }
-    // 边按当前动画位置重算端点: 位移期间以插值后的实际盒位置为准
+    // 边随动画重算 (PMWEB-GRAPH 三态): elk 路由边 = 终形折线 + 端桩随两端节点平移;
+    // 跨泳道边 = 按动画盒全量重算绕行; 其余 = 旧 bezier 端点重算。
     for (const e of C.edges.values()) {
       const p = C.edgeEls.get(e.id)
       if (!p) continue
+      const routed = C.edgeRoutes.get(e.id)
+      if (routed) {
+        const fa = animatedBox(e.from, starts, k, savedPos); const fb = animatedBox(e.to, starts, k, savedPos)
+        const fa0 = savedPos.get(e.from); const fb0 = savedPos.get(e.to)
+        if (!fa || !fb || !fa0 || !fb0) continue
+        const dxA = fa.x - fa0.x; const dyA = fa.y - fa0.y
+        const dxB = fb.x - fb0.x; const dyB = fb.y - fb0.y
+        p.setAttribute('d', pathFromPoints(routed.map(([x, y], i) => {
+          if (i < 2) return [x + dxA, y + dyA]
+          if (i >= routed.length - 2) return [x + dxB, y + dyB]
+          return [x, y]
+        })))
+        continue
+      }
+      const ortho = crossLanePath(e, (id) => animatedBox(id, starts, k, savedPos))
+      if (ortho) { p.setAttribute('d', pathFromPoints(ortho)); continue }
       const a = animatedBox(e.from, starts, k, savedPos); const b = animatedBox(e.to, starts, k, savedPos)
       if (!a || !b) continue
       let sx; let sy; let tx; let ty
@@ -488,7 +610,7 @@ function fitView() {
   const st = stage(); if (!st || st.clientWidth < 40) return // 隐藏 tab 时延到可见
   const world = C.lanes.reduce((a, l) => ({ w: Math.max(a.w, l.w), h: l.y + l.h }), { w: 0, h: 0 })
   if (!world.w) return
-  const s = clamp(Math.min((st.clientWidth - 32) / world.w, (st.clientHeight - 32) / world.h), 0.5, 2)
+  const s = clamp(Math.min((st.clientWidth - 32) / world.w, (st.clientHeight - 32) / world.h), ZOOM_MIN, 2)
   C.view = { s, x: (st.clientWidth - world.w * s) / 2, y: 12 }
   applyView()
 }
@@ -499,7 +621,7 @@ function wireStage() {
     e.preventDefault()
     const rect = s.getBoundingClientRect()
     const px = e.clientX - rect.left; const py = e.clientY - rect.top
-    const s2 = clamp(C.view.s * Math.exp(-e.deltaY * 0.0015), 0.5, 2)
+    const s2 = clamp(C.view.s * Math.exp(-e.deltaY * 0.0015), ZOOM_MIN, 2)
     C.view.x = px - (px - C.view.x) * (s2 / C.view.s)
     C.view.y = py - (py - C.view.y) * (s2 / C.view.s)
     C.view.s = s2
@@ -541,7 +663,7 @@ function wireStage() {
     const id = nodeG.dataset.id
     const p = C.pos.get(id)
     if (!p) return
-    const s2 = clamp(Math.max(C.view.s, 1.4), 0.5, 2)
+    const s2 = clamp(Math.max(C.view.s, 1.4), ZOOM_MIN, 2)
     C.view = { s: s2, x: st.clientWidth / 2 - (p.x + p.w / 2) * s2, y: st.clientHeight / 2 - (p.y + p.h / 2) * s2 }
     C.selected = id
     applyHighlight()
@@ -1138,6 +1260,8 @@ function introspect() {
     replay: { on: C.replay.on, loaded: C.replay.loaded, events: C.replay.events.length, cursor: C.replay.cursor, max: C.replay.max, playing: C.replay.playing, speed: C.replay.speed }, // PMW2-4/F
     minimapDots: $('#mm-dots') ? $('#mm-dots').children.length : 0,
     stickyVisible: [...($('#cv-sticky')?.children ?? [])].filter((c) => c.style.display !== 'none').length,
+    routedEdges: C.edgeRoutes.size, // PMWEB-GRAPH: elk sections 消费数
+    orthogonalEdges: [...C.edges.values()].filter((e) => !C.edgeRoutes.has(e.id) && C.pos.has(e.from) && C.pos.has(e.to)).length, // 跨泳道绕行数
   }
 }
 
@@ -1157,6 +1281,7 @@ const D2 = {
   scene: null, // clusterScene 结果 (折叠态语义)
   expanded: new Set(), // 展开的簇 key 集 (默认全折叠 = 聚合态)
   pos: new Map(), // 场景节点 id -> {x,y,w,h}
+  routes: new Map(), // edgeId -> [x,y][] elk 路由折线 (世界坐标; PMWEB-GRAPH sections 消费)
   world: { w: 0, h: 0 },
   nodeEls: new Map(),
   edgeEls: new Map(),
@@ -1252,6 +1377,7 @@ async function rebuildDag(force) {
   try {
     const r = await layoutDag()
     D2.pos = r.pos
+    D2.routes = r.routes ?? new Map()
     D2.world = { w: r.w, h: r.h }
   } catch (e) { // elk 不可用 → 本地网格兜底 (仍出簇, 边画直线 bezier)
     dagGridLayout()
@@ -1276,7 +1402,24 @@ async function layoutDag() {
     w = Math.max(w, (c.x ?? 0) + (c.width ?? 0))
     h = Math.max(h, (c.y ?? 0) + (c.height ?? 0))
   }
-  return { pos, w: Math.ceil(w), h: Math.ceil(h) }
+  // PMWEB-GRAPH: 消费 elk 边路由 sections (同 layoutLane; 曾弃用致自算 bezier 穿盒)
+  const routes = new Map()
+  const pushPt = (arr, x, y) => { if (Number.isFinite(x) && Number.isFinite(y)) arr.push([x, y]) }
+  for (const e of out.edges ?? []) {
+    const pts = []
+    for (const sec of e.sections ?? []) {
+      if (!sec.startPoint || !sec.endPoint) continue
+      const n0 = pts.length
+      pushPt(pts, sec.startPoint.x, sec.startPoint.y)
+      const b = sec.bendPoints ?? []
+      if (b.length && typeof b[0] === 'object') for (const bp of b) pushPt(pts, bp.x, bp.y)
+      else for (let i = 0; i + 1 < b.length; i += 2) pushPt(pts, b[i], b[i + 1])
+      pushPt(pts, sec.endPoint.x, sec.endPoint.y)
+      if (pts.length - n0 < 2) pts.length = n0
+    }
+    if (pts.length >= 2) routes.set(e.id, pts)
+  }
+  return { pos, w: Math.ceil(w), h: Math.ceil(h), routes }
 }
 
 function dagGridLayout() { // elk 失败兜底: 按簇序网格铺开 (降级优先, 不白屏)
@@ -1288,17 +1431,49 @@ function dagGridLayout() { // elk 失败兜底: 按簇序网格铺开 (降级优
   })
   const rows = Math.ceil(D2.scene.nodes.length / COLS)
   D2.pos = pos
+  D2.routes = new Map() // 网格兜底无路由 → dagEdgePath 走 bezier
   D2.world = { w: COLS * CW + 24, h: rows * CH + 24 }
+}
+
+// ---- 簇标签估宽 (PMWEB-GRAPH): canvas measureText 实测 —— 曾按 6px/字估, CJK 实宽近 2 倍致溢出;
+// 无 DOM/canvas 环境兜底按 CJK 全宽系数。----
+let measureCtx = null
+const DG_LABEL_FONT = '600 11.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace'
+const DG_SUB_FONT = '10px ui-monospace, "SF Mono", Menlo, Consolas, monospace'
+function textW(s, font = DG_LABEL_FONT) {
+  try {
+    measureCtx = measureCtx || document.createElement('canvas').getContext('2d')
+    if (measureCtx) { measureCtx.font = font; return measureCtx.measureText(String(s)).width }
+  } catch {}
+  return [...String(s)].reduce((a, ch) => a + (ch.charCodeAt(0) > 0x2e80 ? 11.5 : 7), 0)
+}
+function fitText(s, maxPx, font = DG_LABEL_FONT) { // 截断到实测宽 ≤ maxPx, 省略号收尾
+  s = String(s ?? '')
+  if (textW(s, font) <= maxPx) return s
+  let lo = 0; let hi = s.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (textW(`${s.slice(0, mid)}…`, font) <= maxPx) lo = mid
+    else hi = mid - 1
+  }
+  return `${s.slice(0, lo)}…`
 }
 
 function dagNodeSize(n) {
   if (n.type === 'cluster') {
-    const w1 = 40 + Math.min(String(n.label ?? '').length, 24) * 7
-    const w2 = 60 + `${n.total} 票 · ${n.active} 活跃`.length * 6
+    // 尺寸常数与渲染预算对齐: fitText 预算 = p.w - 28 (左 12 + 右 16 让位 ▸ 角标) → sizing 同 28/34
+    const w1 = 34 + Math.min(textW(String(n.label ?? '')), 226)
+    const w2 = 28 + Math.min(textW(dagClusterSub(n), DG_SUB_FONT), 232)
     return { w: clamp(Math.ceil(Math.max(w1, w2)), 130, 260), h: 46 }
   }
-  const w = 44 + Math.min(String(n.label ?? '').length, 22) * 7
+  const w = 44 + Math.min(textW(String(n.label ?? '')), 190)
   return { w: clamp(Math.ceil(w), 96, 220), h: 40 }
+}
+
+// 簇副标签: 票数/活跃/轨道 + 跨簇依赖计数 ↗出 ↘入 (无依赖不显示; PMWEB-GRAPH F3)
+function dagClusterSub(n) {
+  return `${n.total} 票 · ${n.active} 活跃${n.kind === 'single' ? '' : ' · ' + n.kind}` +
+    (n.depOut ? ` ↗${n.depOut}` : '') + (n.depIn ? ` ↘${n.depIn}` : '')
 }
 
 function dagNodeEl(n) {
@@ -1307,29 +1482,33 @@ function dagNodeEl(n) {
   if (n.type === 'cluster') {
     const stroke = n.active > 0 ? '#4da3ff' : '#6b7688'
     g.appendChild(svgEl('rect', { x: 1.5, y: 1.5, width: p.w - 3, height: p.h - 3, rx: 9, class: 'dg-node-body', stroke }))
-    const label = svgEl('text', { x: p.w / 2, y: 19, class: 'dg-label' })
-    label.textContent = String(n.label ?? n.id).slice(0, 26)
+    const labelText = fitText(n.label, p.w - 28)
+    const label = svgEl('text', { x: p.w / 2, y: 19, class: 'dg-label', title: String(n.label ?? '') })
+    label.textContent = labelText
     g.appendChild(label)
-    const sub = svgEl('text', { x: p.w / 2, y: 35, class: 'dg-sub' })
-    sub.textContent = `${n.total} 票 · ${n.active} 活跃${n.kind === 'single' ? '' : ' · ' + n.kind}`
+    const subText = fitText(dagClusterSub(n), p.w - 28, DG_SUB_FONT)
+    const sub = svgEl('text', { x: p.w / 2, y: 35, class: 'dg-sub', title: dagClusterSub(n) })
+    sub.textContent = subText
     g.appendChild(sub)
     const fold = svgEl('text', { x: p.w - 10, y: 15, class: 'dg-fold', 'data-fold': n.clusterKey, title: '展开/折叠成员票' }) // 角标: 点击折叠展开
     fold.textContent = '▸'
     g.appendChild(fold)
   } else {
     g.appendChild(svgEl('rect', { x: 1.5, y: 1.5, width: p.w - 3, height: p.h - 3, rx: 7, class: 'dg-node-body', stroke: colorOf(n.state) }))
-    const label = svgEl('text', { x: p.w / 2, y: 17, class: 'dg-label' })
-    label.textContent = String(n.label ?? n.id).slice(0, 24)
+    const label = svgEl('text', { x: p.w / 2, y: 17, class: 'dg-label', title: String(n.label ?? '') })
+    label.textContent = fitText(n.label, p.w - 28)
     g.appendChild(label)
-    const sub = svgEl('text', { x: p.w / 2, y: 32, class: 'dg-sub' })
-    sub.textContent = `${n.state}${n.leaseOwner ? ' · lease ' + n.leaseOwner : ''}`
+    const sub = svgEl('text', { x: p.w / 2, y: 32, class: 'dg-sub', title: `${n.state}${n.leaseOwner ? ' · lease ' + n.leaseOwner : ''}` })
+    sub.textContent = fitText(`${n.state}${n.leaseOwner ? ' · lease ' + n.leaseOwner : ''}`, p.w - 28, DG_SUB_FONT)
     g.appendChild(sub)
   }
   g.style.transform = `translate(${p.x}px, ${p.y}px)`
   return g
 }
 
-function dagEdgePath(e) { // 右出左入 bezier (同 cv-edge 几何)
+function dagEdgePath(e) { // elk 路由折线优先 (PMWEB-GRAPH); 网格兜底态走右出左入 bezier
+  const routed = D2.routes.get(e.id)
+  if (routed) return pathFromPoints(routed)
   const a = D2.pos.get(e.from); const b = D2.pos.get(e.to)
   if (!a || !b) return ''
   let sx; let sy; let tx; let ty
@@ -1344,7 +1523,7 @@ function drawDag() {
   if (!s) return
   s.textContent = ''
   const defs = svgEl('defs')
-  defs.appendChild(svgEl('marker', { id: 'dg-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }))
+  defs.appendChild(svgEl('marker', { id: 'dg-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 10, markerHeight: 10, markerUnits: 'userSpaceOnUse', orient: 'auto-start-reverse' }))
     .appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: EDGE_STYLE.dep.color }))
   s.appendChild(defs)
   const viewport = svgEl('g', { id: 'dg-viewport' })
@@ -1352,7 +1531,11 @@ function drawDag() {
   const gEdges = svgEl('g', { id: 'dg-edges' })
   D2.edgeEls.clear()
   for (const e of D2.scene.edges) {
-    const p = svgEl('path', { class: 'dg-edge', d: dagEdgePath(e), fill: 'none', stroke: EDGE_STYLE.dep.color, 'stroke-width': EDGE_STYLE.dep.width })
+    const st = EDGE_STYLE[e.kind] || EDGE_STYLE.dep
+    // PMWEB-GRAPH: #dg-arrow 接上 (曾定义零引用, dep 边方向不可读)
+    const p = svgEl('path', { class: `dg-edge k-${e.kind}`, d: dagEdgePath(e), fill: 'none', stroke: st.color, 'stroke-width': st.width, 'data-edge': e.id })
+    if (st.dash) p.setAttribute('stroke-dasharray', st.dash)
+    if (st.arrow) p.setAttribute('marker-end', 'url(#dg-arrow)')
     D2.edgeEls.set(e.id, p)
     gEdges.appendChild(p)
   }
@@ -1434,6 +1617,7 @@ async function toggleDagExpand(key, force) {
   if (next) D2.expanded.add(key)
   else D2.expanded.delete(key)
   await rebuildDag(true)
+  if (D2.world.w) { dagFitView(); D2.fitDone = true } // PMWEB-GRAPH: 展开/折叠后重取景 (曾不 fit 致新成员出画)
   renderDagList()
   renderDagCounts('')
 }
@@ -1496,7 +1680,7 @@ function applyDagView() {
 function dagFitView() {
   const st = dagStage()
   if (!st || st.clientWidth < 40 || !D2.world.w) return
-  const s = clamp(Math.min((st.clientWidth - 32) / D2.world.w, (st.clientHeight - 32) / D2.world.h), 0.3, 2)
+  const s = clamp(Math.min((st.clientWidth - 32) / D2.world.w, (st.clientHeight - 32) / D2.world.h), ZOOM_MIN, 2)
   D2.view = { s, x: (st.clientWidth - D2.world.w * s) / 2, y: 12 }
   applyDagView()
 }
@@ -1508,7 +1692,7 @@ function wireDagStage() {
     e.preventDefault()
     const rect = s.getBoundingClientRect()
     const px = e.clientX - rect.left; const py = e.clientY - rect.top
-    const s2 = clamp(D2.view.s * Math.exp(-e.deltaY * 0.0015), 0.3, 2)
+    const s2 = clamp(D2.view.s * Math.exp(-e.deltaY * 0.0015), ZOOM_MIN, 2)
     D2.view.x = px - (px - D2.view.x) * (s2 / D2.view.s)
     D2.view.y = py - (py - D2.view.y) * (s2 / D2.view.s)
     D2.view.s = s2

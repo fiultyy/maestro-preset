@@ -449,7 +449,7 @@ dialog button.primary {
 .cv-label { fill: var(--fg); font: 600 11px var(--mono); text-anchor: middle; pointer-events: none; }
 .cv-sub { fill: var(--dim); font: 10px var(--mono); text-anchor: middle; pointer-events: none; }
 
-.cv-edge { fill: none; opacity: .85; transition: opacity .25s; }
+.cv-edge { fill: none; opacity: .85; transition: opacity .25s; vector-effect: non-scaling-stroke; } /* PMWEB-GRAPH: 缩放时线宽/虚线不糊 */
 .cv-edge.cv-lit { stroke-width: 3; opacity: 1; }
 .cv-dim { opacity: .12 !important; } /* 选中/悬停时其余淡出 (spec §4 item 6: 30% 淡出基调下的强对比) */
 
@@ -599,7 +599,7 @@ button.cv-chip:hover { border-color: var(--accent); }
 .dg-sub { fill: var(--dim); font: 10px var(--mono); text-anchor: middle; pointer-events: none; }
 .dg-fold { fill: var(--dim); font: 10px var(--mono); cursor: pointer; }
 .dg-fold:hover { fill: var(--accent); }
-.dg-edge { fill: none; opacity: .85; transition: opacity .25s; }
+.dg-edge { fill: none; opacity: .85; transition: opacity .25s; vector-effect: non-scaling-stroke; } /* PMWEB-GRAPH: 同 cv-edge */
 .dg-edge.dg-lit { stroke-width: 3; opacity: 1; }
 .dg-dim { opacity: .12 !important; }
 .dg-node.dg-sel .dg-node-body { stroke-width: 3.5; filter: brightness(1.2); }

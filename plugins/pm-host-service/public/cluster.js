@@ -113,6 +113,21 @@ export function clusterTickets(tickets) {
     else label = ticketIds[0]
     clusters.push({ key, kind, label, ticketIds, total: ticketIds.length, active, states })
   }
+  // PMWEB-GRAPH (审计 #108): 跨轨撞名消歧 —— 不同轨/不同簇同名 label 追加轨道后缀
+  // (如 deps 分量与前缀族同叫 OF → 'OF·deps' / 'OF·prefix'), 簇列表与画布同源同规则;
+  // 同轨仍撞 (罕见: 同前缀多个连通分量) → 序号兜底。
+  const baseCount = new Map()
+  for (const c of clusters) baseCount.set(c.label, (baseCount.get(c.label) ?? 0) + 1)
+  if (baseCount.size !== clusters.length) {
+    const seen = new Map()
+    for (const c of clusters) {
+      if (baseCount.get(c.label) <= 1) continue
+      const base = `${c.label}·${c.kind}`
+      const n = (seen.get(base) ?? 0) + 1
+      seen.set(base, n)
+      c.label = n === 1 ? base : `${base}${n}`
+    }
+  }
   clusters.sort((a, b) => (b.active - a.active) || (b.total - a.total) || (a.key < b.key ? -1 : 1))
   return clusters
 }
@@ -149,7 +164,9 @@ export function clusterScene(tickets, expandedSet) {
       nodes.push({ id: nid, type: 'cluster', label: c.label, clusterKey: c.key, kind: c.kind, total: c.total, active: c.active, states: c.states, ticketIds: c.ticketIds })
     }
   }
-  // deps 边: 场景形态映射 + 去重 (折叠簇把多条成员边聚成一条簇间边)
+  // deps 边: 场景形态映射 + 去重 (折叠簇把多条成员边聚成一条簇间边)。
+  // PMWEB-GRAPH (审计 #108): 跨簇 deps 边在此生成簇级边 (两端各自映射到簇节点/成员节点,
+  // 不同场景节点即保留) —— 折叠态簇间依赖必须可见; 簇内边 from===to 折叠语义不变。
   const seen = new Set()
   const edges = []
   for (const t of byId.values()) {
@@ -165,5 +182,13 @@ export function clusterScene(tickets, expandedSet) {
       edges.push({ id: eid, kind: 'dep', from, to, label: '' })
     }
   }
+  // PMWEB-GRAPH: 簇级依赖度 —— 出/入簇跨簇 deps 边计数 (折叠簇节点副标签 ↗N ↘N; 无依赖不显示)
+  const degOut = new Map()
+  const degIn = new Map()
+  for (const e of edges) {
+    degOut.set(e.from, (degOut.get(e.from) ?? 0) + 1)
+    degIn.set(e.to, (degIn.get(e.to) ?? 0) + 1)
+  }
+  for (const n of nodes) if (n.type === 'cluster') { n.depOut = degOut.get(n.id) ?? 0; n.depIn = degIn.get(n.id) ?? 0 }
   return { clusters, nodes, edges, nodeOfTicket, clusterRoot, expanded }
 }

@@ -14,10 +14,17 @@
 //    联动 (选簇聚焦其余淡出 / 选票自动展开高亮 deps 边) + 折叠展开往返 + 空白取消;
 //    席位 tab 小卡 (一行: 状态点+code+持票数) + 组织图血缘嵌套 (head 上 worker 下)
 //    + 详情浮层全量字段+持票列表+关闭返回。页面异常任何一例即 FAIL。
+// D. PMWEB-GRAPH 几何门 (独立扩模 sandbox, 零 live 变更):
+//    G1 几何断言: 泳道/DAG SVG 边路径采样点 vs 非端点节点盒零求交 (容差 2px 内缩);
+//    G2 fixture 扩模: 4 flows×(6-8) 节点 + 13 票 + 4 席 ≥30 节点, ≥3 跨泳道 dispatch 边
+//    + 2 双向对 (反向边), 断言四类边 marker-end 全覆盖 + elk sections 消费;
+//    G3 浏览器级: 折叠态跨簇 deps → 簇级边 ≥1 + 簇副标签 ↗N/↘N 计数渲染;
+//    G4 = 既有断言零回归 (A/B/C 全段原样)。
 // 留存: 截图/日志落 $PM_HOST_SERVICE_GATES_DIR/pmweb-dag/<label>/。
-// Usage: node pmweb-dag-gate.mjs <label> [chrome-bin]
+// Usage: node pmwweb-dag-gate.mjs <label> [chrome-bin]
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 
@@ -95,6 +102,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     return ids.join() === 'cl:fam:Q,tk:Q-1,tk:Q-2' && sc.edges.length === 1 && sc.edges[0].id === 'dep:tk:Q-1>tk:Q-2'
       && sc.nodeOfTicket.get('Q-1') === 'tk:Q-1' && sc.nodeOfTicket.get('Q-3') === 'cl:fam:Q'
   })())
+  // PMWEB-GRAPH G3 (unit): 折叠态簇间 deps → 簇级边 + ↗出/↘入计数
+  ok('G3 unit: 2 簇跨簇 deps → 折叠场景簇级边 ≥1 + ↗↘ 计数正确', (() => {
+    const ts = [t('RA-1', { refs: '{"run":"RA"}', deps: '["RB-9"]' }), t('RA-2', { refs: '{"run":"RA"}' }), t('RB-9', { refs: '{"run":"RB"}' })]
+    const sc = clusterScene(ts, new Set())
+    const ra = sc.nodes.find((n) => n.id === 'cl:run:RA')
+    const rb = sc.nodes.find((n) => n.id === 'cl:run:RB')
+    return sc.edges.length === 1 && sc.edges[0].id === 'dep:cl:run:RB>cl:run:RA'
+      && rb?.depOut === 1 && rb?.depIn === 0 && ra?.depIn === 1 && ra?.depOut === 0
+  })())
+  ok('G3 unit: 无跨簇依赖 → 计数位为 0 (渲染侧不显示)', (() => {
+    const ts = [t('S-1', { refs: '{"run":"SC"}' }), t('S-2', { refs: '{"run":"SC"}' })]
+    const sc = clusterScene(ts, new Set())
+    return sc.edges.length === 0 && sc.nodes.every((n) => n.depOut === 0 && n.depIn === 0)
+  })())
+  // PMWEB-GRAPH (审计 #108): 跨轨撞名消歧
+  ok('F8 unit: 跨轨撞名 label 加轨道后缀 (OF·deps / OF·prefix), 独名不变', (() => {
+    const ts = [t('OF-1'), t('OF-2', { deps: '["OF-1"]' }), t('OF-3'), t('OF-4')]
+    const c = clusterTickets(ts)
+    const labels = c.map((x) => x.label).sort()
+    const solo = clusterTickets([t('SOLO'), t('SXX-1', { refs: '{"run":"SR"}' }), t('SXX-2', { refs: '{"run":"SR"}' })])
+    return c.length === 2 && new Set(labels).size === 2 && labels.includes('OF·deps') && labels.includes('OF·prefix')
+      && solo.map((x) => x.label).sort().join() === 'SOLO,run:SR' // 无撞名 → 零消歧 (回归)
+  })())
   ok('A 辅助: ticketRun/ticketDeps/ticketPrefix 脏形防御', ticketRun({ refs: '{"run":42}' }) === '42' && ticketDeps({ deps: '{"a":1}' }).length === 0 && ticketPrefix('NOPREFIX') === null && ticketPrefix('AND1-2') === 'AND1')
   ok('A 终态集冻结: done/merged/rejected', TERMINAL_STATES.size === 3 && ['done', 'merged', 'rejected'].every((s) => TERMINAL_STATES.has(s)))
 }
@@ -152,14 +182,35 @@ const SEATS = {
   h1: { code: 'h1', sessionId: 'session-11111111-aaaa-4bbb-8ccc-111111111111', role: 'head', node: 'n-head', preset: 'maestro', spawnedAt: '2026-09-01T00:00:00Z', status: 'active' },
   w1: { code: 'w1', sessionId: 'session-22222222-aaaa-4bbb-8ccc-222222222222', role: 'worker', node: 'n-w', preset: 'long-task', spawnedAt: '2026-09-01T01:00:00Z', status: 'active' },
 }
-function writeFleet(sb) {
+function writeFleet(sb, fleet = SEATS) {
   const file = `${sb}/maestro/fleet.json`
-  writeFileSync(`${file}.tmp.${process.pid}`, `${JSON.stringify({ rev: 1, fleet: SEATS }, null, 2)}\n`)
+  writeFileSync(`${file}.tmp.${process.pid}`, `${JSON.stringify({ rev: 1, fleet }, null, 2)}\n`)
   renameSync(`${file}.tmp.${process.pid}`, file)
 }
-const LEDGER_STUB = `#!/bin/bash
+// PMWEB-GRAPH G2 fixture: flow state.db 最小四表 schema (v_status/v_rollup/nodes/events,
+// 供 gatherFlowGraph + PM-006 op=flow 只读查询; 独立 sandbox 内一次性写入, 不触 live)
+function writeFlowDb(dir, spec) {
+  mkdirSync(dir, { recursive: true })
+  const db = new DatabaseSync(`${dir}/state.db`)
+  try {
+    db.exec('CREATE TABLE v_status (node_id TEXT PRIMARY KEY, verb TEXT, state TEXT, attempts INTEGER DEFAULT 0, events INTEGER DEFAULT 0);\nCREATE TABLE v_rollup (state TEXT PRIMARY KEY, count INTEGER DEFAULT 0);\nCREATE TABLE nodes (node_id TEXT PRIMARY KEY, deps TEXT DEFAULT \'[]\');\nCREATE TABLE events (id INTEGER PRIMARY KEY, node_id TEXT, detail TEXT)')
+    const insN = db.prepare('INSERT INTO v_status (node_id, verb, state) VALUES (?, ?, ?)')
+    const insD = db.prepare('INSERT INTO nodes (node_id, deps) VALUES (?, ?)')
+    const insE = db.prepare('INSERT INTO events (id, node_id, detail) VALUES (?, ?, ?)')
+    const roll = {}
+    for (const n of spec.nodes) {
+      insN.run(n.id, n.verb ?? 'status', n.state ?? 'done')
+      insD.run(n.id, JSON.stringify(n.deps ?? []))
+      roll[n.state ?? 'done'] = (roll[n.state ?? 'done'] ?? 0) + 1
+    }
+    ;(spec.events ?? []).forEach((e, i) => insE.run(i + 1, e.node, e.detail))
+    const insR = db.prepare('INSERT INTO v_rollup (state, count) VALUES (?, ?)')
+    for (const [s, c] of Object.entries(roll)) insR.run(s, c)
+  } finally { db.close() }
+}
+const LEDGER_STUB = (tickets) => `#!/bin/bash
 if [ "$1 $2" = "ticket list" ]; then
-  echo '${JSON.stringify({ tickets: TICKETS })}'
+  echo '${JSON.stringify({ tickets })}'
   exit 0
 fi
 echo "stub-ok"; exit 0
@@ -179,14 +230,16 @@ async function startMockDsh() {
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   return { server, port: server.address().port, close: () => new Promise((r) => server.close(r)) }
 }
-async function startSandbox(tag) {
+async function startSandbox(tag, opts = {}) { // PMWEB-GRAPH: opts = { fleet, tickets, flows } 覆写 (缺省 = 既有 fixture 原样)
+  const { fleet = SEATS, tickets = TICKETS, flows = null } = opts
   const sb = `${BASE}/${tag}`
   rmSync(sb, { recursive: true, force: true })
   mkdirSync(`${sb}/maestro/bin`, { recursive: true })
-  writeFileSync(`${sb}/maestro/bin/ledger`, LEDGER_STUB, { mode: 0o755 })
+  writeFileSync(`${sb}/maestro/bin/ledger`, LEDGER_STUB(tickets), { mode: 0o755 })
   writeFileSync(`${sb}/maestro/bin/flowc`, '#!/bin/bash\necho "flowc inspect (stub)"; exit 0\n', { mode: 0o755 })
   writeFileSync(`${sb}/maestro/bin/fleet-list`, '#!/bin/bash\necho "[]"\n', { mode: 0o755 })
-  writeFleet(sb)
+  writeFleet(sb, fleet)
+  if (flows) for (const [name, spec] of Object.entries(flows)) writeFlowDb(`${sb}/maestro/flows/${name}`, spec)
   // 血缘 fixture: callback 边 worker→head (bridge inbox.log 行格式, service gatherBridgePairs)
   mkdirSync(`${sb}/maestro/bridge`, { recursive: true })
   writeFileSync(`${sb}/maestro/bridge/inbox.log`, `${JSON.stringify({ from: 'w1@session-22222222-aaaa-4bbb-8ccc-222222222222', to: 'head@session-11111111-aaaa-4bbb-8ccc-111111111111' })}\n`)
@@ -404,10 +457,178 @@ async function sandboxPart() {
   }
 }
 
+// ---------- D. PMWEB-GRAPH 几何门 (扩模 sandbox: G1 穿盒零求交 / G2 箭头+扩模 / G3 簇间边) ----------
+// G2 fixture: 4 flows (8+8+6+6=28 flow-node, 含 2 双向对) + 13 票 (7 基线 + GR1 跨簇 + OF 撞名组)
+// + 4 席 (h1/w1/aa11/bb22, hex 码供 dispatch 事件 4-hex 匹配) + 2 session = 47 节点 ≥30;
+// 跨泳道 dispatch 边 3 条 (fleet 泳道 → flow 泳道); 泳道内 dep 边含双向对/长链。
+const TICKETS_G2 = [
+  ...TICKETS,
+  { ticket_id: 'GX-1', state: 'running', deps: '["CH-A"]', refs: '{"run":"GR1"}', lease_owner: null },
+  { ticket_id: 'GX-2', state: 'dispatched', deps: '[]', refs: '{"run":"GR1"}', lease_owner: null },
+  { ticket_id: 'OF-1', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
+  { ticket_id: 'OF-2', state: 'done', deps: '["OF-1"]', refs: '{}', lease_owner: null },
+  { ticket_id: 'OF-3', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
+  { ticket_id: 'OF-4', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
+]
+const SEATS_G2 = {
+  ...SEATS,
+  aa11: { code: 'aa11', sessionId: '', role: 'worker', node: 'n-g2a', preset: 'long-task', spawnedAt: '2026-09-02T00:00:00Z', status: 'active' },
+  bb22: { code: 'bb22', sessionId: '', role: 'worker', node: 'n-g2b', preset: 'long-task', spawnedAt: '2026-09-02T00:00:00Z', status: 'active' },
+}
+const chainNodes = (prefix, n, extra = {}) => Array.from({ length: n }, (_, i) => ({
+  id: `${prefix}${i + 1}`, deps: i > 0 ? [`${prefix}${i}`] : [], ...extra,
+}))
+const FLOW_SPECS = {
+  g1: {
+    nodes: [
+      { id: 'n1', deps: ['n2'] }, { id: 'n2', deps: ['n1'] }, // 双向对 ① (反向边来源)
+      { id: 'n3', deps: ['n2'], verb: 'dispatch' }, { id: 'n4', deps: ['n1'] },
+      { id: 'n5', deps: ['n3', 'n4'] }, { id: 'n6', deps: ['n5'], verb: 'dispatch' },
+      { id: 'n7', deps: ['n6'] }, { id: 'n8', deps: ['n7'] },
+    ],
+    events: [{ node: 'n3', detail: 'spawn seat aa11 for steer' }, { node: 'n6', detail: 'reroute to seat bb22 now' }],
+  },
+  g2: {
+    nodes: chainNodes('m', 8, { }),
+    events: [{ node: 'm4', detail: 'dispatch to seat aa11 done' }],
+  },
+  g3: {
+    nodes: [
+      ...chainNodes('p', 4),
+      { id: 'p5', deps: ['p3', 'p4'] }, { id: 'p6', deps: ['p5'] },
+    ],
+  },
+  g4: { nodes: chainNodes('q', 6) },
+}
+// G1 几何扫描 (in-page): 边路径按长度采样, 与「非端点节点盒」(内缩 2px 容差) 求交计数。
+// 坐标一律 user space (getBBox/transform vs getPointAtLength), 与 viewport transform 无关。
+const geoSweep = (svgSel, nodeSel, edgeSel) => `(() => {
+  const svg = document.querySelector('${svgSel}')
+  if (!svg) return { error: 'no svg' }
+  const boxes = new Map()
+  for (const g of svg.querySelectorAll('${nodeSel}')) {
+    const m = /translate\\(([-\\d.]+)px,\\s*([-\\d.]+)px\\)/.exec(g.style.transform || '')
+    const r = g.querySelector('rect, path')
+    if (!m || !r) continue
+    const b = r.getBBox()
+    boxes.set(g.dataset.id, { x: +m[1] + b.x, y: +m[2] + b.y, w: b.width, h: b.height })
+  }
+  const TOL = 2
+  let samples = 0
+  const hits = []
+  const edges = [...svg.querySelectorAll('${edgeSel}')]
+  for (const p of edges) {
+    const id = p.getAttribute('data-edge') || ''
+    const ends = new Set(id.replace(/^[a-z-]+:/, '').split('>'))
+    let len = 0
+    try { len = p.getTotalLength() } catch { continue }
+    const n = Math.min(80, Math.max(12, Math.ceil(len / 6)))
+    for (let i = 0; i <= n; i++) {
+      const pt = p.getPointAtLength((len * i) / n)
+      samples++
+      for (const [nid, b] of boxes) {
+        if (ends.has(nid)) continue
+        if (pt.x > b.x + TOL && pt.x < b.x + b.w - TOL && pt.y > b.y + TOL && pt.y < b.y + b.h - TOL) {
+          hits.push(id + '@' + nid + '(' + pt.x.toFixed(0) + ',' + pt.y.toFixed(0) + ')')
+        }
+      }
+    }
+  }
+  return { edges: edges.length, nodes: boxes.size, samples, violations: hits.length, hits: hits.slice(0, 5) }
+})()`
+
+async function graphPart() {
+  const shot = (f) => `${BASE}/${f}`
+  const errors = []
+  const box = await startSandbox('g2graph', { fleet: SEATS_G2, tickets: TICKETS_G2, flows: FLOW_SPECS })
+  let c = null
+  try {
+    c = await newChrome('g2')
+    c.cdp.on((m) => { if (m.method === 'Runtime.exceptionThrown') errors.push(JSON.stringify(m.params?.exceptionDetails ?? {}).slice(0, 160)) })
+    await c.cdp.send('Page.enable')
+    await c.cdp.send('Runtime.enable')
+    await c.cdp.send('Page.navigate', { url: `http://127.0.0.1:${box.port}/` })
+    let ready = false
+    for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmCanvas && window.__pmCanvas.ready === true && window.__pmDag && window.__pmDag.ready === true') } catch {} }
+    ok('G2 页面就绪 (扩模 sandbox 双场景)', ready)
+
+    // 画布 tab: 泳道视图
+    await c.cdp.eval(`document.querySelector('[data-view="canvas"]').click()`)
+    let mode = ''
+    for (let i = 0; i < 40 && mode !== 'canvas'; i++) { await sleep(250); mode = await c.cdp.eval('window.__pmCanvas ? window.__pmCanvas.mode : ""') }
+    await sleep(800)
+    const cv = await c.cdp.eval('({ nodes: window.__pmCanvas.nodes, edges: window.__pmCanvas.edges, lanes: window.__pmCanvas.lanes, routed: window.__pmCanvas.routedEdges, ortho: window.__pmCanvas.orthogonalEdges })')
+    ok('G2 扩模: 泳道场景 ≥30 节点 (4 flows+13 票+4 席+2 session)', cv.nodes >= 30 && cv.lanes >= 4, JSON.stringify(cv))
+    ok('G2 elk sections 消费: 路由边 ≥20 + 跨泳道绕行边 ≥3', cv.routed >= 20 && cv.ortho >= 3, `routed=${cv.routed} ortho=${cv.ortho}`)
+    const markers = await c.cdp.eval(`(() => {
+      const out = {}
+      for (const kind of ['dep', 'dispatch', 'callback', 'cb-send']) {
+        const ps = [...document.querySelectorAll('#canvas-svg path.cv-edge.k-' + kind)]
+        out[kind] = { total: ps.length, withMarker: ps.filter((p) => p.getAttribute('marker-end')).length }
+      }
+      return out
+    })()`)
+    ok('G2 箭头: dep/callback/cb-send/dispatch 全部 marker-end (G2 断言)', markers.dep.total > 0 && markers.dep.withMarker === markers.dep.total
+      && markers.callback.total > 0 && markers.callback.withMarker === markers.callback.total
+      && markers.dispatch.total >= 3 && markers.dispatch.withMarker === markers.dispatch.total, JSON.stringify(markers))
+    const bidir = await c.cdp.eval(`({
+      e12: !!document.querySelector('#canvas-svg path[data-edge="dep:fn:g1/n1>fn:g1/n2"]'),
+      e21: !!document.querySelector('#canvas-svg path[data-edge="dep:fn:g1/n2>fn:g1/n1"]'),
+    })`)
+    ok('G2 双向对: g1/n1↔n2 两方向边均在场 (反向边语义)', bidir.e12 && bidir.e21, JSON.stringify(bidir))
+    const geoLane = await c.cdp.eval(geoSweep('#canvas-svg', '.cv-node', '.cv-edge'))
+    ok('G1 泳道: 边采样点 vs 非端点节点盒零求交 (容差 2px)', geoLane.edges > 0 && geoLane.violations === 0, JSON.stringify(geoLane))
+    await c.cdp.shot(shot('g2-lane-ortho.png'))
+
+    // 图 tab: 聚合 DAG
+    await c.cdp.eval(`document.querySelector('[data-view="dag"]').click()`)
+    await sleep(1500)
+    const dag = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, clusters: window.__pmDag.clusters })')
+    ok('G3 浏览器: 折叠态 7 簇 + 跨簇 deps → 簇级边 ≥1', dag.clusters === 7 && dag.edges >= 1, JSON.stringify(dag))
+    const sub = await c.cdp.eval(`({
+      out: (document.querySelector('.dg-node[data-id="cl:cdep:CH-A"] .dg-sub') || {}).textContent || '',
+      inn: (document.querySelector('.dg-node[data-id="cl:run:GR1"] .dg-sub') || {}).textContent || '',
+    })`)
+    ok('G3 渲染: 簇副标签 ↗出/↘入 计数位 (无依赖不显示)', /↗1/.test(sub.out) && !/↘/.test(sub.out) && /↘1/.test(sub.inn) && !/↗/.test(sub.inn), JSON.stringify(sub))
+    const disamb = await c.cdp.eval(`(() => {
+      const t = document.querySelector('#dg-list').textContent
+      return { deps: t.includes('OF·deps'), prefix: t.includes('OF·prefix') }
+    })()`)
+    ok('F8 渲染: 簇列表撞名消歧后缀在场 (与画布同规则)', disamb.deps && disamb.prefix, JSON.stringify(disamb))
+    const fit = await c.cdp.eval(`(() => {
+      let over = 0
+      for (const g of document.querySelectorAll('#dag-svg .dg-node')) {
+        const t = g.querySelector('.dg-label'); const r = g.querySelector('rect')
+        if (!t || !r) continue
+        if (t.getComputedTextLength() > r.getBBox().width - 20) over++
+      }
+      return { over, nodes: document.querySelectorAll('#dag-svg .dg-node').length }
+    })()`)
+    ok('F7 标签: CJK/长标签实测估宽 → 零溢出盒框', fit.over === 0 && fit.nodes >= 7, JSON.stringify(fit))
+    const geoDag = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
+    ok('G1 DAG: 边采样点 vs 非端点节点盒零求交 (容差 2px)', geoDag.edges > 0 && geoDag.violations === 0, JSON.stringify(geoDag))
+    await c.cdp.shot(shot('g2-dag-clusters.png'))
+
+    // 展开簇 → 重取景 (F4) + 展开态几何复验
+    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:OF-1"]'))
+    await sleep(1200)
+    const expanded = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, view: window.__pmDag.view })')
+    ok('F4 重取景: 展开簇后 fit 生效 (取景缩放=拟合值)', expanded.nodes === 8 && expanded.edges >= 2 && expanded.view.s > 0, JSON.stringify(expanded))
+    const geoDagOpen = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
+    ok('G1 DAG 展开态: 簇内边+跨簇边零穿盒', geoDagOpen.edges >= 2 && geoDagOpen.violations === 0, JSON.stringify(geoDagOpen))
+    await c.cdp.shot(shot('g2-dag-expanded.png'))
+    ok('D 页面零异常 (全段)', errors.length === 0, errors.slice(0, 2).join(' | '))
+  } finally {
+    await killChrome(c)
+    await box.stop()
+  }
+}
+
 // ---------- 运行 ----------
 mkdirSync(BASE, { recursive: true })
 const startedAt = new Date().toISOString()
 await sandboxPart()
+await graphPart()
 writeFileSync(`${BASE}/manifest.json`, `${JSON.stringify({ label: LABEL, gate: 'pmweb-dag', startedAt, finishedAt: new Date().toISOString(), pass, fail, node: process.version, repo: REPO }, null, 2)}\n`)
 console.log(`\n=== ${LABEL}: PASS=${pass} FAIL=${fail} (evidence: ${BASE}) ===`)
 process.exit(fail === 0 ? 0 : 1)
