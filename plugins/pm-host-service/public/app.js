@@ -52,6 +52,7 @@ const state = {
   tickets: null, // { ok, data, err }
   fleet: null,
   flow: null,
+  graph: null, // PMWEB-DAG: /op/graph (席位组织图血缘源; 只读)
   health: null,
   acts: new Map(), // ref -> entry（页面内存态，可丢；服务侧 registry 为权威）
 }
@@ -78,6 +79,12 @@ async function loadFlow() {
   renderFlow()
 }
 
+// PMWEB-DAG: /op/graph 只为席位组织图供血缘 (callback 边 = worker→head 会话血缘)。
+async function loadGraph() {
+  state.graph = await fetchJson('/op/graph')
+  renderFleet() // 血缘到齐后重绘席位组织图 (票/流程视图不依赖它)
+}
+
 async function pollHealth() {
   state.health = await fetchJson('/health')
   renderHealth()
@@ -89,6 +96,7 @@ const refetch = {
   tickets: debounce(loadTickets, 400),
   fleet: debounce(loadFleet, 400),
   flow: debounce(loadFlow, 400),
+  graph: debounce(loadGraph, 400),
 }
 
 /* ---- 渲染：票视图 (kanban by state + deps + lease_owner) ---- */
@@ -145,27 +153,63 @@ function renderTickets() {
     </div>`).join('')}</div>`
 }
 
-/* ---- 渲染：席位视图 (卡片 + 持票 + 相对年龄) ---- */
+/* ---- 渲染：席位视图 (组织图 + 小卡 + 详情浮层; PMWEB-DAG 需求 4-7) ---- */
+// 需求 4: 本视图零票 DAG 挂载点 (票 DAG 在「图」tab)。
+// 需求 5: 组织图 = 血缘树 (callback 边 worker→head, head 在上 worker 在下) + 持票边
+//         (lease_owner→席位, 体现为小卡持票数与浮层持票列表); 只吃席位/血缘/持票数据。
+// 需求 6: 席位小卡一行缩略 (状态点 + code + 持票数)。
+// 需求 7: 点小卡 → 详情浮层 (join 现成字段全量 + 持票列表)。
 
-function seatCard(s, leaseCounts) {
-  const held = leaseCounts.get(s.code) || 0
-  const ses = s.session
+// 血缘: /op/graph callback 边语义 from=worker session, to=head session (service.mjs
+// bridge 派生)。席位级组织树: 子席位挂父席位; 一父多子保持出现序; 多父取首见
+// (确定性); visited 防环; 血缘源不可达 → 平铺小卡+注记 (降级优先)。
+function lineageOf(seats) {
+  const bySid = new Map(seats.filter((s) => s.sessionId).map((s) => [String(s.sessionId), s]))
+  const headOf = new Map() // 子席位 code → 父席位 code
+  const childrenOf = new Map() // 父席位 code → [子席位 code]
+  const g = state.graph
+  const edges = g && g.ok && g.data && Array.isArray(g.data.edges) ? g.data.edges : []
+  for (const e of edges) {
+    if (!e || e.kind !== 'callback') continue
+    const w = bySid.get(String(e.from ?? '').replace(/^se:/, ''))
+    const h = bySid.get(String(e.to ?? '').replace(/^se:/, ''))
+    if (!w || !h || w.code === h.code || headOf.has(w.code)) continue
+    headOf.set(w.code, h.code)
+    if (!childrenOf.has(h.code)) childrenOf.set(h.code, [])
+    childrenOf.get(h.code).push(w.code)
+  }
+  return { headOf, childrenOf }
+}
+
+const STATUS_DOT = {
+  active: '#3fbf7f', running: '#4da3ff', ready: '#4da3ff', idle: '#7f8da0',
+  stale: '#e0a93e', probing: '#e0a93e', interrupted: '#e06c5f', error: '#e06c5f',
+  unknown: '#7f8da0',
+}
+
+// 需求 6: 小卡一行 = 状态点 + code + 角色/活性 + 持票数
+function seatMini(s, held) {
   const status = s.status || 'unknown'
+  const dot = STATUS_DOT[status] || STATUS_DOT.unknown
+  const live = s.session && s.session.running ? ' · live' : ''
   return `
-    <div class="seat-card">
-      <div class="seat-head">
-        <span class="code">${esc(s.code)}</span>
-        <span class="state-badge st-${esc(status)}">${esc(status)}</span>
-        <span class="role">${esc(s.role || '—')}</span>
-      </div>
-      <dl>
-        <dt>node</dt><dd>${esc(s.node || '—')}</dd>
-        <dt>preset</dt><dd>${esc(s.preset || '—')}</dd>
-        <dt>spawned</dt><dd>${esc(s.spawnedAt || '—')} <span class="dim">(${relAge(s.spawnedAt)})</span></dd>
-        <dt>持票(lease)</dt><dd>${held} 张</dd>
-        <dt>session</dt><dd>${ses ? (ses.running ? 'running' : 'idle') : '未 join'}</dd>
-      </dl>
-      <div class="session-title">${ses && ses.title ? esc(ses.title) : (ses ? '（无标题）' : 'dsh session 不可达或已归档')}</div>
+    <button type="button" class="seat-mini" data-code="${esc(s.code)}" title="点击查看席位全量信息">
+      <span class="seat-dot" style="background:${dot}" title="${esc(status)}"></span>
+      <span class="sm-code mono">${esc(s.code)}</span>
+      <span class="sm-role">${esc(s.role || '—')}${live}</span>
+      <span class="sm-held">${held} 票</span>
+    </button>`
+}
+
+function orgBranch(code, seatsByCode, childrenOf, rendered, heldCounts) {
+  const s = seatsByCode.get(code)
+  if (!s || rendered.has(code)) return ''
+  rendered.add(code)
+  const kids = childrenOf.get(code) || []
+  return `
+    <div class="org-node" data-code="${esc(code)}">
+      ${seatMini(s, heldCounts.get(code) || 0)}
+      ${kids.length ? `<div class="org-children">${kids.map((k) => orgBranch(k, seatsByCode, childrenOf, rendered, heldCounts)).join('')}</div>` : ''}
     </div>`
 }
 
@@ -181,15 +225,95 @@ function renderFleet() {
     el.innerHTML = note + emptyNote(`0 席位${d.note ? ' —— ' + esc(d.note) : '（fleet.json 空：无在场 worker）'}`)
     return
   }
-  // 持票计数：票面 lease_owner -> seat code（/op/tickets 数据可得时）
-  const leaseCounts = new Map()
+  // 持票计数 + 持票列表 (票面 lease_owner -> seat code;/op/tickets 可得时)
+  const heldCounts = new Map()
+  const heldBy = new Map()
   const tk = state.tickets
   if (tk && tk.ok && Array.isArray(tk.data.tickets)) {
     for (const t of tk.data.tickets) {
-      if (t.lease_owner) leaseCounts.set(t.lease_owner, (leaseCounts.get(t.lease_owner) || 0) + 1)
+      if (!t.lease_owner) continue
+      heldCounts.set(t.lease_owner, (heldCounts.get(t.lease_owner) || 0) + 1)
+      if (!heldBy.has(t.lease_owner)) heldBy.set(t.lease_owner, [])
+      heldBy.get(t.lease_owner).push(t)
     }
   }
-  el.innerHTML = note + `<div class="fleet-grid">${seats.map((s) => seatCard(s, leaseCounts)).join('')}</div>`
+  const seatsByCode = new Map(seats.map((s) => [s.code, s]))
+  const { headOf, childrenOf } = lineageOf(seats)
+  const rendered = new Set()
+  const roots = seats.filter((s) => !headOf.has(s.code)).map((s) => s.code)
+  const tree = roots.map((c) => orgBranch(c, seatsByCode, childrenOf, rendered, heldCounts)).join('')
+  const missed = seats.filter((s) => !rendered.has(s.code))
+    .map((s) => orgBranch(s.code, seatsByCode, childrenOf, rendered, heldCounts)).join('') // 环防漏
+  const lineageNote = (state.graph && state.graph.ok)
+    ? ''
+    : viewNote('血缘源 (/op/graph) 不可达 —— 组织图退化为平铺小卡（降级优先，CLI/账本不受影响）')
+  el.innerHTML = note + lineageNote + `<div class="org-chart">${tree}${missed}</div>`
+}
+
+/* ---- 席位详情浮层 (需求 7: join 现成字段全量 + 持票列表 + 血缘, 关闭返回) ---- */
+
+const sdRow = (k, v) => `<div class="sd-row"><dt>${esc(k)}</dt><dd>${v}</dd></div>`
+const sdVal = (v) => v == null || v === ''
+  ? '<span class="dim">—</span>'
+  : (typeof v === 'object' ? `<span class="mono small">${esc(JSON.stringify(v))}</span>` : esc(String(v)))
+
+function seatDetailHtml(code) {
+  const r = state.fleet
+  const seats = r && r.ok && r.data && Array.isArray(r.data.seats) ? r.data.seats : []
+  const s = seats.find((x) => x.code === code)
+  if (!s) return '<p class="dim small">席位已不在场（fleet 已刷新）——关闭返回。</p>'
+  const rows = []
+  for (const [k, v] of Object.entries(s)) { // join 现成字段全量 (服务侧日后新增字段自动展示)
+    if (k === 'session') continue
+    rows.push(sdRow(k, k === 'spawnedAt' ? `${sdVal(v)} <span class="dim small">(${relAge(v)})</span>` : sdVal(v)))
+  }
+  if (s.session && typeof s.session === 'object') {
+    for (const [k, v] of Object.entries(s.session)) rows.push(sdRow(`session.${k}`, k === 'title' ? `<span class="small">${sdVal(v)}</span>` : sdVal(v)))
+  }
+  // 持票列表 (持票边 lease_owner→seat)
+  const held = []
+  const tk = state.tickets
+  if (tk && tk.ok && Array.isArray(tk.data.tickets)) {
+    for (const t of tk.data.tickets) if (t.lease_owner === code) held.push(t)
+  }
+  const heldHtml = held.length
+    ? held.map((t) => `<li><span class="mono">${esc(t.ticket_id)}</span> <span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span> <span class="dim small">${esc(t.title || '')}</span></li>`).join('')
+    : '<li class="dim small">无持票 (lease_owner 未指向本席位)</li>'
+  // 血缘 (上下级)
+  const { headOf, childrenOf } = lineageOf(seats)
+  const head = headOf.get(code)
+  const kids = childrenOf.get(code) || []
+  return `
+    <dl class="sd-fields">${rows.join('')}</dl>
+    <div class="sd-held">
+      <h3>持票 <span class="dim small">(lease_owner → 本席位 · ${held.length} 张)</span></h3>
+      <ul>${heldHtml}</ul>
+    </div>
+    <div class="sd-lineage">
+      <h3>血缘 <span class="dim small">(会话 callback 边)</span></h3>
+      ${sdRow('上级 head', head ? `<span class="mono">${esc(head)}</span>` : '<span class="dim">— (根/无血缘)</span>')}
+      ${sdRow('下级 worker', kids.length ? kids.map((k) => `<span class="mono">${esc(k)}</span>`).join(' ') : '<span class="dim">—</span>')}
+    </div>`
+}
+
+function openSeatDetail(code) {
+  const dlg = $('#seat-detail')
+  if (!dlg) return
+  $('#sd-title').textContent = `席位 ${code} · 全量信息`
+  $('#sd-body').innerHTML = seatDetailHtml(code)
+  dlg.showModal()
+}
+
+function wireSeatDetail() {
+  const el = $('#view-fleet')
+  el.addEventListener('click', (e) => {
+    const mini = e.target.closest?.('.seat-mini')
+    if (mini) openSeatDetail(mini.dataset.code)
+  })
+  const dlg = $('#seat-detail')
+  if (!dlg) return
+  $('#sd-close').addEventListener('click', () => dlg.close())
+  dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close() }) // 点背景关闭
 }
 
 /* ---- 渲染：流程视图 (flow 节点状态推进) ---- */
@@ -311,7 +435,7 @@ function connectSse() {
     logEvent(ev)
     window.dispatchEvent(new CustomEvent('pm:sse', { detail: ev })) // PMW2-2 画布: 复用同一连接, 画布侧自行去抖
     if (ev.kind === 'tickets') refetch.tickets()
-    else if (ev.kind === 'fleet') { refetch.fleet(); refetch.tickets() } // 持票计数依赖票面
+    else if (ev.kind === 'fleet') { refetch.fleet(); refetch.tickets(); refetch.graph() } // 持票计数依赖票面; 组织图血缘跟 fleet/bridge
     else if (ev.kind === 'flow') refetch.flow()
     else if (ev.kind === 'act') onActEvent(ev)
   }
@@ -420,10 +544,12 @@ function wireTabs() {
 function boot() {
   wireTabs()
   wireActForm()
+  wireSeatDetail() // PMWEB-DAG: 席位小卡 → 详情浮层
   renderActs()
   loadTickets()
   loadFleet()
   loadFlow()
+  loadGraph() // 组织图血缘源
   pollHealth()
   setInterval(pollHealth, 30_000) // PW-004: 30s 轮询
   connectSse() // PW-003

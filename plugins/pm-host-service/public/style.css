@@ -521,3 +521,122 @@ button.cv-chip:hover { border-color: var(--accent); }
 .cv-node.cv-future { opacity: 0.08 !important; }
 .cv-edge.cv-future { opacity: 0.04 !important; }
 #cv-drawer { bottom: 168px; } /* PMW2-4: 右下让位 minimap */
+
+/* ---- PMWEB-DAG: 图 tab (聚合 DAG) + 席位组织图/小卡/详情浮层 (只增) ---- */
+
+/* 图 tab: 布局 */
+#view-dag { display: flex; flex-direction: column; gap: 8px; }
+#dg-wrap { display: flex; gap: 10px; min-height: 0; }
+#dg-list {
+  width: 300px; flex: none; overflow: auto; max-height: 76vh;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg-soft);
+  padding: 8px;
+}
+.dg-stage {
+  position: relative; flex: 1; min-width: 0; height: 76vh; min-height: 420px;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  background: var(--bg); touch-action: none;
+}
+#dag-svg { width: 100%; height: 100%; display: block; cursor: grab; }
+#dg-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+#dg-empty .empty-note { pointer-events: auto; background: var(--bg-soft); }
+
+/* 图 tab: 簇 list */
+.dg-cluster { border: 1px solid var(--line); border-radius: 8px; background: var(--bg-card); margin-bottom: 6px; overflow: hidden; }
+.dg-cluster-row {
+  display: flex; align-items: baseline; gap: 6px; width: 100%;
+  padding: 6px 8px; background: none; border: none; color: var(--fg);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.dg-cluster-row:hover { background: #202a37; }
+.dg-cluster-row.dg-selected, .dg-cluster.dg-selected { outline: 1.5px solid var(--accent); }
+.dg-fold-btn {
+  appearance: none; background: none; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--dim); font-size: 10px; line-height: 1; padding: 2px 4px; cursor: pointer; flex: none;
+}
+.dg-fold-btn:hover { color: var(--accent); border-color: var(--accent); }
+.dg-cluster .dg-label { font-weight: 700; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dg-kind {
+  flex: none; font-size: 10px; font-family: var(--mono); padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.dg-kind.k-run { color: #4da3ff; border-color: #2b5a8a; }
+.dg-kind.k-deps { color: #9d7cd8; border-color: #584a78; }
+.dg-kind.k-prefix { color: #e0a93e; border-color: #6b5322; }
+.dg-kind.k-single { color: var(--dim); }
+.dg-cluster .dg-meta { margin-left: auto; flex: none; }
+.dg-active { color: var(--accent); font-weight: 600; }
+.dg-dist { padding: 0 8px 6px 26px; word-break: break-all; }
+.dg-members { list-style: none; margin: 0; padding: 0 6px 6px; }
+.dg-ticket-row {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  background: none; border: none; border-radius: 5px; color: var(--fg);
+  font: inherit; font-size: 12px; padding: 3px 6px; cursor: pointer; text-align: left;
+}
+.dg-ticket-row:hover { background: #202a37; }
+.dg-ticket-row.dg-selected { outline: 1.5px solid var(--accent); }
+.dg-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* 图 tab: 画布节点/边 */
+.dg-node { cursor: pointer; transition: opacity .25s; }
+.dg-node-body { fill: var(--bg-card); stroke-width: 2; }
+.dg-node:hover .dg-node-body { filter: brightness(1.25); }
+.dg-node.t-cluster .dg-node-body { fill: #18202c; }
+.dg-label { fill: var(--fg); font: 600 11.5px var(--mono); text-anchor: middle; pointer-events: none; }
+.dg-sub { fill: var(--dim); font: 10px var(--mono); text-anchor: middle; pointer-events: none; }
+.dg-fold { fill: var(--dim); font: 10px var(--mono); cursor: pointer; }
+.dg-fold:hover { fill: var(--accent); }
+.dg-edge { fill: none; opacity: .85; transition: opacity .25s; }
+.dg-edge.dg-lit { stroke-width: 3; opacity: 1; }
+.dg-dim { opacity: .12 !important; }
+.dg-node.dg-sel .dg-node-body { stroke-width: 3.5; filter: brightness(1.2); }
+
+/* 席位组织图 (需求 5: head 在上 worker 在下; 持票数在小卡) */
+.org-chart { overflow: auto; padding: 4px 2px 20px; }
+.org-node { display: flex; flex-direction: column; align-items: flex-start; }
+.org-children {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0 22px; padding-left: 12px;
+  border-left: 1.5px dashed #35435a;
+}
+.org-children .org-node { position: relative; }
+.org-children .org-node::before {
+  content: ''; position: absolute; left: -12px; top: 16px; width: 10px; height: 0;
+  border-top: 1.5px dashed #35435a;
+}
+
+/* 席位小卡 (需求 6: 一行 = 状态点 + code + 持票数) */
+.seat-mini {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--bg-card); border: 1px solid var(--line); border-radius: 999px;
+  color: var(--fg); font: inherit; font-size: 12.5px; padding: 4px 12px 4px 9px;
+  cursor: pointer; line-height: 1.4;
+}
+.seat-mini:hover { border-color: var(--accent); }
+.seat-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.seat-mini .sm-code { font-weight: 700; font-size: 13.5px; }
+.seat-mini .sm-role { color: var(--dim); font-size: 11.5px; }
+.seat-mini .sm-held { font-size: 11.5px; color: var(--warn); }
+.seat-mini .sm-held:contains('0') { color: var(--dim); }
+
+/* 席位详情浮层 (需求 7) */
+#seat-detail { max-width: 640px; max-height: 82vh; overflow: auto; }
+#seat-detail .sd-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+#seat-detail .sd-head h2 { margin: 0; }
+#sd-close {
+  appearance: none; background: none; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--dim); width: 26px; height: 26px; font-size: 15px; cursor: pointer; flex: none;
+}
+#sd-close:hover { color: var(--fg); border-color: var(--accent); }
+#seat-detail .sd-fields {
+  display: grid; grid-template-columns: auto 1fr; gap: 3px 12px;
+  margin: 0; font-size: 12.5px;
+}
+#seat-detail .sd-fields .sd-row { display: contents; }
+#seat-detail dt { color: var(--dim); }
+#seat-detail dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+#seat-detail h3 { font-size: 12.5px; margin: 14px 0 6px; }
+#seat-detail .sd-held ul, #seat-detail .sd-lineage { list-style: none; margin: 0; padding: 0; }
+#seat-detail .sd-held li {
+  padding: 3px 0; border-bottom: 1px dashed #212a36; font-size: 12px;
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+}

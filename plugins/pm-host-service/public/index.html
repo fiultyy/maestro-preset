@@ -1,6 +1,6 @@
 <!doctype html>
-<!-- pm-web — maestro 浏览器观测面 (spec docs/specs/pm-web.md PW-002..005 + spec-pm-web-canvas.md PMW2-2 画布)
-     零 npm / 零构建 / 零第三方 import: 本文件+app.js+style.css+canvas.js 即部署物。
+<!-- pm-web — maestro 浏览器观测面 (spec docs/specs/pm-web.md PW-002..005 + spec-pm-web-canvas.md PMW2-2 画布 + PMWEB-DAG 图视重构)
+     零 npm / 零构建 / 零第三方 import: 本文件+app.js+style.css+canvas.js+cluster.js(聚合纯函数) 即部署物。
      唯一 vendor 例外 = elk.bundled.js (elkjs 0.12.0 逐字节, EPL-2.0, sha256 见 README「Vendor 例外」)。
      数据: GET /op/{tickets,fleet,flow,graph} + /health 30s 轮询 + SSE /subscribe 直连。 -->
 <html lang="zh-CN">
@@ -26,6 +26,7 @@
     <button data-view="tickets" class="active" type="button">票</button>
     <button data-view="fleet" type="button">席位</button>
     <button data-view="flow" type="button">流程</button>
+    <button data-view="dag" type="button">图</button>
     <button data-view="canvas" type="button">画布</button>
   </nav>
 
@@ -34,6 +35,8 @@
       <section id="view-tickets" class="view"></section>
       <section id="view-fleet" class="view" hidden></section>
       <section id="view-flow" class="view" hidden></section>
+      <!-- PMWEB-DAG: 图 tab —— 票按 DAG 聚合 (簇超级节点+list 联动染选), DOM 由 canvas.js bootDag 注入 -->
+      <section id="view-dag" class="view" hidden></section>
       <section id="view-canvas" class="view" hidden></section>
     </main>
 
@@ -73,9 +76,19 @@
     </form>
   </dialog>
 
+  <!-- PMWEB-DAG: 席位详情浮层 (需求 7: join 现成字段全量 + 持票列表, 关闭返回) -->
+  <dialog id="seat-detail">
+    <div class="sd-head">
+      <h2 id="sd-title">席位详情</h2>
+      <button id="sd-close" type="button" title="关闭返回">×</button>
+    </div>
+    <div id="sd-body"></div>
+  </dialog>
+
   <script src="app.js"></script>
   <!-- PMW2-2 画布: module(自带 defer 语义); elkjs 经 elk.js 动态 import,
-       加载/布局失败 → 画布内列表回退, 绝不白屏 (spec §5 降级链)。 -->
+       加载/布局失败 → 画布内列表回退, 绝不白屏 (spec §5 降级链)。
+       PMWEB-DAG: canvas.js 另注入「图」tab 聚合 DAG 场景; 聚合纯函数在 cluster.js。 -->
   <script type="module" src="canvas.js"></script>
 </body>
 </html>
