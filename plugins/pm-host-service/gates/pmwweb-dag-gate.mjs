@@ -123,8 +123,11 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
   const postSites = []
   for (const f of ['app.js', 'canvas.js']) {
     const src = readFileSync(`${PUBLIC}${f}`, 'utf8')
-    for (const m of src.matchAll(/fetch\(\s*['`]([^'`/?]+)[^'`]*['`]/g)) {
-      if (!FETCH_ALLOW.has(m[1])) { fetchOk = false; console.log(`  redline: ${f} fetch(${m[1]}) 越白名单`) }
+    for (const m of src.matchAll(/fetch\(\s*['`]([^`'?]+)/g)) {
+      // PMWEB-UI (9bb5281): 静态面路径相对化后 fetch 字面量无前导斜杠(按 document.baseURI
+      // 解析), 且捕获须越过路径内 '/' 直达 '?'/引号 —— 剥前导斜杠归一, 白名单语义原样。
+      const ep = `/${m[1].replace(/^\/+/, '')}`
+      if (!FETCH_ALLOW.has(ep)) { fetchOk = false; console.log(`  redline: ${f} fetch(${m[1]}) 越白名单`) }
     }
     postSites.push(`${f}:${(src.match(/method: 'POST'/g) ?? []).length}`)
   }
