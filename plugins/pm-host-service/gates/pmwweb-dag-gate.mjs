@@ -5,19 +5,22 @@
 //    双轨键+兜底逐轨断言 (run/deps 连通分量/前缀族/单票), 轨道优先级 (run 压 deps),
 //    deps=[] 批次不被吞并, dangling deps / 脏 JSON 防御, 终态-活跃口径, 全覆盖恰一簇;
 //    clusterScene 折叠态派生 (簇超节点/成员票替换/边同形去重/跨簇边保留)。
-// B. 静态门: index.html 图 tab+浮层 (既有四 tab 零回归); canvas.js 聚合导入+内省;
+// B. 静态门: index.html 三 tab 面 (PMWEB-3TAB: 票/席位/图; 流程折叠区+画布退役);
+//    canvas.js 聚合导入+scope 选择器+出界聚合+联动锚点+退役零残留;
 //    app.js 组织图标记 (既有 SSE 派发/三视图语义保留); style.css 样式面;
-//    红线: fetch 端点白名单 + POST 仅 /op/act (ADR-002) + cluster.js 零 fetch
+//    红线: fetch 端点白名单 + POST 仅 /op/act (ADR-002, canvas.js 退役后零 POST) + cluster.js 零 fetch
 //    + package.json 零依赖。
 // C. sandbox 浏览器门 (stub ledger + fleet fixture + mock dsh + bridge 血缘,
 //    零 live 变更): 图 tab 出簇 (4 簇 = run/deps/prefix/single 各 1) + list 染选
 //    联动 (选簇聚焦其余淡出 / 选票自动展开高亮 deps 边) + 折叠展开往返 + 空白取消;
+//    3TAB: scope 选择器 (全部/cwd 桶) + 流程折叠区默认收起 + op/graph counts 消费 (A4)
+//    + 票 cwd 分桶看板 (未分配尾组) + 选票联动切图 tab + 席位「在图中聚焦」+ 画布退役零残留;
 //    席位 tab 小卡 (一行: 状态点+code+持票数) + 组织图血缘嵌套 (head 上 worker 下)
 //    + 详情浮层全量字段+持票列表+关闭返回。页面异常任何一例即 FAIL。
-// D. PMWEB-GRAPH 几何门 (独立扩模 sandbox, 零 live 变更):
-//    G1 几何断言: 泳道/DAG SVG 边路径采样点 vs 非端点节点盒零求交 (容差 2px 内缩);
-//    G2 fixture 扩模: 4 flows×(6-8) 节点 + 13 票 + 4 席 ≥30 节点, ≥3 跨泳道 dispatch 边
-//    + 2 双向对 (反向边), 断言四类边 marker-end 全覆盖 + elk sections 消费;
+// D. PMWEB-GRAPH 几何门 (独立扩模 sandbox, 零 live 变更; 泳道场景退役后仅 DAG):
+//    G1 几何断言: DAG SVG 边路径采样点 vs 非端点节点盒零求交 (容差 2px 内缩);
+//    G2 3TAB scope: cwd:/w/one 切 scope → 票面全展开 + 出界聚簇 1 (独立聚合非 ghost)
+//    + 出界簇盒点击重聚焦 cluster:<key> 成员还原;
 //    G3 浏览器级: 折叠态跨簇 deps → 簇级边 ≥1 + 簇副标签 ↗N/↘N 计数渲染;
 //    G4 = 既有断言零回归 (A/B/C 全段原样)。
 // 留存: 截图/日志落 $PM_HOST_SERVICE_GATES_DIR/pmweb-dag/<label>/。
@@ -46,7 +49,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // ---------- A. 聚合纯函数单测 ----------
 {
   const cl = await import(`${PUBLIC}cluster.js`)
-  const { clusterTickets, clusterScene, ticketRun, ticketDeps, ticketPrefix, TERMINAL_STATES } = cl
+  const { clusterTickets, clusterScene, scopeScene, scopeBuckets, ticketCwd, ticketFleet, ticketInScope, ticketRun, ticketDeps, ticketPrefix, TERMINAL_STATES } = cl
   const t = (id, over = {}) => ({ ticket_id: id, state: 'done', deps: '[]', refs: '{}', lease_owner: null, ...over })
 
   ok('A 轨①: refs.run 相同 → 同 run 簇', (() => {
@@ -128,6 +131,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   })())
   ok('A 辅助: ticketRun/ticketDeps/ticketPrefix 脏形防御', ticketRun({ refs: '{"run":42}' }) === '42' && ticketDeps({ deps: '{"a":1}' }).length === 0 && ticketPrefix('NOPREFIX') === null && ticketPrefix('AND1-2') === 'AND1')
   ok('A 终态集冻结: done/merged/rejected', TERMINAL_STATES.size === 3 && ['done', 'merged', 'rejected'].every((s) => TERMINAL_STATES.has(s)))
+  // PMWEB-3TAB (A): scope 层 —— cwd/fleet 桶口径 + scopeScene 出界独立聚合 (用户裁决 ③)
+  const ts3 = [
+    t('A-1', { state: 'running', deps: '["B-1"]', refs: '{"cwd":"/x/y"}', lease_owner: 'w1/budget' }),
+    t('B-1', { refs: '{"cwd":"/x/z"}' }),
+    t('A-2', { state: 'blocked', refs: '{"cwd":"/x/y"}', lease_owner: 'w1@sub' }),
+    t('C-9', { refs: '{}' }),
+  ]
+  ok('A 3TAB scope: cwd/fleet 口径 + scopeBuckets 分桶计数 (未分配不计桶)', ticketCwd(ts3[0]) === '/x/y' && ticketCwd(t('N', { refs: null })) === ''
+    && ticketFleet(ts3[0]) === 'w1' && ticketFleet(ts3[2]) === 'w1' && ticketFleet(t('N2', { lease_owner: null })) === ''
+    && (() => { const b = scopeBuckets(ts3); return JSON.stringify(b.cwds) === JSON.stringify([{ key: '/x/y', count: 2 }, { key: '/x/z', count: 1 }]) && b.fleets.length === 1 && b.fleets[0].key === 'w1' && b.fleets[0].count === 2 && b.unassigned === 1 })())
+  ok('A 3TAB scopeScene: scope 内全展开 + 出界 deps 按自身聚簇 → 出界簇盒 (非 ghost 散点)', (() => {
+    const sc = scopeScene(ts3, 'cwd:/x/y')
+    const ids = sc.nodes.map((n) => `${n.id}:${n.type}`)
+    return ids.join() === 'tk:A-1:ticket,tk:A-2:ticket,out:one:B-1:out'
+      && sc.edges.length === 1 && sc.edges[0].id === 'dep:tk:A-1>out:one:B-1'
+      && sc.outClusters.length === 1 && sc.outClusters[0].key === 'one:B-1' // C-9 无 deps 关系不入场
+  })())
+  ok('A 3TAB scopeScene: cluster:<key> 重聚焦 (全量表命中 + 出界盒 key 回退还原) + 空桶降级安全', (() => {
+    const all = scopeScene(ts3, 'cluster:cdep:A-1') // 全量簇表命中: A-1 deps B-1 连通分量成员
+    const box = scopeScene(ts3, 'cluster:one:B-1') // 出界盒 key (全量表无) → 回退按 key 形态还原成员
+    const ec = scopeScene(ts3, 'cwd:/nope')
+    return all.nodes.map((n) => n.id).sort().join() === 'tk:A-1,tk:B-1' && all.outClusters.length === 0
+      && box.nodes.map((n) => n.id).join() === 'tk:B-1' && box.outClusters.length === 0
+      && ec.nodes.length === 0 && ec.edges.length === 0 && ec.outClusters.length === 0
+  })())
+  ok('A 3TAB scope: ticketInScope 三档谓词 (all 恒真/cwd 严格/fleet 归一)', ticketInScope(ts3[0], 'all') === true
+    && ticketInScope(ts3[0], 'cwd:/x/y') === true && ticketInScope(ts3[1], 'cwd:/x/y') === false
+    && ticketInScope(ts3[2], 'fleet:w1') === true && ticketInScope(ts3[3], 'fleet:w1') === false)
 }
 
 // ---------- B. 静态门 ----------
@@ -135,16 +166,24 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
 {
   const html = readFileSync(`${PUBLIC}index.html`, 'utf8')
   ok('B index.html: 图 tab (data-view=dag + view-dag)', html.includes('data-view="dag"') && html.includes('id="view-dag"'))
-  ok('B index.html: 既有四 tab 零回归', ['data-view="tickets"', 'data-view="fleet"', 'data-view="flow"', 'data-view="canvas"'].every((s) => html.includes(s)) && html.includes('id="view-canvas"') && html.includes('canvas.js'))
+  ok('B index.html: 三 tab 面 (票/席位/图; PMWEB-3TAB 五→三)', ['data-view="tickets"', 'data-view="fleet"', 'data-view="dag"'].every((s) => html.includes(s))
+    && !html.includes('data-view="flow"') && !html.includes('data-view="canvas"')
+    && !html.includes('id="view-flow"') && !html.includes('id="view-canvas"'))
   ok('B index.html: 席位详情浮层 dialog 在场', html.includes('id="seat-detail"') && html.includes('id="sd-body"') && html.includes('id="sd-close"'))
   const cv = readFileSync(`${PUBLIC}canvas.js`, 'utf8')
   ok('B canvas.js: 聚合层导入 + 图 tab boot + 内省', cv.includes("from './cluster.js'") && cv.includes('clusterTickets(list)') && cv.includes('bootDag()') && cv.includes('window.__pmDag'))
-  ok('B canvas.js: 既有泳道画布零回归 (boot/refetchGraph/drawer/replay 锚点仍在)', cv.includes('await refetchGraph()') && cv.includes('syncDrawer()') && cv.includes('loadReplay') && cv.includes('id="canvas-svg"'))
+  ok('B canvas.js: 画布退役 (泳道/抽屉/回放/minimap 锚点零残留)', !cv.includes('refetchGraph') && !cv.includes('loadReplay') && !cv.includes('canvas-svg')
+    && !cv.includes('openDrawer') && !cv.includes('wireMinimap') && !cv.includes('id="cv-stage"'))
+  ok('B canvas.js: scope 选择器+出界聚合+流程折叠区+联动锚点 (PMWEB-3TAB)', cv.includes('scopeScene') && cv.includes('scopeBuckets') && cv.includes('#dg-scope')
+    && cv.includes('dg-flow-body') && cv.includes("pm:dag-focus") && cv.includes("pm:dag-focus-fleet") && cv.includes('pullGraphCounts'))
   const ap = readFileSync(`${PUBLIC}app.js`, 'utf8')
   ok('B app.js: 组织图+小卡+浮层标记', ap.includes('function lineageOf') && ap.includes('seat-mini') && ap.includes('org-children') && ap.includes('openSeatDetail') && ap.includes('loadGraph'))
   ok('B app.js: 既有 SSE 派发两事件 + 三视图 refetch 保留', ap.includes("new CustomEvent('pm:sse'") && ap.includes("new CustomEvent('pm:sse-state'") && ap.includes('refetch.tickets()') && ap.includes('refetch.flow()'))
+  ok('B app.js: 3TAB 票 cwd 分组+选票联动+席位聚焦+流程重定向锚点', ap.includes('cwd-group') && ap.includes('未分配') && ap.includes("pm:dag-focus'")
+    && ap.includes('data-dg-focus') && ap.includes('__pmRenderFlow') && ap.includes("$('#dg-flow-body')"))
   const css = readFileSync(`${PUBLIC}style.css`, 'utf8')
   ok('B style.css: 图 tab + 组织图 + 小卡 + 浮层样式面', css.includes('#dg-list') && css.includes('.dg-node') && css.includes('.org-children') && css.includes('.seat-mini') && css.includes('#seat-detail'))
+  ok('B style.css: 3TAB 样式面 (cwd 分组/scope 选择器/出界簇盒/流程折叠区)', css.includes('.cwd-group') && css.includes('#dg-scope') && css.includes('.t-out') && css.includes('details.dg-flow') && css.includes('.dg-focus'))
   ok('B cluster.js: 纯函数模块零 fetch 零 DOM', (() => {
     const c = readFileSync(`${PUBLIC}cluster.js`, 'utf8')
     return !/fetch\(|document\.|window\./.test(c) && c.includes('export function clusterTickets')
@@ -163,18 +202,19 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
     postSites.push(`${f}:${(src.match(/method: 'POST'/g) ?? []).length}`)
   }
   ok('B 红线: fetch 全量端点白名单 (/op/* + /health + /subscribe)', fetchOk, postSites.join(' '))
-  ok('B 红线: POST 仅两处且均为 /op/act 透传 (app.js PW-005 + canvas.js PMW2-3)', (readFileSync(`${PUBLIC}app.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 1 && (readFileSync(`${PUBLIC}canvas.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 1)
+  ok('B 红线: POST 仅 /op/act 透传 (app.js PW-005 一处; canvas.js 画布退役后零 POST)', (readFileSync(`${PUBLIC}app.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 1 && (readFileSync(`${PUBLIC}canvas.js`, 'utf8').match(/method: 'POST'/g) ?? []).length === 0)
   const pkg = JSON.parse(readFileSync(`${REPO}package.json`, 'utf8'))
   ok('B 宪章: package.json 仍零依赖字段', !pkg.dependencies && !pkg.devDependencies && !pkg.optionalDependencies)
 }
 
 // ---------- sandbox 工厂 (pmw2-3 gate 惯例: stub ledger + fleet fixture + mock dsh) ----------
 // 7 票 → 4 簇: run:R77(RUN-1/RUN-2) + cdep:CH-A(CH-A←CH-B) + fam:FAM(FAM-1/FAM-2) + one:SGL-9
+// PMWEB-3TAB: refs.cwd 标注 (alpha×2 / beta×2 / 未分配×3) 供 cwd 分桶看板与 scope 选择器 —— cwd 不参与聚合轨道, 簇结构不变。
 const TICKETS = [
-  { ticket_id: 'RUN-1', state: 'running', deps: '[]', refs: '{"run":"R77"}', lease_owner: 'w1' },
-  { ticket_id: 'RUN-2', state: 'done', deps: '[]', refs: '{"run":"R77"}', lease_owner: null },
-  { ticket_id: 'CH-A', state: 'blocked', deps: '[]', refs: '{}', lease_owner: null },
-  { ticket_id: 'CH-B', state: 'done', deps: '["CH-A"]', refs: '{}', lease_owner: null },
+  { ticket_id: 'RUN-1', state: 'running', deps: '[]', refs: '{"run":"R77","cwd":"/repo/alpha"}', lease_owner: 'w1' },
+  { ticket_id: 'RUN-2', state: 'done', deps: '[]', refs: '{"run":"R77","cwd":"/repo/alpha"}', lease_owner: null },
+  { ticket_id: 'CH-A', state: 'blocked', deps: '[]', refs: '{"cwd":"/repo/beta"}', lease_owner: null },
+  { ticket_id: 'CH-B', state: 'done', deps: '["CH-A"]', refs: '{"cwd":"/repo/beta"}', lease_owner: null },
   { ticket_id: 'FAM-1', state: 'dispatched', deps: '[]', refs: '{}', lease_owner: null },
   { ticket_id: 'FAM-2', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
   { ticket_id: 'SGL-9', state: 'merged', deps: '[]', refs: '{}', lease_owner: null },
@@ -366,8 +406,8 @@ async function sandboxPart() {
     await c.cdp.send('Runtime.enable')
     await c.cdp.send('Page.navigate', { url: `http://127.0.0.1:${box.port}/` })
     let ready = false
-    for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmCanvas && window.__pmCanvas.ready === true && window.__pmDag && window.__pmDag.ready === true') } catch {} }
-    ok('C 页面就绪: 泳道画布 + 聚合 DAG 双场景 ready', ready)
+    for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmDag && window.__pmDag.ready === true') } catch {} }
+    ok('C 页面就绪: 图 tab scope-DAG ready (泳道画布已退役)', ready)
 
     // 图 tab: 出簇
     await c.cdp.eval(`document.querySelector('[data-view="dag"]').click()`)
@@ -375,6 +415,20 @@ async function sandboxPart() {
     const dag = await c.cdp.eval('window.__pmDag')
     ok('C 图 tab: 7 票 → 4 簇 (run/deps/prefix/single 各 1)', dag.clusters === 4 && dag.byKind.run === 1 && dag.byKind.deps === 1 && dag.byKind.prefix === 1 && dag.byKind.single === 1, JSON.stringify(dag.byKind))
     ok('C 图 tab: 折叠场景 4 超节点 0 边 (簇内 deps 边聚合隐藏)', dag.nodes === 4 && dag.edges === 0, `nodes=${dag.nodes} edges=${dag.edges}`)
+    // PMWEB-3TAB: scope 选择器 (全部默认 + cwd 桶) + 流程折叠区 (原流程页降级, 默认收起)
+    const scopeUi = await c.cdp.eval(`({
+      sel: !!document.querySelector('#dg-scope'),
+      opts: [...document.querySelectorAll('#dg-scope option')].map((o) => o.value),
+      groups: [...document.querySelectorAll('#dg-scope optgroup')].map((o) => o.label),
+      flow: !!document.querySelector('#dg-flow'),
+      flowOpen: document.querySelector('#dg-flow') ? document.querySelector('#dg-flow').open : null,
+      flowBody: (document.querySelector('#dg-flow-body') || {}).textContent || '',
+      scopeAll: window.__pmDag.scope,
+      graphCounts: window.__pmDag.graphCounts,
+    })`)
+    ok('C 3TAB: scope 选择器在场 (全部默认 + cwd 桶派生)', scopeUi.sel && scopeUi.scopeAll === 'all' && scopeUi.opts.includes('all') && scopeUi.opts.includes('cwd:/repo/alpha') && scopeUi.groups.includes('cwd 桶'), JSON.stringify(scopeUi))
+    ok('C 3TAB: 流程折叠区默认收起且流程面已回填 (加载中/降级注记均算)', scopeUi.flow && scopeUi.flowOpen === false && scopeUi.flowBody.trim().length > 0, `len=${scopeUi.flowBody.trim().length}`)
+    ok('C 3TAB A4: /op/graph 仍被图 tab 消费 (counts 进内省)', !!scopeUi.graphCounts && scopeUi.graphCounts.nodes > 0 && scopeUi.graphCounts.edges > 0, JSON.stringify(scopeUi.graphCounts))
     const listRows = await c.cdp.eval(`({
       clusters: document.querySelectorAll('#dg-list .dg-cluster').length,
       metas: [...document.querySelectorAll('#dg-list .dg-meta')].map((x) => x.textContent.trim()),
@@ -497,6 +551,19 @@ async function sandboxPart() {
     })()`, true)
     ok('PMWEB-FLEET-SIDE: 浮层持票行点击 → 关浮层开侧栏 (弹窗改侧栏)', fs4.row === true && fs4.dlgClosed === true && fs4.side === true, JSON.stringify(fs4))
 
+    // PMWEB-3TAB: 席位「在图中聚焦」→ 切图 tab + scope=fleet:<code> (持票全展开)
+    await c.cdp.eval(clickEl('.dg-focus[data-dg-focus="w1"]'))
+    await sleep(900)
+    const foc = await c.cdp.eval(`({
+      hash: location.hash,
+      scope: window.__pmDag.scope,
+      nodes: window.__pmDag.nodes,
+      out: window.__pmDag.outClusters,
+      selVal: (document.querySelector('#dg-scope') || {}).value || '',
+    })`)
+    ok('C 3TAB: 席位在图中聚焦 → scope=fleet:w1 (持票 RUN-1 全展开, 无出界)', foc.hash === '#view-dag' && foc.scope === 'fleet:w1' && foc.nodes === 1 && foc.out === 0 && foc.selVal === 'fleet:w1', JSON.stringify(foc))
+    await c.cdp.shot(shot('3tab-fleet-focus.png'))
+
     // PMWEB-ARCHIVE: 终态票归档 → 归档区 → 还原 (localStorage 往返, 看板计数还原)
     await c.cdp.eval(`document.querySelector('[data-view="tickets"]').click()`)
     await sleep(300)
@@ -529,10 +596,42 @@ async function sandboxPart() {
     await sleep(300)
     const kanban = await c.cdp.eval(`document.querySelectorAll('#view-tickets .ticket-card').length`)
     ok('C 回归: 票视图 kanban 照常渲染 (7 卡)', kanban === 7, `cards=${kanban}`)
-    await c.cdp.eval(`document.querySelector('[data-view="canvas"]').click()`)
-    let mode = ''
-    for (let i = 0; i < 40 && mode !== 'canvas'; i++) { await sleep(250); mode = await c.cdp.eval('window.__pmCanvas ? window.__pmCanvas.mode : ""') }
-    ok('C 回归: 画布 tab 泳道场景照常 (elk 可用即 canvas 模式)', mode === 'canvas', `mode=${mode}`)
+
+    // PMWEB-3TAB: 票 tab refs.cwd 分桶看板 (组头短路径+票数; 未分配桶恒尾; 组内列结构不变)
+    const cwdG = await c.cdp.eval(`({
+      groups: [...document.querySelectorAll('#view-tickets .cwd-group')].map((g) => ({
+        cwd: g.dataset.cwd,
+        name: (g.querySelector('.cwd-name') || {}).textContent || '',
+        n: g.querySelectorAll('.ticket-card').length,
+        cols: g.querySelectorAll('.kanban .col').length,
+      })),
+      tail: (document.querySelector('#view-tickets .cwd-group:last-of-type .cwd-name') || {}).textContent || '',
+    })`)
+    ok('C 3TAB: 票看板 cwd 分组 (alpha/beta + 未分配尾组; 列结构不变)', cwdG.groups.length === 3
+      && cwdG.groups[0].cwd === '/repo/alpha' && cwdG.groups[0].name === 'alpha' && cwdG.groups[0].n === 2
+      && cwdG.groups[1].cwd === '/repo/beta' && cwdG.groups[1].n === 2
+      && cwdG.tail === '未分配' && cwdG.groups[2].n === 3 && cwdG.groups.every((g) => g.cols === 6), JSON.stringify(cwdG))
+    // PMWEB-3TAB: 选票联动 → 切图 tab + 所在簇自动展开 + 染选 deps 邻域
+    await c.cdp.eval(clickEl('#view-tickets .ticket-card[data-tid="CH-A"]'))
+    await sleep(900)
+    const link = await c.cdp.eval(`({
+      hash: location.hash,
+      visible: !document.querySelector('#view-dag').hidden,
+      sel: window.__pmDag.selected,
+      expanded: window.__pmDag.expanded,
+      lit: document.querySelectorAll('#dag-svg .dg-lit').length,
+      cardSel: !!document.querySelector('.ticket-card.tk-selected[data-tid="CH-A"]'),
+    })`)
+    ok('C 3TAB: 选票联动 → 切图 tab + 所在簇展开 + 染选 (卡片选中态)', link.hash === '#view-dag' && link.visible
+      && link.sel?.kind === 'ticket' && link.sel.id === 'CH-A' && link.expanded.includes('cdep:CH-A') && link.lit >= 1 && link.cardSel, JSON.stringify(link))
+    // PMWEB-3TAB: 画布退役 (入口/视图/泳道场景/内省全不存在)
+    const retired = await c.cdp.eval(`({
+      btn: !!document.querySelector('[data-view="canvas"]'),
+      sec: !!document.querySelector('#view-canvas'),
+      stage: !!document.querySelector('#cv-stage'),
+      intro: !!window.__pmCanvas,
+    })`)
+    ok('C 回归: 画布退役 (按钮/视图/泳道场景/内省零残留)', !retired.btn && !retired.sec && !retired.stage && !retired.intro, JSON.stringify(retired))
     ok('C 页面零异常 (全段)', errors.length === 0, errors.slice(0, 2).join(' | '))
   } finally {
     await killChrome(c)
@@ -540,10 +639,10 @@ async function sandboxPart() {
   }
 }
 
-// ---------- D. PMWEB-GRAPH 几何门 (扩模 sandbox: G1 穿盒零求交 / G2 箭头+扩模 / G3 簇间边) ----------
-// G2 fixture: 4 flows (8+8+6+6=28 flow-node, 含 2 双向对) + 13 票 (7 基线 + GR1 跨簇 + OF 撞名组)
-// + 4 席 (h1/w1/aa11/bb22, hex 码供 dispatch 事件 4-hex 匹配) + 2 session = 47 节点 ≥30;
-// 跨泳道 dispatch 边 3 条 (fleet 泳道 → flow 泳道); 泳道内 dep 边含双向对/长链。
+// ---------- D. PMWEB-GRAPH 几何门 (扩模 sandbox: G1 穿盒零求交 / G2 3TAB scope / G3 簇间边) ----------
+// G2 fixture: 4 flows (PMWEB-3TAB: 泳道场景退役, flows 仅喂 /op/graph counts 消费) + 15 票
+// (7 基线 + GR1 跨簇 + OF 撞名组 + TW-1/OX-1 跨 cwd deps 对) + 4 席 (h1/w1/aa11/bb22) + 2 session;
+// TW-1(cwd /w/one, lease aa11) deps→OX-1(cwd /w/two) —— scope cwd:/w/one 出界聚簇断言数据面。
 const TICKETS_G2 = [
   ...TICKETS,
   { ticket_id: 'GX-1', state: 'running', deps: '["CH-A"]', refs: '{"run":"GR1"}', lease_owner: null },
@@ -552,6 +651,8 @@ const TICKETS_G2 = [
   { ticket_id: 'OF-2', state: 'done', deps: '["OF-1"]', refs: '{}', lease_owner: null },
   { ticket_id: 'OF-3', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
   { ticket_id: 'OF-4', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
+  { ticket_id: 'TW-1', state: 'running', deps: '["OX-1"]', refs: '{"cwd":"/w/one"}', lease_owner: 'aa11' },
+  { ticket_id: 'OX-1', state: 'done', deps: '[]', refs: '{"cwd":"/w/two"}', lease_owner: null },
 ]
 const SEATS_G2 = {
   ...SEATS,
@@ -632,42 +733,14 @@ async function graphPart() {
     await c.cdp.send('Runtime.enable')
     await c.cdp.send('Page.navigate', { url: `http://127.0.0.1:${box.port}/` })
     let ready = false
-    for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmCanvas && window.__pmCanvas.ready === true && window.__pmDag && window.__pmDag.ready === true') } catch {} }
-    ok('G2 页面就绪 (扩模 sandbox 双场景)', ready)
+    for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmDag && window.__pmDag.ready === true') } catch {} }
+    ok('G2 页面就绪 (扩模 sandbox 图 tab scope-DAG)', ready)
 
-    // 画布 tab: 泳道视图
-    await c.cdp.eval(`document.querySelector('[data-view="canvas"]').click()`)
-    let mode = ''
-    for (let i = 0; i < 40 && mode !== 'canvas'; i++) { await sleep(250); mode = await c.cdp.eval('window.__pmCanvas ? window.__pmCanvas.mode : ""') }
-    await sleep(800)
-    const cv = await c.cdp.eval('({ nodes: window.__pmCanvas.nodes, edges: window.__pmCanvas.edges, lanes: window.__pmCanvas.lanes, routed: window.__pmCanvas.routedEdges, ortho: window.__pmCanvas.orthogonalEdges })')
-    ok('G2 扩模: 泳道场景 ≥30 节点 (4 flows+13 票+4 席+2 session)', cv.nodes >= 30 && cv.lanes >= 4, JSON.stringify(cv))
-    ok('G2 elk sections 消费: 路由边 ≥20 + 跨泳道绕行边 ≥3', cv.routed >= 20 && cv.ortho >= 3, `routed=${cv.routed} ortho=${cv.ortho}`)
-    const markers = await c.cdp.eval(`(() => {
-      const out = {}
-      for (const kind of ['dep', 'dispatch', 'callback', 'cb-send']) {
-        const ps = [...document.querySelectorAll('#canvas-svg path.cv-edge.k-' + kind)]
-        out[kind] = { total: ps.length, withMarker: ps.filter((p) => p.getAttribute('marker-end')).length }
-      }
-      return out
-    })()`)
-    ok('G2 箭头: dep/callback/cb-send/dispatch 全部 marker-end (G2 断言)', markers.dep.total > 0 && markers.dep.withMarker === markers.dep.total
-      && markers.callback.total > 0 && markers.callback.withMarker === markers.callback.total
-      && markers.dispatch.total >= 3 && markers.dispatch.withMarker === markers.dispatch.total, JSON.stringify(markers))
-    const bidir = await c.cdp.eval(`({
-      e12: !!document.querySelector('#canvas-svg path[data-edge="dep:fn:g1/n1>fn:g1/n2"]'),
-      e21: !!document.querySelector('#canvas-svg path[data-edge="dep:fn:g1/n2>fn:g1/n1"]'),
-    })`)
-    ok('G2 双向对: g1/n1↔n2 两方向边均在场 (反向边语义)', bidir.e12 && bidir.e21, JSON.stringify(bidir))
-    const geoLane = await c.cdp.eval(geoSweep('#canvas-svg', '.cv-node', '.cv-edge'))
-    ok('G1 泳道: 边采样点 vs 非端点节点盒零求交 (容差 2px)', geoLane.edges > 0 && geoLane.violations === 0, JSON.stringify(geoLane))
-    await c.cdp.shot(shot('g2-lane-ortho.png'))
-
-    // 图 tab: 聚合 DAG
+    // 图 tab: 聚合 DAG (泳道画布已退役 —— G2 泳道/箭头/双向对断言随场景同步移除)
     await c.cdp.eval(`document.querySelector('[data-view="dag"]').click()`)
     await sleep(1500)
     const dag = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, clusters: window.__pmDag.clusters })')
-    ok('G3 浏览器: 折叠态 7 簇 + 跨簇 deps → 簇级边 ≥1', dag.clusters === 7 && dag.edges >= 1, JSON.stringify(dag))
+    ok('G3 浏览器: 折叠态 8 簇 (7+cdep:OX-1) + 跨簇 deps → 簇级边 ≥1', dag.clusters === 8 && dag.edges >= 1, JSON.stringify(dag))
     const sub = await c.cdp.eval(`({
       out: (document.querySelector('.dg-node[data-id="cl:cdep:CH-A"] .dg-sub') || {}).textContent || '',
       inn: (document.querySelector('.dg-node[data-id="cl:run:GR1"] .dg-sub') || {}).textContent || '',
@@ -696,10 +769,43 @@ async function graphPart() {
     await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:OF-1"]'))
     await sleep(1200)
     const expanded = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, view: window.__pmDag.view })')
-    ok('F4 重取景: 展开簇后 fit 生效 (取景缩放=拟合值)', expanded.nodes === 8 && expanded.edges >= 2 && expanded.view.s > 0, JSON.stringify(expanded))
+    ok('F4 重取景: 展开簇后 fit 生效 (取景缩放=拟合值)', expanded.nodes === 9 && expanded.edges >= 2 && expanded.view.s > 0, JSON.stringify(expanded))
     const geoDagOpen = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
     ok('G1 DAG 展开态: 簇内边+跨簇边零穿盒', geoDagOpen.edges >= 2 && geoDagOpen.violations === 0, JSON.stringify(geoDagOpen))
     await c.cdp.shot(shot('g2-dag-expanded.png'))
+
+    // PMWEB-3TAB: scope-DAG 三档交互 (出界独立聚合 + 点击重聚焦; 用户裁决 ③)
+    await c.cdp.eval(`(() => {
+      const sel = document.querySelector('#dg-scope')
+      sel.value = 'cwd:/w/one'
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+      return true
+    })()`)
+    await sleep(1200)
+    const scoped = await c.cdp.eval(`({
+      scope: window.__pmDag.scope,
+      nodes: window.__pmDag.nodes,
+      edges: window.__pmDag.edges,
+      out: window.__pmDag.outClusters,
+      ids: [...document.querySelectorAll('#dag-svg .dg-node')].map((g) => g.dataset.id),
+      outEl: !!document.querySelector('#dag-svg .dg-node.t-out'),
+      outSub: (document.querySelector('#dag-svg .dg-node.t-out .dg-sub') || {}).textContent || '',
+      outEdge: !!document.querySelector('#dag-svg .dg-edge[data-edge="dep:tk:TW-1>out:one:OX-1"]'),
+    })`)
+    ok('G2 3TAB: scope 切 cwd:/w/one → 票面全展开 + 出界聚簇 1 (独立聚合非 ghost)', scoped.scope === 'cwd:/w/one' && scoped.nodes === 2 && scoped.out === 1
+      && scoped.ids.includes('tk:TW-1') && scoped.ids.includes('out:one:OX-1') && scoped.outEl && /出界/.test(scoped.outSub) && scoped.outEdge, JSON.stringify(scoped))
+    await c.cdp.shot(shot('3tab-scope-cwd-outcluster.png'))
+    // 出界簇盒点击 → 重聚焦 cluster:<key> (成员还原)
+    await c.cdp.eval(clickNode('.dg-node[data-id="out:one:OX-1"]'))
+    await sleep(1200)
+    const refoc = await c.cdp.eval(`({
+      scope: window.__pmDag.scope,
+      nodes: window.__pmDag.nodes,
+      out: window.__pmDag.outClusters,
+      ids: [...document.querySelectorAll('#dag-svg .dg-node')].map((g) => g.dataset.id),
+    })`)
+    ok('G2 3TAB: 出界簇盒点击重聚焦 → cluster:one:OX-1 (成员票还原)', refoc.scope === 'cluster:one:OX-1' && refoc.nodes === 1 && refoc.out === 0 && refoc.ids.join() === 'tk:OX-1', JSON.stringify(refoc))
+    await c.cdp.shot(shot('3tab-scope-refocus-cluster.png'))
     ok('D 页面零异常 (全段)', errors.length === 0, errors.slice(0, 2).join(' | '))
   } finally {
     await killChrome(c)

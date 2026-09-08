@@ -71,6 +71,8 @@ const state = {
   orgTicketsOpen: new Set(),
   fleetSide: null, // { kind: 'ticket', id } — null = 侧栏收起
   turnEndCache: new Map(), // sessionId -> { ok, turn, step, text, err } (内存态)
+  // PMWEB-3TAB: 票 tab 选中票 (联动 图 tab 染选; 再点同票取消; 内存态)
+  selTicket: null,
 }
 
 // PW-003: consumer 每 tab 随机 —— 重载即全量快照回放；tab 内 EventSource
@@ -160,11 +162,12 @@ function ticketCard(t, { archived = false } = {}) {
   if (refKeys.length > 4) chips.push(`<span class="chip ref">+${refKeys.length - 4}</span>`)
   // PMWEB-ARCHIVE: 终态票卡悬停出归档钮; 归档区票卡出还原钮 (非终态不可归档)
   const isTerminal = TERMINAL_STATES.has(t.state)
+  const sel = !archived && state.selTicket === String(t.ticket_id) // PMWEB-3TAB: 选中态 (联动图 tab)
   const act = archived
     ? `<button type="button" class="arch-btn" data-unarch="${esc(t.ticket_id)}" title="还原到看板">↩</button>`
     : (isTerminal ? `<button type="button" class="arch-btn" data-arch="${esc(t.ticket_id)}" title="归档 (从看板收起, 本页持久)">✕</button>` : '')
   return `
-    <div class="ticket-card${archived ? ' archived' : ''}" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
+    <div class="ticket-card${archived ? ' archived' : ''}${sel ? ' tk-selected' : ''}" data-tid="${esc(t.ticket_id)}" title="点击选中并在 图 tab 染选其 deps 邻域" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
       <span class="tid">${esc(t.ticket_id)}</span><span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="title">${esc(t.title)}</span>
       <span class="chips">${chips.join('')}</span>${act}
@@ -187,11 +190,6 @@ function renderTickets() {
     el.innerHTML = note + emptyNote(`0 张票${d.note ? ' —— ' + esc(d.note) : '（账本为空或源暂不可用）'}`)
     return
   }
-  const cols = new Map(TICKET_COLS.map((c) => [c, []]))
-  for (const t of list) {
-    if (!cols.has(t.state)) cols.set(t.state, [])
-    cols.get(t.state).push(t)
-  }
   // 归档区: 默认收起 (计数常显); 展开列出归档票卡 (还原钮)
   const archSection = archivedList.length || state.archive.size
     ? `<div class="archive-bar">
@@ -202,11 +200,35 @@ function renderTickets() {
        </div>
        ${state.archOpen ? `<div class="kanban archive-open">${archivedList.map((t) => ticketCard(t, { archived: true })).join('') || emptyNote('归档集非空但票面已无对应票 (账本已删/过期)')}</div>` : ''}`
     : ''
-  el.innerHTML = note + `<div class="kanban">${[...cols.entries()].map(([c, ts]) => `
-    <div class="col">
-      <h3><span>${esc(c)}</span><span>${ts.length}</span></h3>
-      ${ts.map((t) => ticketCard(t)).join('')}
-    </div>`).join('')}</div>` + archSection
+  // PMWEB-3TAB: 按 refs.cwd 分桶看板 —— 组头 = 短路径 + 票数, 未标注 cwd → 「未分配」桶恒尾;
+  // 组内列结构不变 (TICKET_COLS kanban)。cwd 口径 = refs.cwd (PMWEB-CWD 回填产出)。
+  const cwdOf = (t) => {
+    const refs = parseJsonField(t.refs, {})
+    const c = refs && typeof refs === 'object' && !Array.isArray(refs) ? refs.cwd : null
+    return c == null || c === '' ? '' : String(c)
+  }
+  const shortCwd = (p) => p.split('/').filter(Boolean).pop() || p
+  const groups = new Map() // cwd → [tickets]
+  for (const t of list) {
+    const c = cwdOf(t)
+    if (!groups.has(c)) groups.set(c, [])
+    groups.get(c).push(t)
+  }
+  const gkeys = [...groups.keys()].sort((a, b) => (!a ? 1 : !b ? -1 : a < b ? -1 : a > b ? 1 : 0)) // '' 未分配恒尾
+  const boards = gkeys.map((c) => {
+    const cols = new Map(TICKET_COLS.map((x) => [x, []]))
+    for (const t of groups.get(c)) {
+      if (!cols.has(t.state)) cols.set(t.state, [])
+      cols.get(t.state).push(t)
+    }
+    const head = `<header class="cwd-head"><span class="cwd-name">${c ? esc(shortCwd(c)) : '未分配'}</span>${c ? `<span class="cwd-path mono dim" title="${esc(c)}">${esc(c)}</span>` : '<span class="cwd-path dim">refs.cwd 未标注</span>'}<b>${groups.get(c).length}</b></header>`
+    return `<section class="cwd-group" data-cwd="${esc(c)}">${head}<div class="kanban">${[...cols.entries()].map(([col, ts]) => `
+      <div class="col">
+        <h3><span>${esc(col)}</span><span>${ts.length}</span></h3>
+        ${ts.map((t) => ticketCard(t)).join('')}
+      </div>`).join('')}</div></section>`
+  }).join('')
+  el.innerHTML = note + boards + archSection
 }
 
 // PMWEB-ARCHIVE: 归档钮/还原钮/归档区折叠 — 事件委托常驻 (SSE 全量重渲不丢)
@@ -218,6 +240,19 @@ function wireTickets() {
     const un = e.target.closest?.('[data-unarch]')
     if (un) { toggleArchive(un.dataset.unarch); return }
     if (e.target.closest?.('#arch-toggle')) { state.archOpen = !state.archOpen; renderTickets() }
+    // PMWEB-3TAB: 选票 → 图 tab 联动 (染选该票 deps+邻接; 再点同票取消, 不跳 tab)
+    else {
+      const card = e.target.closest?.('.ticket-card[data-tid]')
+      if (card) {
+        const id = card.dataset.tid
+        state.selTicket = state.selTicket === id ? null : id
+        renderTickets()
+        if (state.selTicket) {
+          if (location.hash !== '#view-dag') location.hash = 'view-dag' // wireTabs hashchange 切 图 tab
+          window.dispatchEvent(new CustomEvent('pm:dag-focus', { detail: { ticketId: id } }))
+        }
+      }
+    }
   })
 }
 
@@ -302,9 +337,11 @@ function orgBranch(code, seatsByCode, childrenOf, rendered, heldCounts) {
           <span class="mono">${esc(t.ticket_id)}</span>
           <span class="tk-title">${esc(t.title || '')}</span>
         </button>`).join('')}</div>`)
+  // PMWEB-3TAB: 「在图中聚焦」→ 图 tab scope=fleet:<code> (持票全展开 + 出界依赖聚簇)
+  const focus = `<button type="button" class="dg-focus" data-dg-focus="${esc(code)}" title="在 图 tab 聚焦本席位: scope=fleet:${esc(code)} (持票全展开, 出界依赖聚合显示)">在图中聚焦</button>`
   return `
     <div class="org-node" data-code="${esc(code)}">
-      <div class="org-row">${seatMini(s, heldCounts.get(code) || 0)}${toggle}</div>
+      <div class="org-row">${seatMini(s, heldCounts.get(code) || 0)}${toggle}${focus}</div>
       ${ticketsHtml}
       ${kids.length ? `<div class="org-children">${kids.map((k) => orgBranch(k, seatsByCode, childrenOf, rendered, heldCounts)).join('')}</div>` : ''}
     </div>`
@@ -505,6 +542,13 @@ function openSeatDetail(code) {
 function wireSeatDetail() {
   const el = $('#view-fleet')
   el.addEventListener('click', (e) => {
+    // PMWEB-3TAB: 「在图中聚焦」→ 图 tab scope=fleet:<code> (先于 seat-mini 判定, 互不误触)
+    const foc = e.target.closest?.('[data-dg-focus]')
+    if (foc) {
+      if (location.hash !== '#view-dag') location.hash = 'view-dag'
+      window.dispatchEvent(new CustomEvent('pm:dag-focus-fleet', { detail: { code: foc.dataset.dgFocus } }))
+      return
+    }
     const mini = e.target.closest?.('.seat-mini')
     if (mini) { openSeatDetail(mini.dataset.code); return }
     // PMWEB-FLEET-SIDE: 树展开 chevron + 票行 → 侧栏
@@ -551,8 +595,11 @@ function flowBlock(f) {
     </div>`
 }
 
+// PMWEB-3TAB: 流程页退役为 图 tab 折叠区 (#dg-flow-body, canvas.js bootDag 注入;
+// 默认收起)。DOM 未就绪时静默返回 —— bootDag 注入后经 __pmRenderFlow 回填。
 function renderFlow() {
-  const el = $('#view-flow')
+  const el = $('#dg-flow-body')
+  if (!el) return
   const r = state.flow
   if (!r) { el.innerHTML = emptyNote('流程加载中…'); return }
   if (!r.ok) { el.innerHTML = emptyNote(`流程源不可用：${r.err}`); return }
@@ -565,6 +612,7 @@ function renderFlow() {
   }
   el.innerHTML = note + flows.map(flowBlock).join('')
 }
+window.__pmRenderFlow = renderFlow // PMWEB-3TAB: canvas.js bootDag 注入折叠区后回填流程面
 
 /* ---- 渲染：health 横幅 (PW-004, 30s 轮询) ---- */
 

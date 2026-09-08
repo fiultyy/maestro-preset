@@ -724,3 +724,52 @@ button.cv-chip:hover { border-color: var(--accent); }
   word-break: break-word; font-size: 12px; line-height: 1.55; color: var(--fg);
   font-family: var(--mono);
 }
+
+/* ---- PMWEB-3TAB: 三 tab 面 —— 票 cwd 分组看板 + 图 tab scope 选择器/出界簇盒/流程折叠区 + 联动 ---- */
+/* 票 tab: refs.cwd 分桶 (组头 = 短路径 + 全路径 + 票数; 未分配桶置尾) */
+.cwd-group { margin: 0 0 22px; }
+.cwd-group .cwd-head {
+  display: flex; align-items: baseline; gap: 10px;
+  margin: 0 0 8px; padding: 5px 10px;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px;
+  position: sticky; top: 0; z-index: 2;
+}
+.cwd-group .cwd-head .cwd-name { font-weight: 700; font-size: 13px; }
+.cwd-group .cwd-head .cwd-path { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46%; }
+.cwd-group .cwd-head b { margin-left: auto; color: var(--warn); font-size: 12.5px; }
+.ticket-card.tk-selected {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+  border-color: var(--accent); cursor: pointer;
+}
+.ticket-card[data-tid] { cursor: pointer; }
+.ticket-card[data-tid]:hover { border-color: var(--accent); }
+/* 图 tab: scope 选择器 (全部 / cwd 桶 / fleet) */
+#dg-scope {
+  background: var(--bg-card); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 6px; font-size: 12px; font-family: var(--mono);
+  max-width: 300px;
+}
+#dg-scope:focus { outline: none; border-color: var(--accent); }
+/* 图 tab: 流程折叠区 (原流程页降级; 默认收起) */
+details.dg-flow {
+  margin: 0 0 10px; padding: 6px 10px;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 8px;
+}
+details.dg-flow > summary {
+  cursor: pointer; font-weight: 700; font-size: 13px; user-select: none;
+}
+details.dg-flow > summary::marker { color: var(--dim); }
+details.dg-flow[open] { padding-bottom: 12px; }
+details.dg-flow .dg-flow-body .flow-block { margin-top: 10px; }
+/* 图 tab: 出界聚合簇盒 (PMWEB-3TAB 裁决 ③: 独立聚合, 非 ghost 散点) */
+.dg-node.t-out .dg-node-body { fill: #241d14; }
+.dg-node.t-out:hover .dg-node-body { filter: brightness(1.3); }
+.dg-node.t-out .dg-sub { fill: #e0a93e; }
+.dg-node.t-out .dg-fold { fill: #e0a93e; cursor: pointer; }
+.dg-node.t-out .dg-fold:hover { fill: var(--fg); }
+/* 席位 tab: 「在图中聚焦」钮 (org 行内, 小卡/折叠钮同级) */
+.dg-focus {
+  background: var(--bg-card); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--dim); padding: 2px 8px; cursor: pointer; font-size: 11.5px;
+}
+.dg-focus:hover { color: var(--fg); border-color: var(--accent); }

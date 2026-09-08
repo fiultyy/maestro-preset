@@ -192,3 +192,121 @@ export function clusterScene(tickets, expandedSet) {
   for (const n of nodes) if (n.type === 'cluster') { n.depOut = degOut.get(n.id) ?? 0; n.depIn = degIn.get(n.id) ?? 0 }
   return { clusters, nodes, edges, nodeOfTicket, clusterRoot, expanded }
 }
+
+// ==== PMWEB-3TAB: scope-DAG 层 (纯派生, 仍零 DOM/零 fetch) ====
+// 用户裁决 ③ (2026-09-08): 出界依赖独立聚合显示 —— scope 内票全展开 (簇语义保留),
+// scope 外的 deps 邻居按其自身聚簇轨道聚成「出界簇盒」(type:'out'), 可点击重聚焦
+// (canvas.js 侧 scope 切 cluster:<key>)。scope 键三档 + 簇聚焦:
+//   'all'          → 全部票 (走 clusterScene 原语义, 折叠聚合)
+//   'cwd:<path>'   → refs.cwd === <path> 的票
+//   'fleet:<code>' → lease_owner 归一 code === <code> 的票
+//   'cluster:<key>'→ 该簇成员票 (重聚焦目标)
+// lease 归一与 app.js leaseCode 同规则镜像 (剥 '/' 与 '@' 后段取 code 前缀)。
+
+export function ticketCwd(t) { // refs.cwd → string ('' = 未标注)
+  const r = parseJsonField(t?.refs, null)
+  const cwd = r && typeof r === 'object' && !Array.isArray(r) ? r.cwd : null
+  return cwd == null || cwd === '' ? '' : String(cwd)
+}
+
+export function ticketFleet(t) { // lease_owner → 席位 code ('' = 未派发/脏形)
+  const v = t?.lease_owner
+  return typeof v === 'string' && v ? v.split(/[/@]/)[0].trim() : ''
+}
+
+// scope 桶清单 (scope 选择器数据面): refs.cwd / fleet code 分桶计数, 空桶排除,
+// 升序 (稳定幂等)。unassigned = 无 cwd 标注票数 (仅口径注记用, 不出桶)。
+export function scopeBuckets(tickets) {
+  const list = Array.isArray(tickets) ? tickets : []
+  const cwds = new Map()
+  const fleets = new Map()
+  let unassigned = 0
+  for (const t of list) {
+    const cwd = ticketCwd(t)
+    if (cwd) cwds.set(cwd, (cwds.get(cwd) ?? 0) + 1)
+    else unassigned++
+    const code = ticketFleet(t)
+    if (code) fleets.set(code, (fleets.get(code) ?? 0) + 1)
+  }
+  const asc = (m) => [...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, n]) => ({ key: k, count: n }))
+  return { cwds: asc(cwds), fleets: asc(fleets), unassigned }
+}
+
+export function ticketInScope(t, scope) {
+  if (!scope || scope === 'all') return true
+  if (scope.startsWith('cwd:')) return ticketCwd(t) === scope.slice(4)
+  if (scope.startsWith('fleet:')) return ticketFleet(t) === scope.slice(6)
+  return false // 'cluster:<key>' 需全量簇表, 走 scopeScene 专属分支
+}
+
+// 出界盒 key 成员还原 (纯派生): 重聚焦 key 来自出界票自聚 (clusterTickets(outTickets)),
+// 该 key 未必存在于全量簇表 (连通分量可穿过 scope 内票) —— 按 key 形态在全量票面上
+// 还原成员: one:<id> 单票 / run:<r> refs.run 组 / fam:<p> 前缀族 / cdep:<min> 连通分量
+// (union-find 同 clusterTickets; 不做 run 收编裁剪 —— 出界盒成员本就无 run 轨)。
+function clusterMembersByKey(list, key) {
+  const clean = Array.isArray(list) ? list.filter((t) => t && t.ticket_id != null) : []
+  const byId = new Map(clean.map((t) => [String(t.ticket_id), t]))
+  if (key.startsWith('one:')) { const id = key.slice(4); return byId.has(id) ? [id] : [] }
+  if (key.startsWith('run:')) { const r = key.slice(4); return clean.filter((t) => ticketRun(t) === r).map((t) => String(t.ticket_id)) }
+  if (key.startsWith('fam:')) { const p = key.slice(4); return clean.filter((t) => ticketPrefix(String(t.ticket_id)) === p).map((t) => String(t.ticket_id)) }
+  if (key.startsWith('cdep:')) {
+    const min = key.slice(5)
+    if (!byId.has(min)) return []
+    const parent = new Map([...byId.keys()].map((id) => [id, id]))
+    const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x) } return x }
+    const union = (a, b) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent.set(ra < rb ? ra : rb, ra < rb ? rb : ra) }
+    for (const t of clean) { const id = String(t.ticket_id); for (const d of ticketDeps(t)) if (byId.has(d) && d !== id) union(id, d) }
+    const root = find(min)
+    return [...byId.keys()].filter((id) => find(id) === root).sort()
+  }
+  return []
+}
+
+// scopeScene(tickets, scope) → scope-DAG 场景 (scope ≠ 'all'; 纯派生):
+//   scope 内: 全簇强制展开 (成员票节点入场, 簇语义经 clusterKey/clusterLabel 保留)
+//   scope 外: 仅「被 scope 内票 deps 指向」的出界票入场, 按其自身聚簇轨道聚成
+//             出界簇节点 { id:'out:<key>', type:'out', … } (独立聚合, 非 ghost 散点);
+//             deps 边重映射 成员票节点 → 出界簇盒 (同目标去重)。
+// 返回同 clusterScene 形 + outClusters (簇元数据数组) + scope。
+export function scopeScene(tickets, scope) {
+  const list = Array.isArray(tickets) ? tickets.filter((t) => t && t.ticket_id != null) : []
+  let inList
+  if (scope?.startsWith('cluster:')) {
+    const key = scope.slice(8)
+    const c = clusterTickets(list).find((x) => x.key === key)
+    const ids = c ? c.ticketIds : clusterMembersByKey(list, key) // 出界盒 key 回退还原
+    const idset = new Set(ids)
+    inList = list.filter((t) => idset.has(String(t.ticket_id)))
+  } else {
+    inList = list.filter((t) => ticketInScope(t, scope))
+  }
+  const base = clusterScene(inList, new Set(clusterTickets(inList).map((c) => c.key))) // 全展开
+  const inIds = new Set(inList.map((t) => String(t.ticket_id)))
+  const outNeeded = new Set()
+  for (const t of inList) for (const d of ticketDeps(t)) if (!inIds.has(String(d))) outNeeded.add(String(d))
+  const outTickets = list.filter((t) => outNeeded.has(String(t.ticket_id)))
+  const outClusters = clusterTickets(outTickets)
+  const outNodeByKey = new Map() // key → 出界簇节点
+  const outNodes = outClusters.map((c) => {
+    const n = { id: `out:${c.key}`, type: 'out', clusterKey: c.key, label: c.label, kind: c.kind, total: c.total, active: c.active, states: c.states, ticketIds: c.ticketIds }
+    outNodeByKey.set(c.key, n)
+    return n
+  })
+  const tidToOut = new Map() // 出界票id → out 节点 id
+  for (const c of outClusters) for (const id of c.ticketIds) tidToOut.set(id, `out:${c.key}`)
+  const seen = new Set()
+  const outEdges = []
+  for (const t of inList) {
+    const from = base.nodeOfTicket.get(String(t.ticket_id))
+    if (!from) continue
+    for (const d of ticketDeps(t)) {
+      const to = tidToOut.get(String(d))
+      if (!to) continue
+      const eid = `dep:${from}>${to}`
+      if (seen.has(eid)) continue
+      seen.add(eid)
+      outEdges.push({ id: eid, kind: 'dep', from, to, label: '' })
+    }
+  }
+  return { ...base, nodes: [...base.nodes, ...outNodes], edges: [...base.edges, ...outEdges], outClusters, scope }
+}
