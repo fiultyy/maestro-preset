@@ -151,7 +151,7 @@ const STATE_COLORS = {
 const emptyNote = (msg) => `<div class="empty-note">${esc(msg)}</div>`
 const viewNote = (note) => `<p class="view-note">⚠ ${esc(note)}</p>`
 
-function ticketCard(t, { archived = false } = {}) {
+function ticketCard(t, { archived = false, pool = false } = {}) {
   const deps = parseJsonField(t.deps, [])
   const refs = parseJsonField(t.refs, {})
   const refKeys = refs && typeof refs === 'object' ? Object.keys(refs) : []
@@ -162,12 +162,14 @@ function ticketCard(t, { archived = false } = {}) {
   if (refKeys.length > 4) chips.push(`<span class="chip ref">+${refKeys.length - 4}</span>`)
   // PMWEB-ARCHIVE: 终态票卡悬停出归档钮; 归档区票卡出还原钮 (非终态不可归档)
   const isTerminal = TERMINAL_STATES.has(t.state)
-  const sel = !archived && state.selTicket === String(t.ticket_id) // PMWEB-3TAB: 选中态 (联动图 tab)
+  // PMWEB-REPO: 归档池票卡纯展示 (无 data-tid 不联动图, 无归档钮, 账本不动)
+  const sel = !archived && !pool && state.selTicket === String(t.ticket_id) // PMWEB-3TAB: 选中态 (联动图 tab)
   const act = archived
     ? `<button type="button" class="arch-btn" data-unarch="${esc(t.ticket_id)}" title="还原到看板">↩</button>`
-    : (isTerminal ? `<button type="button" class="arch-btn" data-arch="${esc(t.ticket_id)}" title="归档 (从看板收起, 本页持久)">✕</button>` : '')
+    : (pool ? '' : (isTerminal ? `<button type="button" class="arch-btn" data-arch="${esc(t.ticket_id)}" title="归档 (从看板收起, 本页持久)">✕</button>` : ''))
+  const cardTitle = pool ? '无仓归档票 (纯展示, 不参与图)' : '点击选中并在 图 tab 染选其 deps 邻域'
   return `
-    <div class="ticket-card${archived ? ' archived' : ''}${sel ? ' tk-selected' : ''}" data-tid="${esc(t.ticket_id)}" title="点击选中并在 图 tab 染选其 deps 邻域" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
+    <div class="ticket-card${archived ? ' archived' : ''}${pool ? ' pool' : ''}${sel ? ' tk-selected' : ''}"${pool ? '' : ` data-tid="${esc(t.ticket_id)}"`} title="${cardTitle}" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
       <span class="tid">${esc(t.ticket_id)}</span><span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="title">${esc(t.title)}</span>
       <span class="chips">${chips.join('')}</span>${act}
@@ -200,35 +202,46 @@ function renderTickets() {
        </div>
        ${state.archOpen ? `<div class="kanban archive-open">${archivedList.map((t) => ticketCard(t, { archived: true })).join('') || emptyNote('归档集非空但票面已无对应票 (账本已删/过期)')}</div>` : ''}`
     : ''
-  // PMWEB-3TAB: 按 refs.cwd 分桶看板 —— 组头 = 短路径 + 票数, 未标注 cwd → 「未分配」桶恒尾;
-  // 组内列结构不变 (TICKET_COLS kanban)。cwd 口径 = refs.cwd (PMWEB-CWD 回填产出)。
+  // PMWEB-REPO: 容器优先看板 —— 仓分组为主体 (cwd-group, 组头 = 短路径 + 全路径 + 票数,
+  // 升序); 无 refs.cwd 票 = 归档池, 收进「无仓归档」details 默认收起 (纯展示, 不与仓并列
+  // 混排; 裁决 B: 展示面隔离, 账本不动)。组内列结构不变 (TICKET_COLS kanban)。
   const cwdOf = (t) => {
     const refs = parseJsonField(t.refs, {})
     const c = refs && typeof refs === 'object' && !Array.isArray(refs) ? refs.cwd : null
     return c == null || c === '' ? '' : String(c)
   }
   const shortCwd = (p) => p.split('/').filter(Boolean).pop() || p
-  const groups = new Map() // cwd → [tickets]
-  for (const t of list) {
+  const repoTickets = []
+  const poolTickets = []
+  for (const t of list) (cwdOf(t) ? repoTickets : poolTickets).push(t)
+  const groups = new Map() // cwd → [tickets] (仅仓票)
+  for (const t of repoTickets) {
     const c = cwdOf(t)
     if (!groups.has(c)) groups.set(c, [])
     groups.get(c).push(t)
   }
-  const gkeys = [...groups.keys()].sort((a, b) => (!a ? 1 : !b ? -1 : a < b ? -1 : a > b ? 1 : 0)) // '' 未分配恒尾
+  const gkeys = [...groups.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   const boards = gkeys.map((c) => {
     const cols = new Map(TICKET_COLS.map((x) => [x, []]))
     for (const t of groups.get(c)) {
       if (!cols.has(t.state)) cols.set(t.state, [])
       cols.get(t.state).push(t)
     }
-    const head = `<header class="cwd-head"><span class="cwd-name">${c ? esc(shortCwd(c)) : '未分配'}</span>${c ? `<span class="cwd-path mono dim" title="${esc(c)}">${esc(c)}</span>` : '<span class="cwd-path dim">refs.cwd 未标注</span>'}<b>${groups.get(c).length}</b></header>`
+    const head = `<header class="cwd-head"><span class="cwd-name">${esc(shortCwd(c))}</span><span class="cwd-path mono dim" title="${esc(c)}">${esc(c)}</span><b>${groups.get(c).length}</b></header>`
     return `<section class="cwd-group" data-cwd="${esc(c)}">${head}<div class="kanban">${[...cols.entries()].map(([col, ts]) => `
       <div class="col">
         <h3><span>${esc(col)}</span><span>${ts.length}</span></h3>
         ${ts.map((t) => ticketCard(t)).join('')}
       </div>`).join('')}</div></section>`
   }).join('')
-  el.innerHTML = note + boards + archSection
+  // 归档池折叠区: 默认收起 (details 无 open), 展开纯浏览
+  const poolSection = poolTickets.length
+    ? `<details class="tk-pool" id="tk-pool">
+         <summary>无仓归档 <b>${poolTickets.length}</b> <span class="dim small">无 refs.cwd 存量票 · 不参与图 (任何 scope 零入场) · 默认收起 · 纯展示 (账本不动)</span></summary>
+         <div class="kanban pool-open">${poolTickets.map((t) => ticketCard(t, { pool: true })).join('')}</div>
+       </details>`
+    : ''
+  el.innerHTML = note + boards + poolSection + archSection
 }
 
 // PMWEB-ARCHIVE: 归档钮/还原钮/归档区折叠 — 事件委托常驻 (SSE 全量重渲不丢)

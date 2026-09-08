@@ -1,15 +1,19 @@
-// pm-web 图 tab — PMWEB-3TAB: 三 tab 面 (票/席位/图) 的 scope-DAG 中心场景。
-// 聚合纯函数在 cluster.js (双轨键 refs.run → deps 连通分量 → 前缀族/单票 + scope 层),
-// 簇 = 可折叠超级节点 (簇头 = run_id|族名/票数/活跃数, 展开显成员票), 左侧簇 list
-// 联动染选 (选簇聚焦/选票高亮 deps 边+邻接, 其余淡出; selected 优先 hover)。
-// scope 选择器三档 (用户裁决 ③): 全部 / cwd 桶 (refs.cwd) / fleet (席位 code) ——
-// scope 内票全展开 (簇语义保留), 出界 deps 邻居按自身聚簇轨道聚成「出界簇盒」
-// (type:'out'), 点击重聚焦 (scope → cluster:<key> 展开该簇成员)。
+// pm-web 图 tab — PMWEB-REPO: 容器优先 scope-DAG 中心场景 (仓=repo, 票=issue)。
+// 聚合纯函数在 cluster.js (双轨键 refs.run → deps 连通分量 → 前缀族/单票 + 仓优先
+// scope 层), 簇 = 可折叠超级节点 (簇头 = run_id|族名/票数/活跃数, 展开显成员票), 左侧
+// 簇 list 联动染选 (选簇聚焦/选票高亮 deps 边+邻接, 其余淡出; selected 优先 hover)。
+// scope 两档 (用户裁决 A 2026-09-08「ticket 就像 issue 跟着 repo 走」): 落地默认即仓内
+// 视图 (cwd:<path>, 仓清单 = refs.cwd distinct); fleet 席位为显式次级入口 (optgroup
+// 后置); 跨仓全局档彻底退役删码。无仓票 = 归档池 (裁决 B): 任何 scope 零入场。
+// 出界簇盒 (type:'out'): scope 内票 deps 指向仓外票 → 虚线琥珀盒独立聚合; 点击 →
+// 跳成员多数 refs.cwd 的目标仓 (setDagScope('cwd:<path>', 成员ids)) 并染选聚焦该簇;
+// 成员全无仓 → jumpCwd '' 纯提示盒不可点。
 // PMWEB-3TAB 退役: 旧泳道画布 (#view-canvas, PMW2-2..4) 场景代码整体移除 —— 用户裁决
 // 2026-09-08「3个tab就够了」(191 边全量视图与图 tab 构造性冗余); 删除而非死代码:
-// 零构建静态面逐字节出货, 死代码 = 每次加载常驻开销; git 5e7f98a 存档可溯; 共享工具
-// (elk 通道/svgEl/pathFromPoints/EDGE_STYLE/textW) 保留供 DAG 复用。
-// A4 口径: /op/graph 仍被本 tab 消费 —— refetchDag 顺带拉 counts (nodes/edges) 进计数条。
+// 零构建静态面逐字节出货, 死代码 = 每次加载常驻开销; git 5e7f98a/24a708d 存档可溯;
+// 共享工具 (elk 通道/svgEl/pathFromPoints/EDGE_STYLE/textW) 保留供 DAG 复用。
+// A4 口径: /op/graph 仍被本 tab 消费 —— refetchDag 顺带拉 counts (nodes/edges) 进计数条
+// (标注「全量」= /op/graph 数据面全量口径, 与仓内场景分列)。
 // 流程页降级为本 tab 折叠区 (#dg-flow, 默认收起; 数据面仍归 app.js op/flow, 经
 // window.__pmRenderFlow 回填)。
 // 零 npm / 零构建: 唯一 vendor = elk.bundled.js (elkjs 0.12.0, EPL-2.0, README「Vendor
@@ -17,7 +21,7 @@
 // SSE 复用 app.js 连接 (pm:sse), 断 → 30s 轮询。交互只读: wheel 缩放/拖拽平移/点选染选。
 'use strict'
 
-import { clusterTickets, clusterScene, scopeScene, scopeBuckets, ticketInScope } from './cluster.js' // PMWEB-DAG 聚合层 + PMWEB-3TAB scope 层 (纯函数)
+import { scopeScene, scopeBuckets, ticketInScope, ticketCwd } from './cluster.js' // PMWEB-DAG 聚合层 + PMWEB-REPO 仓优先 scope 层 (纯函数)
 
 const $ = (s) => document.querySelector(s)
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v))
@@ -69,9 +73,8 @@ async function loadElk() {
 // ==== PMWEB-DAG: 图 tab —— 聚合 DAG 场景 (只增; 聚合语义见 cluster.js 头注) ====
 const D2 = {
   tickets: [], // 最近一次 /op/tickets 票数组
-  clusters: [], // clusterTickets 结果
-  scene: null, // clusterScene 结果 (折叠态语义)
-  expanded: new Set(), // 展开的簇 key 集 (默认全折叠 = 聚合态)
+  scene: null, // scopeScene 结果 (仓内 scope 语义)
+  folded: new Set(), // PMWEB-REPO: scope 内折叠簇 key 集 (默认全展开 = 裁决③语义)
   pos: new Map(), // 场景节点 id -> {x,y,w,h}
   routes: new Map(), // edgeId -> [x,y][] elk 路由折线 (世界坐标; PMWEB-GRAPH sections 消费)
   world: { w: 0, h: 0 },
@@ -86,7 +89,7 @@ const D2 = {
   sseOpen: null,
   pollTimer: 0,
   sig: '', // 场景签名 (节点+边 id) —— 未变则只刷高亮/计数, 不重排不重画
-  scope: 'all', // PMWEB-3TAB: 'all' | 'cwd:<path>' | 'fleet:<code>' | 'cluster:<key>'
+  scope: '', // PMWEB-REPO: 'cwd:<path>' (默认档) | 'fleet:<code>' (次级); '' = 未定 (首个桶落地前)
   graphCounts: null, // PMWEB-3TAB A4: /op/graph counts (nodes/edges) —— 图 tab 仍消费 op/graph
 }
 const dagStage = () => $('#dg-stage')
@@ -104,10 +107,8 @@ async function refetchDag() {
     D2.lastRefetchAt = Date.now()
     const list = Array.isArray(d?.tickets) ? d.tickets : []
     D2.tickets = list
-    D2.clusters = clusterTickets(list)
-    const alive = new Set(D2.clusters.map((c) => c.key))
-    for (const k of [...D2.expanded]) if (!alive.has(k)) D2.expanded.delete(k) // 簇消失即收拢
-    renderScopeOptions() // PMWEB-3TAB: scope 桶随票面刷新 (当前桶消失自动回「全部」)
+    renderScopeOptions() // PMWEB-REPO: 仓桶随票面刷新 (默认档 = 首个仓; 桶消失回退默认仓)
+    if (!D2.scope) { dagShowEmpty(`${d?.note ? d.note + ' —— ' : ''}全部票无仓 (归档池) —— 图仅在仓 scope 下渲染`); return }
     await pullGraphCounts(ctl) // PMWEB-3TAB A4: /op/graph 仍被 图 tab 消费
     if (!list.length) { dagShowEmpty(d?.note); return }
     const ov = $('#dg-empty')
@@ -136,41 +137,42 @@ async function pullGraphCounts(ctl) {
   } catch { D2.graphCounts = null }
 }
 
-// PMWEB-3TAB: scope 选择器数据面 —— cwd 桶 / fleet 桶自票面派生 (cluster.js scopeBuckets)。
-// 当前 scope 桶已从票面消失 → 自动回「全部」(降级优先, 不留死 scope)。
+// PMWEB-REPO: scope 选择器数据面 —— 仓桶 (refs.cwd distinct) 为主, fleet 桶为显式次级
+// (cluster.js scopeBuckets; 归档池票不入桶)。容器优先 (裁决 A): 无全局档, 默认档 =
+// 首个仓 (升序); 当前桶从票面消失 → 回退默认仓 (降级优先, 不留死 scope)。
 function renderScopeOptions() {
   const sel = $('#dg-scope')
   if (!sel) return
   const b = scopeBuckets(D2.tickets)
   const opt = (v, label) => `<option value="${esc(v)}">${esc(label)}</option>`
   const short = (p) => String(p).split('/').filter(Boolean).pop() || String(p)
-  sel.innerHTML = opt('all', `全部 (${D2.tickets.length})`) +
-    (b.cwds.length ? `<optgroup label="cwd 桶">${b.cwds.map((x) => opt(`cwd:${x.key}`, `${short(x.key)} · ${x.count}`)).join('')}</optgroup>` : '') +
-    (b.fleets.length ? `<optgroup label="fleet">${b.fleets.map((x) => opt(`fleet:${x.key}`, `${x.key} · ${x.count}`)).join('')}</optgroup>` : '')
+  const defScope = b.cwds.length ? `cwd:${b.cwds[0].key}` : (b.fleets.length ? `fleet:${b.fleets[0].key}` : '')
+  if (!D2.scope) D2.scope = defScope // 首次落地: 默认即仓内视图
+  sel.innerHTML = (b.cwds.length ? `<optgroup label="仓 (refs.cwd)">${b.cwds.map((x) => opt(`cwd:${x.key}`, `${short(x.key)} · ${x.count}`)).join('')}</optgroup>` : '') +
+    (b.fleets.length ? `<optgroup label="fleet 席位 (次级)">${b.fleets.map((x) => opt(`fleet:${x.key}`, `${x.key} · ${x.count}`)).join('')}</optgroup>` : '')
   sel.value = D2.scope
-  if (sel.value !== D2.scope && D2.scope !== 'all') { // 桶消失回退
-    D2.scope = 'all'
-    D2.expanded.clear()
+  if (sel.value !== D2.scope) { // 桶消失回退默认仓
+    D2.scope = defScope
+    D2.folded.clear()
     D2.selected = null
-    sel.value = 'all'
+    sel.value = D2.scope
   }
 }
 
-// PMWEB-3TAB: scope 切换单入口 (选择器/联动共用) —— 展开态与选中态随 scope 重置
-async function setDagScope(scope) {
-  D2.scope = scope || 'all'
-  D2.expanded.clear()
+// PMWEB-REPO: scope 切换单入口 (选择器/联动/出界盒跳转共用) —— 折叠态与选中态随 scope
+// 重置; focusIds (出界盒成员票) → 重建后染选聚焦其所在簇 (跨仓跳转落点可见)。
+async function setDagScope(scope, focusIds) {
+  D2.scope = scope || ''
+  D2.folded.clear()
   D2.selected = null
   const sel = $('#dg-scope')
-  if (sel && sel.value !== D2.scope) { // 重聚焦 scope 不在桶选项中 → 前插临时选中项 (选择器不落空)
-    const opt = document.createElement('option')
-    opt.value = D2.scope
-    opt.textContent = `聚焦 ${D2.scope.replace('cluster:', '')}`
-    sel.prepend(opt)
-    sel.value = D2.scope
-  }
+  if (sel && sel.value !== D2.scope) sel.value = D2.scope // 程序化切仓/席位 (联动/跳转) → 选择器同步
   await rebuildDag(true)
   renderDagList()
+  if (Array.isArray(focusIds) && focusIds.length && D2.scene) {
+    const c = D2.scene.clusters.find((x) => x.ticketIds.some((id) => focusIds.includes(id)))
+    if (c) selectDag({ kind: 'cluster', key: c.key }) // 聚焦该簇 (染选 + 列表选中)
+  }
   renderDagCounts('')
   if (D2.world.w) { dagFitView(); D2.fitDone = true }
   dagIntro()
@@ -206,23 +208,28 @@ function dagShowEmpty(note) { // 空态: 清场景 + 覆盖层注记 (不销毁 
 function renderDagCounts(degradedNote) {
   const el = $('#dg-counts')
   if (!el) return
-  const c = D2.clusters
+  const b = scopeBuckets(D2.tickets) // {cwds, fleets, archive}
+  const repoN = D2.tickets.length - b.archive
+  const c = D2.scene?.clusters ?? []
   const active = c.reduce((a, x) => a + x.active, 0)
   const outN = D2.scene?.outClusters?.length ?? 0
-  const scopeTxt = !D2.scope || D2.scope === 'all' ? 'scope 全部' : `scope ${D2.scope}`
-  const graphTxt = D2.graphCounts ? ` · graph ${D2.graphCounts.nodes}节点/${D2.graphCounts.edges}边` : ''
+  const graphTxt = D2.graphCounts ? ` · graph 全量 ${D2.graphCounts.nodes}节点/${D2.graphCounts.edges}边` : ''
   el.textContent = D2.scene
-    ? `${D2.tickets.length} 票 → ${c.length} 簇 (run ${c.filter((x) => x.kind === 'run').length} / deps ${c.filter((x) => x.kind === 'deps').length} / 前缀 ${c.filter((x) => x.kind === 'prefix').length} / 单票 ${c.filter((x) => x.kind === 'single').length}) · 活跃 ${active} · ${scopeTxt}${outN ? ` · 出界簇 ${outN}` : ''}${graphTxt} · 场景 ${D2.scene.nodes.length} 节点 / ${D2.scene.edges.length} 边 · 展开 ${D2.expanded.size}`
+    ? `仓 ${repoN} 票 · 归档 ${b.archive} 零入场 · scope ${D2.scope || '未定'} · scope 内 ${c.length} 簇 · 活跃 ${active}${outN ? ` · 出界簇 ${outN}` : ''}${graphTxt} · 场景 ${D2.scene.nodes.length} 节点 / ${D2.scene.edges.length} 边 · 折叠 ${D2.folded.size}`
     : '加载中…'
   if (!degradedNote && dagBannerEl() && /票面降级/.test(dagBannerEl().textContent || '')) dagBannerEl().hidden = true
 }
 
-// 场景重建: 聚合派生 + elk layered 布局; 签名未变则跳过重排 (SSE 突发不闪)。
-// PMWEB-3TAB: scope ≠ all → scopeScene (scope 内全展开 + 出界聚合簇盒)。
+// 场景重建: 仓内 scope 派生 + elk layered 布局; 签名未变则跳过重排 (SSE 突发不闪)。
+// PMWEB-REPO: scope 恒有值 (默认首个仓) → scopeScene (默认全展开 + D2.folded 折叠集
+// + 出界聚合簇盒)。
 async function rebuildDag(force) {
-  D2.scene = !D2.scope || D2.scope === 'all'
-    ? clusterScene(D2.tickets, D2.expanded)
-    : scopeScene(D2.tickets, D2.scope)
+  D2.scene = D2.scope ? scopeScene(D2.tickets, D2.scope, D2.folded) : null
+  if (D2.scene) { // 折叠集里已消失的簇键随手清 (票面变化不留死折叠)
+    const alive = new Set(D2.scene.clusters.map((c) => c.key))
+    for (const k of [...D2.folded]) if (!alive.has(k)) D2.folded.delete(k)
+  }
+  if (!D2.scene) return // scope 未定 (refetchDag 已走空态, 此处防御)
   const sig = D2.scene.nodes.map((n) => n.id).join('|') + '#' + D2.scene.edges.map((e) => e.id).join('|')
   if (!force && sig === D2.sig) { applyDagHighlight(); renderDagCounts(''); return }
   D2.sig = sig
@@ -325,7 +332,7 @@ function dagNodeSize(n) {
 // 簇副标签: 票数/活跃/轨道 + 跨簇依赖计数 ↗出 ↘入 (无依赖不显示; PMWEB-GRAPH F3);
 // 出界簇盒 (PMWEB-3TAB): 「出界」徽标 + 票数/活跃 —— 独立聚合显示, 非 ghost 散点。
 function dagClusterSub(n) {
-  if (n.type === 'out') return `出界 · ${n.total} 票 · ${n.active} 活跃`
+  if (n.type === 'out') return n.jumpCwd ? `出界 · ${n.total} 票 · ${n.active} 活跃` : `出界 · ${n.total} 票 · 无仓 (不可跳转)`
   return `${n.total} 票 · ${n.active} 活跃${n.kind === 'single' ? '' : ' · ' + n.kind}` +
     (n.depOut ? ` ↗${n.depOut}` : '') + (n.depIn ? ` ↘${n.depIn}` : '')
 }
@@ -333,7 +340,8 @@ function dagClusterSub(n) {
 function dagNodeEl(n) {
   const p = D2.pos.get(n.id) || { x: 0, y: 0, w: 140, h: 44 }
   const g = svgEl('g', { class: `dg-node t-${n.type}`, 'data-id': n.id })
-  if (n.type === 'out') { // PMWEB-3TAB: 出界聚合簇盒 —— 虚线框 + 出界徽标, 点击重聚焦该簇
+  if (n.type === 'out') { // PMWEB-REPO: 出界聚合簇盒 —— 虚线框; jumpCwd 有值可点击跨仓跳转, 无值 (成员全无仓) = 纯提示盒
+    if (!n.jumpCwd) g.classList.add('t-out-hint')
     g.appendChild(svgEl('rect', { x: 1.5, y: 1.5, width: p.w - 3, height: p.h - 3, rx: 9, class: 'dg-node-body', stroke: '#e0a93e', 'stroke-dasharray': '5 4' }))
     const label = svgEl('text', { x: p.w / 2, y: 19, class: 'dg-label', title: String(n.label ?? '') })
     label.textContent = fitText(n.label, p.w - 28)
@@ -341,9 +349,11 @@ function dagNodeEl(n) {
     const sub = svgEl('text', { x: p.w / 2, y: 35, class: 'dg-sub', title: dagClusterSub(n) })
     sub.textContent = fitText(dagClusterSub(n), p.w - 28, DG_SUB_FONT)
     g.appendChild(sub)
-    const refocus = svgEl('text', { x: p.w - 10, y: 15, class: 'dg-fold', title: '点击重聚焦到该簇 scope' })
-    refocus.textContent = '⤴'
-    g.appendChild(refocus)
+    if (n.jumpCwd) { // 跨仓跳转角标 (仅可点盒): 点击 → 切成员多数仓 + 染选聚焦该簇
+      const refocus = svgEl('text', { x: p.w - 10, y: 15, class: 'dg-fold', title: `点击跳转目标仓 (${n.jumpCwd}) 并聚焦该簇` })
+      refocus.textContent = '⤴'
+      g.appendChild(refocus)
+    }
   } else if (n.type === 'cluster') {
     const stroke = n.active > 0 ? '#4da3ff' : '#6b7688'
     g.appendChild(svgEl('rect', { x: 1.5, y: 1.5, width: p.w - 3, height: p.h - 3, rx: 9, class: 'dg-node-body', stroke }))
@@ -476,34 +486,31 @@ function selectDag(sel) { // sel = null 取消
   dagIntro()
 }
 
-async function toggleDagExpand(key, force) {
-  const open = D2.expanded.has(key)
-  const next = force == null ? !open : !!force
-  if (next) D2.expanded.add(key)
-  else D2.expanded.delete(key)
+async function toggleDagFold(key) { // PMWEB-REPO: scope 内折叠交互 (默认全展开, 折叠集取反)
+  D2.folded.has(key) ? D2.folded.delete(key) : D2.folded.add(key)
   await rebuildDag(true)
   if (D2.world.w) { dagFitView(); D2.fitDone = true } // PMWEB-GRAPH: 展开/折叠后重取景 (曾不 fit 致新成员出画)
   renderDagList()
   renderDagCounts('')
 }
 
-// ---- 图 tab: 左侧簇 list (票数/活跃数/状态分布摘要; 点选联动染选) ----
+// ---- 图 tab: 左侧簇 list (scope 内簇; 票数/活跃数/状态分布摘要; 点选联动染选) ----
 function renderDagList() {
   const el = $('#dg-list')
   if (!el) return
   const ticketsById = new Map(D2.tickets.map((t) => [String(t.ticket_id), t]))
-  const rows = D2.clusters.map((c) => {
-    const open = D2.expanded.has(c.key)
+  const rows = (D2.scene?.clusters ?? []).map((c) => {
+    const folded = D2.folded.has(c.key) // PMWEB-REPO: 默认展开 → ▾; 折叠 → ▸
     const sel = D2.selected?.kind === 'cluster' && D2.selected.key === c.key
     const dist = Object.entries(c.states).map(([s, n]) => `${s} ${n}`).join(' · ')
-    const members = !open ? '' : `<ul class="dg-members">${c.ticketIds.map((id) => {
+    const members = folded ? '' : `<ul class="dg-members">${c.ticketIds.map((id) => {
       const st = String(ticketsById.get(id)?.state ?? 'unknown')
       const tsel = D2.selected?.kind === 'ticket' && D2.selected.id === id
       return `<li><button type="button" class="dg-ticket-row${tsel ? ' dg-selected' : ''}" data-tid="${esc(id)}"><span class="dg-dot" style="background:${colorOf(st)}"></span><span class="mono">${esc(id)}</span><span class="dim small">${esc(st)}</span></button></li>`
     }).join('')}</ul>`
     return `<div class="dg-cluster${sel ? ' dg-selected' : ''}" data-keywrap="${esc(c.key)}">
       <div class="dg-cluster-row${sel ? ' dg-selected' : ''}" data-key="${esc(c.key)}">
-        <button type="button" class="dg-fold-btn" data-fold="${esc(c.key)}" title="${open ? '折叠' : '展开'}成员票">${open ? '▾' : '▸'}</button>
+        <button type="button" class="dg-fold-btn" data-fold="${esc(c.key)}" title="${folded ? '展开' : '折叠'}成员票">${folded ? '▸' : '▾'}</button>
         <span class="dg-label mono" title="${esc(c.key)}">${esc(c.label)}</span>
         <span class="dg-kind k-${c.kind}">${c.kind}</span>
         <span class="dg-meta small">${c.total} 票 · <span class="${c.active ? 'dg-active' : 'dim'}">${c.active} 活跃</span></span>
@@ -520,15 +527,9 @@ function wireDagList() {
   if (!el) return
   el.addEventListener('click', async (e) => {
     const fold = e.target.closest?.('[data-fold]')
-    if (fold) { await toggleDagExpand(fold.dataset.fold); return }
+    if (fold) { await toggleDagFold(fold.dataset.fold); return }
     const tid = e.target.closest?.('[data-tid]')
-    if (tid) { // 选票: 所在簇折叠时自动展开 (图上可见其 deps 边)
-      const id = tid.dataset.tid
-      const c = D2.clusters.find((x) => x.ticketIds.includes(id))
-      if (c && !D2.expanded.has(c.key)) await toggleDagExpand(c.key, true)
-      selectDag({ kind: 'ticket', id })
-      return
-    }
+    if (tid) { selectDag({ kind: 'ticket', id: tid.dataset.tid }); return } // scope 内默认全展开, 直选染选
     const row = e.target.closest?.('[data-key]')
     if (row) {
       const key = row.dataset.key
@@ -577,12 +578,16 @@ function wireDagStage() {
     D2.view.x = pan.vx0 + dx; D2.view.y = pan.vy0 + dy
     applyDagView()
   })
-  const up = (e) => {
+  const up = async (e) => {
     if (!pan) return
     if (pan.node && !pan.moved) {
       const n = D2.scene?.nodes.find((x) => x.id === pan.node)
-      if (n?.type === 'out') { pan = null; setDagScope(`cluster:${n.clusterKey}`); return } // PMWEB-3TAB: 出界簇盒点击 → 重聚焦该簇 scope
-      if (n?.type === 'cluster' && e.target.closest?.('.dg-fold')) { const k = n.clusterKey; pan = null; toggleDagExpand(k); return } // 角标: 折叠展开
+      if (n?.type === 'out') { // PMWEB-REPO: 出界簇盒点击 → 跨仓跳转 (切成员多数仓 + 染选聚焦该簇); 无仓成员纯提示不可点
+        pan = null
+        if (n.jumpCwd) await setDagScope(`cwd:${n.jumpCwd}`, n.ticketIds)
+        return
+      }
+      if (n?.type === 'cluster' && e.target.closest?.('.dg-fold')) { const k = n.clusterKey; pan = null; toggleDagFold(k); return } // 角标: 折叠展开
       const sel = n?.type === 'cluster' ? { kind: 'cluster', key: n.clusterKey } : n ? { kind: 'ticket', id: n.ticketId } : null
       const same = D2.selected && sel && D2.selected.kind === sel.kind &&
         (sel.kind === 'cluster' ? D2.selected.key === sel.key : D2.selected.id === sel.id)
@@ -596,7 +601,7 @@ function wireDagStage() {
     const nodeG = e.target.closest?.('.dg-node.t-cluster')
     if (!nodeG) return
     const n = D2.scene?.nodes.find((x) => x.id === nodeG.dataset.id)
-    if (n?.clusterKey) toggleDagExpand(n.clusterKey)
+    if (n?.clusterKey) toggleDagFold(n.clusterKey)
   })
   s.addEventListener('mouseover', (e) => {
     const nodeG = e.target.closest?.('.dg-node')
@@ -617,21 +622,22 @@ function wireDagVisibility() { // tab 首次可见时取景 (隐藏时 stage 尺
 }
 
 function dagIntro() { // 门/证据只读数据面
+  const b = scopeBuckets(D2.tickets)
   window.__pmDag = {
     ready: !!D2.scene,
     tickets: D2.tickets.length,
-    clusters: D2.clusters.length,
-    byKind: Object.fromEntries(['run', 'deps', 'prefix', 'single'].map((k) => [k, D2.clusters.filter((c) => c.kind === k).length])),
+    archive: b.archive, // PMWEB-REPO: 归档池票数 (零入场口径)
+    clusters: D2.scene?.clusters.length ?? 0, // scope 内簇数
     nodes: D2.scene?.nodes.length ?? 0,
     edges: D2.scene?.edges.length ?? 0,
-    expanded: [...D2.expanded],
+    folded: [...D2.folded],
     selected: D2.selected,
     view: { ...D2.view },
     lastRefetchAt: D2.lastRefetchAt,
     sseOpen: D2.sseOpen,
-    clusterKeys: D2.clusters.map((c) => c.key),
-    scope: D2.scope, // PMWEB-3TAB: 当前 scope 键
-    outClusters: D2.scene?.outClusters?.length ?? 0, // 出界聚合簇盒数 (scope ≠ all 时)
+    scope: D2.scope, // PMWEB-REPO: 当前 scope 键 (默认档 = 首个仓)
+    outClusters: D2.scene?.outClusters?.length ?? 0, // 出界聚合簇盒数
+    outJumps: (D2.scene?.outClusters ?? []).map((c) => ({ key: c.key, jumpCwd: c.jumpCwd })), // 跨仓跳转目标 ('' = 纯提示不可点)
     graphCounts: D2.graphCounts, // A4: /op/graph counts (图 tab 仍消费 op/graph)
   }
 }
@@ -642,8 +648,8 @@ async function bootDag() {
   sec.innerHTML = `
     <div class="cv-head">
       <span id="dg-counts" class="dim mono">加载中…</span>
-      <select id="dg-scope" title="scope 选择器: 全部 / cwd 桶 (refs.cwd) / fleet 席位"></select>
-      <span class="dim small">聚合 DAG · scope 内全展开, 出界簇盒点击重聚焦 · ▸ 展开簇 / 双击簇折叠 · 点选染选 deps+邻接 · 数据 GET /op/tickets + /op/graph (只读)</span>
+      <select id="dg-scope" title="scope 选择器: 仓 (refs.cwd, 默认) / fleet 席位 (显式次级)"></select>
+      <span class="dim small">仓内聚合 DAG · 默认即仓视图, 出界盒点击跳目标仓聚焦该簇 · ▸ 折叠簇 / 双击展开 · 点选染选 deps+邻接 · 数据 GET /op/tickets + /op/graph (只读)</span>
     </div>
     <details id="dg-flow" class="dg-flow">
       <summary>流程 <span class="dim small">原流程页折叠区 · 默认收起 · 数据源 op/flow (app.js)</span></summary>
@@ -667,14 +673,13 @@ async function bootDag() {
   dagIntro() // 空票面/降级态也要有内省面 (门断言用)
 }
 
-// ---- PMWEB-3TAB: 跨 tab 联动 (票 tab 选票 → 本 tab 染选; 席位 tab「在图中聚焦」→ fleet scope) ----
+// ---- PMWEB-REPO: 跨 tab 联动 (票 tab 选票 → 本 tab 染选; 席位 tab「在图中聚焦」→ fleet scope) ----
 window.addEventListener('pm:dag-focus', async (e) => {
   const id = e.detail?.ticketId == null ? null : String(e.detail.ticketId)
   if (!id) return
   const t = D2.tickets.find((x) => String(x.ticket_id) === id)
-  if (t && !ticketInScope(t, D2.scope)) await setDagScope('all') // 目标票不在当前 scope → 先回全部
-  const c = D2.clusters.find((x) => x.ticketIds.includes(id))
-  if (c && !D2.expanded.has(c.key)) await toggleDagExpand(c.key, true) // 所在簇自动展开
+  if (!t) return // 归档池票不出票面联动 (app.js 归档区纯展示)
+  if (!ticketInScope(t, D2.scope)) await setDagScope(`cwd:${ticketCwd(t)}`) // 容器优先: 目标票不在当前仓 → 跳其所在仓
   selectDag({ kind: 'ticket', id })
   dagIntro()
 })

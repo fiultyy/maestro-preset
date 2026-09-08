@@ -1,27 +1,29 @@
 #!/usr/bin/env node
-// pmweb-dag-gate.mjs — PMWEB-DAG 图视重构 gate (spec /tmp/pmweb-dag-spec.md)。
+// pmweb-dag-gate.mjs — PMWEB-DAG 图视重构 gate (spec /tmp/pmweb-dag-spec.md; PMWEB-REPO 仓优先翻转)。
 //
 // A. 聚合纯函数单测 (零浏览器, node 直 import public/cluster.js):
 //    双轨键+兜底逐轨断言 (run/deps 连通分量/前缀族/单票), 轨道优先级 (run 压 deps),
 //    deps=[] 批次不被吞并, dangling deps / 脏 JSON 防御, 终态-活跃口径, 全覆盖恰一簇;
-//    clusterScene 折叠态派生 (簇超节点/成员票替换/边同形去重/跨簇边保留)。
+//    clusterScene 折叠态派生 (簇超节点/成员票替换/边同形去重/跨簇边保留);
+//    PMWEB-REPO 仓优先 scope 层: 归档池零入场 / 出界盒跨仓 jumpCwd (多数仓+平票字典序)
+//    / 折叠集默认全展开 / 全局档退役恒假。
 // B. 静态门: index.html 三 tab 面 (PMWEB-3TAB: 票/席位/图; 流程折叠区+画布退役);
-//    canvas.js 聚合导入+scope 选择器+出界聚合+联动锚点+退役零残留;
-//    app.js 组织图标记 (既有 SSE 派发/三视图语义保留); style.css 样式面;
+//    canvas.js 容器优先 (默认首个仓/无全局档/出界跨仓跳转/折叠集) + 聚合导入+联动锚点
+//    +退役零残留; app.js 仓分组看板+无仓归档折叠区 (纯展示) +组织图标记; style.css 样式面;
 //    红线: fetch 端点白名单 + POST 仅 /op/act (ADR-002, canvas.js 退役后零 POST) + cluster.js 零 fetch
 //    + package.json 零依赖。
 // C. sandbox 浏览器门 (stub ledger + fleet fixture + mock dsh + bridge 血缘,
-//    零 live 变更): 图 tab 出簇 (4 簇 = run/deps/prefix/single 各 1) + list 染选
-//    联动 (选簇聚焦其余淡出 / 选票自动展开高亮 deps 边) + 折叠展开往返 + 空白取消;
-//    3TAB: scope 选择器 (全部/cwd 桶) + 流程折叠区默认收起 + op/graph counts 消费 (A4)
-//    + 票 cwd 分桶看板 (未分配尾组) + 选票联动切图 tab + 席位「在图中聚焦」+ 画布退役零残留;
-//    席位 tab 小卡 (一行: 状态点+code+持票数) + 组织图血缘嵌套 (head 上 worker 下)
+//    零 live 变更): 图 tab 默认即仓内视图 (alpha 全展开) + scope 选择器 (仓/fleet 次级,
+//    无全局档) + 仓内折叠往返 + list 染选联动 + 流程折叠区默认收起 + op/graph counts
+//    消费 (A4) + 票 tab 仓分组看板 + 无仓归档折叠区 (默认收起, 纯展示 3 卡) + 选票联动
+//    跳所在仓 + 席位「在图中聚焦」+ 画布退役零残留; 席位 tab 小卡 + 组织图血缘嵌套
 //    + 详情浮层全量字段+持票列表+关闭返回。页面异常任何一例即 FAIL。
 // D. PMWEB-GRAPH 几何门 (独立扩模 sandbox, 零 live 变更; 泳道场景退役后仅 DAG):
-//    G1 几何断言: DAG SVG 边路径采样点 vs 非端点节点盒零求交 (容差 2px 内缩);
-//    G2 3TAB scope: cwd:/w/one 切 scope → 票面全展开 + 出界聚簇 1 (独立聚合非 ghost)
-//    + 出界簇盒点击重聚焦 cluster:<key> 成员还原;
-//    G3 浏览器级: 折叠态跨簇 deps → 簇级边 ≥1 + 簇副标签 ↗N/↘N 计数渲染;
+//    G1 几何断言: DAG SVG 边路径采样点 vs 非端点节点盒零求交 (容差 2px 内缩; /w/one
+//    仓内场景含 2 出界边);
+//    G2 REPO: 默认首个仓 (/repo/alpha) + 归档池零入场注记 + 出界盒两态 (jumpCwd 可跳转
+//    / 无仓纯提示不可点) + 点击跨仓跳转 → 目标仓 + 染选聚焦该簇;
+//    G3 折叠重取景 (fold → fit) + 标签零溢出 (dense 仓 8 成员);
 //    G4 = 既有断言零回归 (A/B/C 全段原样)。
 // 留存: 截图/日志落 $PM_HOST_SERVICE_GATES_DIR/pmweb-dag/<label>/。
 // Usage: node pmwweb-dag-gate.mjs <label> [chrome-bin]
@@ -131,34 +133,53 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   })())
   ok('A 辅助: ticketRun/ticketDeps/ticketPrefix 脏形防御', ticketRun({ refs: '{"run":42}' }) === '42' && ticketDeps({ deps: '{"a":1}' }).length === 0 && ticketPrefix('NOPREFIX') === null && ticketPrefix('AND1-2') === 'AND1')
   ok('A 终态集冻结: done/merged/rejected', TERMINAL_STATES.size === 3 && ['done', 'merged', 'rejected'].every((s) => TERMINAL_STATES.has(s)))
-  // PMWEB-3TAB (A): scope 层 —— cwd/fleet 桶口径 + scopeScene 出界独立聚合 (用户裁决 ③)
+  // PMWEB-REPO (A): 仓优先 scope 层 —— 归档池零入场 + 出界盒跨仓 jumpCwd (用户两裁决)
   const ts3 = [
     t('A-1', { state: 'running', deps: '["B-1"]', refs: '{"cwd":"/x/y"}', lease_owner: 'w1/budget' }),
     t('B-1', { refs: '{"cwd":"/x/z"}' }),
     t('A-2', { state: 'blocked', refs: '{"cwd":"/x/y"}', lease_owner: 'w1@sub' }),
     t('C-9', { refs: '{}' }),
+    t('C-8', { lease_owner: 'w1' }), // 归档池持票: 有 lease 无仓 → fleet 也不入场
   ]
-  ok('A 3TAB scope: cwd/fleet 口径 + scopeBuckets 分桶计数 (未分配不计桶)', ticketCwd(ts3[0]) === '/x/y' && ticketCwd(t('N', { refs: null })) === ''
+  ok('A REPO scope: cwd/fleet 口径 + scopeBuckets 仓桶 (归档池不计桶)', ticketCwd(ts3[0]) === '/x/y' && ticketCwd(t('N', { refs: null })) === ''
     && ticketFleet(ts3[0]) === 'w1' && ticketFleet(ts3[2]) === 'w1' && ticketFleet(t('N2', { lease_owner: null })) === ''
-    && (() => { const b = scopeBuckets(ts3); return JSON.stringify(b.cwds) === JSON.stringify([{ key: '/x/y', count: 2 }, { key: '/x/z', count: 1 }]) && b.fleets.length === 1 && b.fleets[0].key === 'w1' && b.fleets[0].count === 2 && b.unassigned === 1 })())
-  ok('A 3TAB scopeScene: scope 内全展开 + 出界 deps 按自身聚簇 → 出界簇盒 (非 ghost 散点)', (() => {
+    && (() => { const b = scopeBuckets(ts3); return JSON.stringify(b.cwds) === JSON.stringify([{ key: '/x/y', count: 2 }, { key: '/x/z', count: 1 }]) && b.fleets.length === 1 && b.fleets[0].key === 'w1' && b.fleets[0].count === 2 && b.archive === 2 })())
+  ok('A REPO scopeScene: scope 内全展开 + 出界 deps 聚簇盒带跨仓 jumpCwd (非 ghost 散点)', (() => {
     const sc = scopeScene(ts3, 'cwd:/x/y')
     const ids = sc.nodes.map((n) => `${n.id}:${n.type}`)
     return ids.join() === 'tk:A-1:ticket,tk:A-2:ticket,out:one:B-1:out'
       && sc.edges.length === 1 && sc.edges[0].id === 'dep:tk:A-1>out:one:B-1'
-      && sc.outClusters.length === 1 && sc.outClusters[0].key === 'one:B-1' // C-9 无 deps 关系不入场
+      && sc.outClusters.length === 1 && sc.outClusters[0].key === 'one:B-1' && sc.outClusters[0].jumpCwd === '/x/z' // C-9/C-8 归档池不入场
   })())
-  ok('A 3TAB scopeScene: cluster:<key> 重聚焦 (全量表命中 + 出界盒 key 回退还原) + 空桶降级安全', (() => {
-    const all = scopeScene(ts3, 'cluster:cdep:A-1') // 全量簇表命中: A-1 deps B-1 连通分量成员
-    const box = scopeScene(ts3, 'cluster:one:B-1') // 出界盒 key (全量表无) → 回退按 key 形态还原成员
-    const ec = scopeScene(ts3, 'cwd:/nope')
-    return all.nodes.map((n) => n.id).sort().join() === 'tk:A-1,tk:B-1' && all.outClusters.length === 0
-      && box.nodes.map((n) => n.id).join() === 'tk:B-1' && box.outClusters.length === 0
-      && ec.nodes.length === 0 && ec.edges.length === 0 && ec.outClusters.length === 0
+  ok('A REPO 归档池零入场: 无仓票任何 scope 不出节点 (持票也不入 fleet); 全员无仓出界盒 → 纯提示 jumpCwd 空', (() => {
+    const fl = scopeScene(ts3, 'fleet:w1')
+    const hint = scopeScene([t('H-1', { refs: '{"cwd":"/h"}', deps: '["AR-9"]' }), t('AR-9')], 'cwd:/h')
+    return fl.nodes.some((n) => n.id === 'tk:A-1') && fl.nodes.some((n) => n.id === 'tk:A-2')
+      && !fl.nodes.some((n) => n.id === 'tk:C-8') // 归档池持票: fleet scope 也不入场 (裁决 B)
+      && hint.nodes.some((n) => n.id === 'tk:H-1') && !hint.nodes.some((n) => n.id === 'tk:AR-9') // 归档池票零节点 (出界提示盒除外)
+      && hint.outClusters.length === 1 && hint.outClusters[0].jumpCwd === '' && hint.outClusters[0].total === 1
   })())
-  ok('A 3TAB scope: ticketInScope 三档谓词 (all 恒真/cwd 严格/fleet 归一)', ticketInScope(ts3[0], 'all') === true
+  ok('A REPO 跨仓跳转: 出界盒 jumpCwd = 成员多数仓, 平票取字典序最小 (确定幂等)', (() => {
+    const tj = [t('J-1', { refs: '{"cwd":"/r/a"}', deps: '["K-1","K-2"]' }), t('K-1', { refs: '{"cwd":"/r/b"}' }), t('K-2', { refs: '{"cwd":"/r/c"}', deps: '["K-1"]' })]
+    const sc = scopeScene(tj, 'cwd:/r/a')
+    const c = sc.outClusters[0]
+    const single = scopeScene(ts3, 'cwd:/x/z') // 仓内无跨界 deps → 零出界
+    return sc.outClusters.length === 1 && c.key === 'cdep:K-1' && c.jumpCwd === '/r/b'
+      && single.outClusters.length === 0 && single.nodes.map((n) => n.id).join() === 'tk:B-1'
+  })())
+  ok('A REPO 折叠集: scope 内默认全展开, foldedSet 折叠为超级节点; 未知 scope 安全空场', (() => {
+    const tf = [t('D-1', { refs: '{"cwd":"/f"}' }), t('D-2', { refs: '{"cwd":"/f"}', deps: '["D-1"]' }), t('D-3', { refs: '{"cwd":"/f"}', deps: '["D-2"]' })]
+    const open = scopeScene(tf, 'cwd:/f')
+    const folded = scopeScene(tf, 'cwd:/f', new Set(['cdep:D-1']))
+    const dead = scopeScene(tf, 'cwd:/nope')
+    return open.nodes.length === 3 && open.nodes.every((n) => n.type === 'ticket')
+      && folded.nodes.length === 1 && folded.nodes[0].id === 'cl:cdep:D-1' && folded.edges.length === 0
+      && dead.nodes.length === 0 && dead.edges.length === 0 && dead.outClusters.length === 0
+  })())
+  ok('A REPO scope: ticketInScope 谓词 (全局档退役恒假/归档池恒假/cwd 严格/fleet 归一/未知档假)', ticketInScope(ts3[0], 'all') === false
+    && ticketInScope(ts3[3], 'cwd:/x/y') === false && ticketInScope(ts3[4], 'fleet:w1') === false
     && ticketInScope(ts3[0], 'cwd:/x/y') === true && ticketInScope(ts3[1], 'cwd:/x/y') === false
-    && ticketInScope(ts3[2], 'fleet:w1') === true && ticketInScope(ts3[3], 'fleet:w1') === false)
+    && ticketInScope(ts3[2], 'fleet:w1') === true && ticketInScope(ts3[0], 'junk:z') === false)
 }
 
 // ---------- B. 静态门 ----------
@@ -171,19 +192,29 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
     && !html.includes('id="view-flow"') && !html.includes('id="view-canvas"'))
   ok('B index.html: 席位详情浮层 dialog 在场', html.includes('id="seat-detail"') && html.includes('id="sd-body"') && html.includes('id="sd-close"'))
   const cv = readFileSync(`${PUBLIC}canvas.js`, 'utf8')
-  ok('B canvas.js: 聚合层导入 + 图 tab boot + 内省', cv.includes("from './cluster.js'") && cv.includes('clusterTickets(list)') && cv.includes('bootDag()') && cv.includes('window.__pmDag'))
+  ok('B canvas.js: 聚合层导入 + 图 tab boot + 内省', cv.includes("from './cluster.js'") && cv.includes('scopeScene(D2.tickets') && cv.includes('bootDag()') && cv.includes('window.__pmDag'))
   ok('B canvas.js: 画布退役 (泳道/抽屉/回放/minimap 锚点零残留)', !cv.includes('refetchGraph') && !cv.includes('loadReplay') && !cv.includes('canvas-svg')
     && !cv.includes('openDrawer') && !cv.includes('wireMinimap') && !cv.includes('id="cv-stage"'))
   ok('B canvas.js: scope 选择器+出界聚合+流程折叠区+联动锚点 (PMWEB-3TAB)', cv.includes('scopeScene') && cv.includes('scopeBuckets') && cv.includes('#dg-scope')
     && cv.includes('dg-flow-body') && cv.includes("pm:dag-focus") && cv.includes("pm:dag-focus-fleet") && cv.includes('pullGraphCounts'))
+  ok('B canvas.js: 容器优先翻转 (默认首个仓/无全局档/出界盒跨仓跳转/折叠集/A4 全量口径注记)', !cv.includes("'all'") && !cv.includes("'cluster:")
+    && cv.includes('b.cwds[0]') && cv.includes('jumpCwd') && cv.includes('D2.folded') && cv.includes('graph 全量'))
   const ap = readFileSync(`${PUBLIC}app.js`, 'utf8')
   ok('B app.js: 组织图+小卡+浮层标记', ap.includes('function lineageOf') && ap.includes('seat-mini') && ap.includes('org-children') && ap.includes('openSeatDetail') && ap.includes('loadGraph'))
   ok('B app.js: 既有 SSE 派发两事件 + 三视图 refetch 保留', ap.includes("new CustomEvent('pm:sse'") && ap.includes("new CustomEvent('pm:sse-state'") && ap.includes('refetch.tickets()') && ap.includes('refetch.flow()'))
-  ok('B app.js: 3TAB 票 cwd 分组+选票联动+席位聚焦+流程重定向锚点', ap.includes('cwd-group') && ap.includes('未分配') && ap.includes("pm:dag-focus'")
+  ok('B app.js: REPO 仓分组看板+无仓归档折叠区+选票联动+席位聚焦+流程重定向锚点', ap.includes('cwd-group') && ap.includes('tk-pool') && ap.includes('无仓归档')
+    && !ap.includes(": '未分配'") && ap.includes("pm:dag-focus'")
     && ap.includes('data-dg-focus') && ap.includes('__pmRenderFlow') && ap.includes("$('#dg-flow-body')"))
+  ok('B app.js: 归档池纯展示 (pool 卡零联动零钮; 折叠区 details 默认收起不带 open)', ap.includes('{ pool: true }') && ap.includes("pool ? '' : ` data-tid=")
+    && ap.includes('<details class="tk-pool"') && !/details class="tk-pool"[^>]*\bopen\b/.test(ap))
+  ok('B cluster.js: 仓优先 scope 层 (无全局档字面量/无簇伪 scope/出界 jumpCwd/归档池 archive 口径)', (() => {
+    const c = readFileSync(`${PUBLIC}cluster.js`, 'utf8')
+    return !c.includes("'all'") && !c.includes("'cluster:") && c.includes('export function outJumpCwd') && c.includes('jumpCwd') && c.includes('archive')
+  })())
   const css = readFileSync(`${PUBLIC}style.css`, 'utf8')
   ok('B style.css: 图 tab + 组织图 + 小卡 + 浮层样式面', css.includes('#dg-list') && css.includes('.dg-node') && css.includes('.org-children') && css.includes('.seat-mini') && css.includes('#seat-detail'))
   ok('B style.css: 3TAB 样式面 (cwd 分组/scope 选择器/出界簇盒/流程折叠区)', css.includes('.cwd-group') && css.includes('#dg-scope') && css.includes('.t-out') && css.includes('details.dg-flow') && css.includes('.dg-focus'))
+  ok('B style.css: REPO 样式面 (无仓归档折叠区/归档池卡/出界提示盒)', css.includes('.tk-pool') && css.includes('.ticket-card.pool') && css.includes('.t-out-hint'))
   ok('B cluster.js: 纯函数模块零 fetch 零 DOM', (() => {
     const c = readFileSync(`${PUBLIC}cluster.js`, 'utf8')
     return !/fetch\(|document\.|window\./.test(c) && c.includes('export function clusterTickets')
@@ -209,7 +240,8 @@ const FETCH_ALLOW = new Set(['/op/tickets', '/op/fleet', '/op/flow', '/op/graph'
 
 // ---------- sandbox 工厂 (pmw2-3 gate 惯例: stub ledger + fleet fixture + mock dsh) ----------
 // 7 票 → 4 簇: run:R77(RUN-1/RUN-2) + cdep:CH-A(CH-A←CH-B) + fam:FAM(FAM-1/FAM-2) + one:SGL-9
-// PMWEB-3TAB: refs.cwd 标注 (alpha×2 / beta×2 / 未分配×3) 供 cwd 分桶看板与 scope 选择器 —— cwd 不参与聚合轨道, 簇结构不变。
+// PMWEB-REPO: refs.cwd 仓标注 (alpha×2 / beta×2) + 无仓×3 (FAM-1/FAM-2/SGL-9 = 归档池,
+// 图零入场/票 tab 折叠区) —— cwd 不参与聚合轨道, 簇结构不变; 默认 scope = /repo/alpha。
 const TICKETS = [
   { ticket_id: 'RUN-1', state: 'running', deps: '[]', refs: '{"run":"R77","cwd":"/repo/alpha"}', lease_owner: 'w1' },
   { ticket_id: 'RUN-2', state: 'done', deps: '[]', refs: '{"run":"R77","cwd":"/repo/alpha"}', lease_owner: null },
@@ -409,68 +441,84 @@ async function sandboxPart() {
     for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmDag && window.__pmDag.ready === true') } catch {} }
     ok('C 页面就绪: 图 tab scope-DAG ready (泳道画布已退役)', ready)
 
-    // 图 tab: 出簇
+    // 图 tab: 容器优先默认仓 (裁决 A: 落地即仓内视图, 无全局档)
     await c.cdp.eval(`document.querySelector('[data-view="dag"]').click()`)
     await sleep(700) // elk 布局+取景
     const dag = await c.cdp.eval('window.__pmDag')
-    ok('C 图 tab: 7 票 → 4 簇 (run/deps/prefix/single 各 1)', dag.clusters === 4 && dag.byKind.run === 1 && dag.byKind.deps === 1 && dag.byKind.prefix === 1 && dag.byKind.single === 1, JSON.stringify(dag.byKind))
-    ok('C 图 tab: 折叠场景 4 超节点 0 边 (簇内 deps 边聚合隐藏)', dag.nodes === 4 && dag.edges === 0, `nodes=${dag.nodes} edges=${dag.edges}`)
-    // PMWEB-3TAB: scope 选择器 (全部默认 + cwd 桶) + 流程折叠区 (原流程页降级, 默认收起)
+    ok('C REPO: 默认即仓内视图 (首个仓 /repo/alpha, alpha 2 票全展开, 归档池 3 零入场)', dag.scope === 'cwd:/repo/alpha' && dag.nodes === 2 && dag.edges === 0 && dag.clusters === 1 && dag.archive === 3, JSON.stringify({ scope: dag.scope, nodes: dag.nodes, archive: dag.archive }))
+    const countsBar = await c.cdp.eval(`(document.querySelector('#dg-counts') || {}).textContent || ''`)
+    ok('C REPO: 计数条 仓/归档 零入场注记 + graph 全量口径', /仓 4 票 · 归档 3 零入场/.test(countsBar) && /scope cwd:\/repo\/alpha/.test(countsBar) && /graph 全量 \d+节点\/\d+边/.test(countsBar), countsBar)
+    // PMWEB-REPO: scope 选择器 (仓默认 + fleet 次级; 无全局档) + 流程折叠区 (原流程页降级, 默认收起)
     const scopeUi = await c.cdp.eval(`({
       sel: !!document.querySelector('#dg-scope'),
       opts: [...document.querySelectorAll('#dg-scope option')].map((o) => o.value),
       groups: [...document.querySelectorAll('#dg-scope optgroup')].map((o) => o.label),
+      selVal: (document.querySelector('#dg-scope') || {}).value || '',
       flow: !!document.querySelector('#dg-flow'),
       flowOpen: document.querySelector('#dg-flow') ? document.querySelector('#dg-flow').open : null,
       flowBody: (document.querySelector('#dg-flow-body') || {}).textContent || '',
-      scopeAll: window.__pmDag.scope,
       graphCounts: window.__pmDag.graphCounts,
     })`)
-    ok('C 3TAB: scope 选择器在场 (全部默认 + cwd 桶派生)', scopeUi.sel && scopeUi.scopeAll === 'all' && scopeUi.opts.includes('all') && scopeUi.opts.includes('cwd:/repo/alpha') && scopeUi.groups.includes('cwd 桶'), JSON.stringify(scopeUi))
+    ok('C REPO: scope 选择器 仓默认档 (无全局档, fleet 次级 optgroup)', scopeUi.sel && scopeUi.selVal === 'cwd:/repo/alpha'
+      && JSON.stringify(scopeUi.opts) === JSON.stringify(['cwd:/repo/alpha', 'cwd:/repo/beta', 'fleet:w1'])
+      && JSON.stringify(scopeUi.groups) === JSON.stringify(['仓 (refs.cwd)', 'fleet 席位 (次级)']), JSON.stringify(scopeUi))
     ok('C 3TAB: 流程折叠区默认收起且流程面已回填 (加载中/降级注记均算)', scopeUi.flow && scopeUi.flowOpen === false && scopeUi.flowBody.trim().length > 0, `len=${scopeUi.flowBody.trim().length}`)
     ok('C 3TAB A4: /op/graph 仍被图 tab 消费 (counts 进内省)', !!scopeUi.graphCounts && scopeUi.graphCounts.nodes > 0 && scopeUi.graphCounts.edges > 0, JSON.stringify(scopeUi.graphCounts))
     const listRows = await c.cdp.eval(`({
       clusters: document.querySelectorAll('#dg-list .dg-cluster').length,
       metas: [...document.querySelectorAll('#dg-list .dg-meta')].map((x) => x.textContent.trim()),
       dists: [...document.querySelectorAll('#dg-list .dg-dist')].map((x) => x.textContent.trim()).join(' | '),
+      memberRows: document.querySelectorAll('#dg-list .dg-ticket-row').length,
+      foldGlyph: (document.querySelector('#dg-list .dg-fold-btn') || {}).textContent || '',
     })`)
-    ok('C list: 簇列表 4 行 (票数/活跃数/状态分布摘要)', listRows.clusters === 4 && listRows.metas.length === 4 && /2 票 · 1 活跃/.test(listRows.metas.join(' ')) && /running 1 · done 1/.test(listRows.dists), `${listRows.metas.join(' / ')} :: ${listRows.dists.slice(0, 90)}`)
+    ok('C list: scope 内簇列表 1 行 (run:R77 · 票数/活跃数/状态分布) 默认展开成员 2 行 ▾', listRows.clusters === 1 && /2 票 · 1 活跃/.test(listRows.metas.join(' ')) && /running 1 · done 1/.test(listRows.dists) && listRows.memberRows === 2 && listRows.foldGlyph === '▾', `${listRows.metas.join(' / ')} :: ${listRows.dists.slice(0, 60)} :: rows=${listRows.memberRows}`)
 
-    // 染选联动 ①: 选簇聚焦, 其余淡出
-    await c.cdp.eval(clickEl('#dg-list .dg-cluster-row[data-key="run:R77"]'))
+    // 染选联动 ①: scope 切 beta 仓 → 选簇聚焦 (折叠态簇超节点, 其余淡出)
+    await c.cdp.eval(`(() => {
+      const sel = document.querySelector('#dg-scope')
+      sel.value = 'cwd:/repo/beta'
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+      return true
+    })()`)
+    await sleep(700)
+    const beta0 = await c.cdp.eval(`({ scope: window.__pmDag.scope, nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, selVal: (document.querySelector('#dg-scope') || {}).value || '' })`)
+    ok('C REPO: scope 切 beta 仓 (2 票全展开 1 簇内 deps 边)', beta0.scope === 'cwd:/repo/beta' && beta0.nodes === 2 && beta0.edges === 1 && beta0.selVal === 'cwd:/repo/beta', JSON.stringify(beta0))
+    // 仓内折叠: list 折叠钮 → 簇超节点 (裁决③默认全展开的反向交互)
+    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:CH-A"]'))
+    await sleep(700)
+    const foldedS = await c.cdp.eval(`({
+      nodes: window.__pmDag.nodes, edges: window.__pmDag.edges,
+      folded: window.__pmDag.folded,
+      glyph: (document.querySelector('#dag-svg .dg-node.t-cluster .dg-fold') || {}).textContent || '',
+    })`)
+    ok('C REPO 折叠钮: 展开簇收回聚合超节点 (1 节点 0 边, ▸ 角标)', foldedS.nodes === 1 && foldedS.edges === 0 && foldedS.folded.includes('cdep:CH-A') && foldedS.glyph === '▸', JSON.stringify(foldedS))
+    await c.cdp.eval(clickEl('#dg-list .dg-cluster-row[data-key="cdep:CH-A"]'))
     await sleep(150)
     const focus = await c.cdp.eval(`({
       sel: window.__pmDag.selected,
       dims: document.querySelectorAll('#dag-svg .dg-dim').length,
       selNodes: document.querySelectorAll('#dag-svg .dg-sel').length,
     })`)
-    ok('C 选簇聚焦: selected=run:R77 且其余簇淡出', focus.sel?.kind === 'cluster' && focus.sel.key === 'run:R77' && focus.dims === 3 && focus.selNodes === 1, JSON.stringify(focus))
+    ok('C 选簇聚焦: selected=cdep:CH-A 折叠超节点染选', focus.sel?.kind === 'cluster' && focus.sel.key === 'cdep:CH-A' && focus.dims === 0 && focus.selNodes === 1, JSON.stringify(focus))
     await c.cdp.shot(shot('dag-cluster-focus.png'))
 
-    // 染选联动 ②: list 折叠钮展开 deps 簇 → 点成员票 → deps 边高亮 (折叠簇无成员行, 先展开)
+    // 折叠往返 ②: 展开钮还原成员票 → 点成员票 → deps 边高亮
     await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:CH-A"]'))
     await sleep(700)
-    const preT = await c.cdp.eval('({ nodes: window.__pmDag.nodes, expanded: window.__pmDag.expanded })')
-    ok('C list 折叠钮: 展开 deps 簇 (成员票 2 入场)', preT.nodes === 5 && preT.expanded.includes('cdep:CH-A'), JSON.stringify(preT))
+    const openedS = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, folded: window.__pmDag.folded })')
+    ok('C REPO 展开钮: 折叠簇还原成员票 (2 节点 1 边, 折叠集清空)', openedS.nodes === 2 && openedS.edges === 1 && openedS.folded.length === 0, JSON.stringify(openedS))
     await c.cdp.eval(clickEl('#dg-list .dg-ticket-row[data-tid="CH-A"]'))
     await sleep(700)
     const tsel = await c.cdp.eval(`({
       sel: window.__pmDag.selected,
       nodes: window.__pmDag.nodes, edges: window.__pmDag.edges,
-      expanded: window.__pmDag.expanded,
       dims: document.querySelectorAll('#dag-svg .dg-dim').length,
       lit: document.querySelectorAll('#dag-svg .dg-lit').length,
       selRows: document.querySelectorAll('#dg-list .dg-selected').length,
     })`)
-    ok('C 选票: 所在簇自动展开 (成员票 2 + 簇内 deps 边 1)', tsel.sel?.kind === 'ticket' && tsel.sel.id === 'CH-A' && tsel.expanded.includes('cdep:CH-A') && tsel.nodes === 5 && tsel.edges === 1, JSON.stringify(tsel.sel ?? {}))
-    ok('C 选票染选: deps 边 lit 且其余淡出 (3 节点淡出)', tsel.lit === 1 && tsel.dims === 3 && tsel.selRows >= 1, `lit=${tsel.lit} dims=${tsel.dims}`)
+    ok('C 选票: 染选 deps 边+邻接 (2 节点全邻接入 lit, 1 边亮)', tsel.sel?.kind === 'ticket' && tsel.sel.id === 'CH-A' && tsel.nodes === 2 && tsel.edges === 1, JSON.stringify(tsel.sel ?? {}))
+    ok('C 选票染选: deps 边 lit (邻接全亮 → 零淡出)', tsel.lit === 1 && tsel.dims === 0 && tsel.selRows >= 1, `lit=${tsel.lit} dims=${tsel.dims}`)
     await c.cdp.shot(shot('dag-ticket-highlight.png'))
-
-    // 折叠往返: list 折叠钮收起 → 回聚合态 (展开态簇节点不在场景, 折叠走 list)
-    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:CH-A"]'))
-    await sleep(700)
-    const folded = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, expanded: window.__pmDag.expanded })')
-    ok('C 折叠钮: 展开簇收回聚合态 (4 节点 0 边)', folded.nodes === 4 && folded.edges === 0 && folded.expanded.length === 0, JSON.stringify(folded))
 
     // 空白点击取消
     const cleared = await c.cdp.eval(`(() => {
@@ -565,23 +613,42 @@ async function sandboxPart() {
     await c.cdp.shot(shot('3tab-fleet-focus.png'))
 
     // PMWEB-ARCHIVE: 终态票归档 → 归档区 → 还原 (localStorage 往返, 看板计数还原)
+    // PMWEB-REPO: 归档池 (无仓 3 票) 并存 —— 计数选择器排除 pool-open 区, 互不污染
     await c.cdp.eval(`document.querySelector('[data-view="tickets"]').click()`)
     await sleep(300)
     const archA = await c.cdp.eval(`({
-      cards: document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card').length,
-      btns: document.querySelectorAll('#view-tickets .arch-btn[data-arch]').length,
-      terminal: [...document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card')]
+      cards: document.querySelectorAll('#view-tickets .kanban:not(.archive-open):not(.pool-open) .ticket-card').length,
+      btns: document.querySelectorAll('#view-tickets .kanban:not(.archive-open):not(.pool-open) .arch-btn[data-arch]').length,
+      terminal: [...document.querySelectorAll('#view-tickets .kanban:not(.archive-open):not(.pool-open) .ticket-card')]
         .filter((el) => /st-(done|merged|rejected)/.test(el.querySelector('.state-badge').className)).length,
+      pool: !!document.querySelector('#tk-pool'),
+      poolOpen: document.querySelector('#tk-pool') ? document.querySelector('#tk-pool').open : null,
+      poolCards: document.querySelectorAll('#tk-pool .ticket-card').length,
     })`)
-    ok('PMWEB-ARCHIVE: 仅终态票卡带归档钮 (钮数=终态卡数, 非终态不可归档)', archA.cards === 7 && archA.btns === archA.terminal, JSON.stringify(archA))
+    ok('PMWEB-ARCHIVE: 仅终态票卡带归档钮 (钮数=终态卡数, 非终态不可归档)', archA.cards === 4 && archA.btns === archA.terminal && archA.btns === 2, JSON.stringify(archA))
+    ok('C REPO: 无仓归档折叠区在场且默认收起 (3 卡)', archA.pool && archA.poolOpen === false && archA.poolCards === 3, JSON.stringify({ pool: archA.pool, poolOpen: archA.poolOpen, poolCards: archA.poolCards }))
+    // 归档池纯展示: 无 data-tid (零图联动) + 无归档钮; 展开可见
+    const poolPure = await c.cdp.eval(`(() => {
+      const d = document.querySelector('#tk-pool')
+      d.open = true
+      const cards = [...d.querySelectorAll('.ticket-card')]
+      return {
+        n: cards.length,
+        linked: d.querySelectorAll('.ticket-card[data-tid]').length,
+        btns: d.querySelectorAll('.arch-btn').length,
+        cls: cards[0] ? cards[0].className : '',
+      }
+    })()`)
+    ok('C REPO: 归档池展开可见且纯展示 (零 data-tid 零归档钮, pool 弱化态)', poolPure.n === 3 && poolPure.linked === 0 && poolPure.btns === 0 && /\bpool\b/.test(poolPure.cls), JSON.stringify(poolPure))
+    await c.cdp.shot(shot('repo-pool-expanded.png'))
     await c.cdp.eval(clickEl('#view-tickets .arch-btn[data-arch]'))
     await sleep(200)
     const archB = await c.cdp.eval(`({
       toggle: (document.querySelector('#arch-toggle') || {}).textContent || '',
-      board: document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card').length,
+      board: document.querySelectorAll('#view-tickets .kanban:not(.archive-open):not(.pool-open) .ticket-card').length,
       ls: localStorage.getItem('pmweb:archive:v1'),
     })`)
-    ok('PMWEB-ARCHIVE: 归档 → 看板 -1 + 计数 1 + localStorage 落盘', /1/.test(archB.toggle) && archB.board === 6 && !!archB.ls, JSON.stringify(archB))
+    ok('PMWEB-ARCHIVE: 归档 → 看板 -1 + 计数 1 + localStorage 落盘', /1/.test(archB.toggle) && archB.board === 3 && !!archB.ls, JSON.stringify(archB))
     await c.cdp.eval(clickEl('#arch-toggle'))
     await sleep(200)
     const archC = await c.cdp.eval(`({ open: !!document.querySelector('#view-tickets .kanban.archive-open'), un: !!document.querySelector('[data-unarch]') })`)
@@ -595,9 +662,9 @@ async function sandboxPart() {
     await c.cdp.eval(`document.querySelector('[data-view="tickets"]').click()`)
     await sleep(300)
     const kanban = await c.cdp.eval(`document.querySelectorAll('#view-tickets .ticket-card').length`)
-    ok('C 回归: 票视图 kanban 照常渲染 (7 卡)', kanban === 7, `cards=${kanban}`)
+    ok('C 回归: 票视图 kanban 照常渲染 (4 仓卡 + 3 归档池卡 = 7)', kanban === 7, `cards=${kanban}`)
 
-    // PMWEB-3TAB: 票 tab refs.cwd 分桶看板 (组头短路径+票数; 未分配桶恒尾; 组内列结构不变)
+    // PMWEB-REPO: 票 tab 容器优先看板 (仓分组主体; 归档池收折叠区; 无未分配并列桶)
     const cwdG = await c.cdp.eval(`({
       groups: [...document.querySelectorAll('#view-tickets .cwd-group')].map((g) => ({
         cwd: g.dataset.cwd,
@@ -605,25 +672,26 @@ async function sandboxPart() {
         n: g.querySelectorAll('.ticket-card').length,
         cols: g.querySelectorAll('.kanban .col').length,
       })),
-      tail: (document.querySelector('#view-tickets .cwd-group:last-of-type .cwd-name') || {}).textContent || '',
+      unassignedGroup: [...document.querySelectorAll('#view-tickets .cwd-group')].some((g) => g.dataset.cwd === ''),
     })`)
-    ok('C 3TAB: 票看板 cwd 分组 (alpha/beta + 未分配尾组; 列结构不变)', cwdG.groups.length === 3
+    ok('C REPO: 票看板仓分组主体 (alpha/beta 升序; 列结构不变; 零未分配并列桶)', cwdG.groups.length === 2
       && cwdG.groups[0].cwd === '/repo/alpha' && cwdG.groups[0].name === 'alpha' && cwdG.groups[0].n === 2
       && cwdG.groups[1].cwd === '/repo/beta' && cwdG.groups[1].n === 2
-      && cwdG.tail === '未分配' && cwdG.groups[2].n === 3 && cwdG.groups.every((g) => g.cols === 6), JSON.stringify(cwdG))
-    // PMWEB-3TAB: 选票联动 → 切图 tab + 所在簇自动展开 + 染选 deps 邻域
+      && cwdG.unassignedGroup === false && cwdG.groups.every((g) => g.cols === 6), JSON.stringify(cwdG))
+    // PMWEB-REPO: 选票联动 → 跳所在仓 (容器优先: 目标不在当前仓 → 切仓) + 染选 (卡片选中态)
     await c.cdp.eval(clickEl('#view-tickets .ticket-card[data-tid="CH-A"]'))
     await sleep(900)
     const link = await c.cdp.eval(`({
       hash: location.hash,
       visible: !document.querySelector('#view-dag').hidden,
+      scope: window.__pmDag.scope,
       sel: window.__pmDag.selected,
-      expanded: window.__pmDag.expanded,
+      folded: window.__pmDag.folded,
       lit: document.querySelectorAll('#dag-svg .dg-lit').length,
       cardSel: !!document.querySelector('.ticket-card.tk-selected[data-tid="CH-A"]'),
     })`)
-    ok('C 3TAB: 选票联动 → 切图 tab + 所在簇展开 + 染选 (卡片选中态)', link.hash === '#view-dag' && link.visible
-      && link.sel?.kind === 'ticket' && link.sel.id === 'CH-A' && link.expanded.includes('cdep:CH-A') && link.lit >= 1 && link.cardSel, JSON.stringify(link))
+    ok('C REPO: 选票联动 → 切图 tab + 所在仓 scope + 染选 (卡片选中态)', link.hash === '#view-dag' && link.visible
+      && link.scope === 'cwd:/repo/beta' && link.sel?.kind === 'ticket' && link.sel.id === 'CH-A' && link.folded.length === 0 && link.lit >= 1 && link.cardSel, JSON.stringify(link))
     // PMWEB-3TAB: 画布退役 (入口/视图/泳道场景/内省全不存在)
     const retired = await c.cdp.eval(`({
       btn: !!document.querySelector('[data-view="canvas"]'),
@@ -639,10 +707,12 @@ async function sandboxPart() {
   }
 }
 
-// ---------- D. PMWEB-GRAPH 几何门 (扩模 sandbox: G1 穿盒零求交 / G2 3TAB scope / G3 簇间边) ----------
-// G2 fixture: 4 flows (PMWEB-3TAB: 泳道场景退役, flows 仅喂 /op/graph counts 消费) + 15 票
-// (7 基线 + GR1 跨簇 + OF 撞名组 + TW-1/OX-1 跨 cwd deps 对) + 4 席 (h1/w1/aa11/bb22) + 2 session;
-// TW-1(cwd /w/one, lease aa11) deps→OX-1(cwd /w/two) —— scope cwd:/w/one 出界聚簇断言数据面。
+// ---------- D. PMWEB-GRAPH 几何门 (扩模 sandbox: G1 穿盒零求交 / G2 REPO 仓优先 / G3 折叠重取景) ----------
+// G2 fixture: 4 flows (PMWEB-3TAB: 泳道场景退役, flows 仅喂 /op/graph counts 消费) + 25 票
+// (7 基线 + GR1 跨簇 + OF 撞名组 + TW-1/OX-1 跨仓 deps 对 + AX-1/AR-9 无仓出界对 + DEN×8 dense 仓)
+// + 4 席 (h1/w1/aa11/bb22) + 2 session;
+// 仓标注: /repo/alpha×2 /repo/beta×2 /w/one×2 (TW-1,AX-1) /w/two×1 (OX-1) /w/dense×8, 无仓×10 (归档池);
+// 默认 scope = /repo/alpha (首个仓升序)。TW-1 deps→OX-1 (跨仓可跳转), AX-1 deps→AR-9 (全员无仓 → 纯提示盒)。
 const TICKETS_G2 = [
   ...TICKETS,
   { ticket_id: 'GX-1', state: 'running', deps: '["CH-A"]', refs: '{"run":"GR1"}', lease_owner: null },
@@ -653,6 +723,9 @@ const TICKETS_G2 = [
   { ticket_id: 'OF-4', state: 'done', deps: '[]', refs: '{}', lease_owner: null },
   { ticket_id: 'TW-1', state: 'running', deps: '["OX-1"]', refs: '{"cwd":"/w/one"}', lease_owner: 'aa11' },
   { ticket_id: 'OX-1', state: 'done', deps: '[]', refs: '{"cwd":"/w/two"}', lease_owner: null },
+  { ticket_id: 'AX-1', state: 'running', deps: '["AR-9"]', refs: '{"cwd":"/w/one"}', lease_owner: null },
+  { ticket_id: 'AR-9', state: 'done', deps: '[]', refs: '{}', lease_owner: null }, // 归档池: 出界纯提示盒成员
+  ...Array.from({ length: 8 }, (_, i) => ({ ticket_id: `DEN-${i + 1}`, state: 'done', deps: '[]', refs: '{"cwd":"/w/dense"}', lease_owner: null })),
 ]
 const SEATS_G2 = {
   ...SEATS,
@@ -736,21 +809,32 @@ async function graphPart() {
     for (let i = 0; i < 100 && !ready; i++) { await sleep(300); try { ready = await c.cdp.eval('window.__pmDag && window.__pmDag.ready === true') } catch {} }
     ok('G2 页面就绪 (扩模 sandbox 图 tab scope-DAG)', ready)
 
-    // 图 tab: 聚合 DAG (泳道画布已退役 —— G2 泳道/箭头/双向对断言随场景同步移除)
+    // 图 tab: 容器优先默认仓 (泳道画布已退役 —— G2 泳道/箭头/双向对断言随场景同步移除)
     await c.cdp.eval(`document.querySelector('[data-view="dag"]').click()`)
     await sleep(1500)
-    const dag = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, clusters: window.__pmDag.clusters })')
-    ok('G3 浏览器: 折叠态 8 簇 (7+cdep:OX-1) + 跨簇 deps → 簇级边 ≥1', dag.clusters === 8 && dag.edges >= 1, JSON.stringify(dag))
-    const sub = await c.cdp.eval(`({
-      out: (document.querySelector('.dg-node[data-id="cl:cdep:CH-A"] .dg-sub') || {}).textContent || '',
-      inn: (document.querySelector('.dg-node[data-id="cl:run:GR1"] .dg-sub') || {}).textContent || '',
+    const dag = await c.cdp.eval(`({
+      scope: window.__pmDag.scope, nodes: window.__pmDag.nodes, edges: window.__pmDag.edges,
+      archive: window.__pmDag.archive, clusters: window.__pmDag.clusters,
+      counts: (document.querySelector('#dg-counts') || {}).textContent || '',
     })`)
-    ok('G3 渲染: 簇副标签 ↗出/↘入 计数位 (无依赖不显示)', /↗1/.test(sub.out) && !/↘/.test(sub.out) && /↘1/.test(sub.inn) && !/↗/.test(sub.inn), JSON.stringify(sub))
-    const disamb = await c.cdp.eval(`(() => {
-      const t = document.querySelector('#dg-list').textContent
-      return { deps: t.includes('OF·deps'), prefix: t.includes('OF·prefix') }
+    ok('G2 REPO: 默认首个仓 /repo/alpha (升序) + 归档池 10 零入场 + 全量口径注记', dag.scope === 'cwd:/repo/alpha' && dag.nodes === 2 && dag.clusters === 1 && dag.archive === 10
+      && /仓 15 票 · 归档 10 零入场/.test(dag.counts) && /graph 全量/.test(dag.counts), JSON.stringify({ scope: dag.scope, nodes: dag.nodes, archive: dag.archive, counts: dag.counts.slice(0, 80) }))
+    await c.cdp.shot(shot('g2-dag-default-repo.png'))
+
+    // dense 仓: 标签零溢出 (8 成员全展开) + 折叠重取景
+    await c.cdp.eval(`(() => {
+      const sel = document.querySelector('#dg-scope')
+      sel.value = 'cwd:/w/dense'
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+      return true
     })()`)
-    ok('F8 渲染: 簇列表撞名消歧后缀在场 (与画布同规则)', disamb.deps && disamb.prefix, JSON.stringify(disamb))
+    await sleep(1200)
+    const dense = await c.cdp.eval(`({
+      scope: window.__pmDag.scope, nodes: window.__pmDag.nodes,
+      listLabel: (document.querySelector('#dg-list .dg-label') || {}).textContent || '',
+      listKind: (document.querySelector('#dg-list .dg-kind') || {}).textContent || '',
+    })`)
+    ok('G3 dense 仓: 8 成员 fam 簇全展开 + 列表行在场', dense.scope === 'cwd:/w/dense' && dense.nodes === 8 && dense.listLabel === 'DEN' && dense.listKind === 'prefix', JSON.stringify(dense))
     const fit = await c.cdp.eval(`(() => {
       let over = 0
       for (const g of document.querySelectorAll('#dag-svg .dg-node')) {
@@ -761,20 +845,13 @@ async function graphPart() {
       return { over, nodes: document.querySelectorAll('#dag-svg .dg-node').length }
     })()`)
     ok('F7 标签: CJK/长标签实测估宽 → 零溢出盒框', fit.over === 0 && fit.nodes >= 7, JSON.stringify(fit))
-    const geoDag = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
-    ok('G1 DAG: 边采样点 vs 非端点节点盒零求交 (容差 2px)', geoDag.edges > 0 && geoDag.violations === 0, JSON.stringify(geoDag))
-    await c.cdp.shot(shot('g2-dag-clusters.png'))
-
-    // 展开簇 → 重取景 (F4) + 展开态几何复验
-    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="cdep:OF-1"]'))
+    await c.cdp.eval(clickEl('#dg-list .dg-fold-btn[data-fold="fam:DEN"]'))
     await sleep(1200)
-    const expanded = await c.cdp.eval('({ nodes: window.__pmDag.nodes, edges: window.__pmDag.edges, view: window.__pmDag.view })')
-    ok('F4 重取景: 展开簇后 fit 生效 (取景缩放=拟合值)', expanded.nodes === 9 && expanded.edges >= 2 && expanded.view.s > 0, JSON.stringify(expanded))
-    const geoDagOpen = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
-    ok('G1 DAG 展开态: 簇内边+跨簇边零穿盒', geoDagOpen.edges >= 2 && geoDagOpen.violations === 0, JSON.stringify(geoDagOpen))
-    await c.cdp.shot(shot('g2-dag-expanded.png'))
+    const foldedFit = await c.cdp.eval('({ nodes: window.__pmDag.nodes, folded: window.__pmDag.folded, view: window.__pmDag.view })')
+    ok('G3 折叠重取景: fam 折叠为超节点 (8→1) + fit 生效', foldedFit.nodes === 1 && foldedFit.folded.includes('fam:DEN') && foldedFit.view.s > 0, JSON.stringify(foldedFit))
+    await c.cdp.shot(shot('g2-dense-folded.png'))
 
-    // PMWEB-3TAB: scope-DAG 三档交互 (出界独立聚合 + 点击重聚焦; 用户裁决 ③)
+    // /w/one 仓内场景: 2 仓票 + 出界盒两态 (跨仓可跳转 OX-1 / 无仓纯提示 AR-9)
     await c.cdp.eval(`(() => {
       const sel = document.querySelector('#dg-scope')
       sel.value = 'cwd:/w/one'
@@ -787,25 +864,51 @@ async function graphPart() {
       nodes: window.__pmDag.nodes,
       edges: window.__pmDag.edges,
       out: window.__pmDag.outClusters,
+      jumps: window.__pmDag.outJumps,
       ids: [...document.querySelectorAll('#dag-svg .dg-node')].map((g) => g.dataset.id),
-      outEl: !!document.querySelector('#dag-svg .dg-node.t-out'),
-      outSub: (document.querySelector('#dag-svg .dg-node.t-out .dg-sub') || {}).textContent || '',
+      jumpGlyph: !!document.querySelector('#dag-svg .dg-node[data-id="out:one:OX-1"] .dg-fold'),
+      hintClass: ((document.querySelector('#dag-svg .dg-node[data-id="out:one:AR-9"]') || {}).getAttribute('class')) || '',
+      hintGlyph: !!document.querySelector('#dag-svg .dg-node[data-id="out:one:AR-9"] .dg-fold'),
+      hintSub: (document.querySelector('#dag-svg .dg-node[data-id="out:one:AR-9"] .dg-sub') || {}).textContent || '',
       outEdge: !!document.querySelector('#dag-svg .dg-edge[data-edge="dep:tk:TW-1>out:one:OX-1"]'),
+      outEdge2: !!document.querySelector('#dag-svg .dg-edge[data-edge="dep:tk:AX-1>out:one:AR-9"]'),
     })`)
-    ok('G2 3TAB: scope 切 cwd:/w/one → 票面全展开 + 出界聚簇 1 (独立聚合非 ghost)', scoped.scope === 'cwd:/w/one' && scoped.nodes === 2 && scoped.out === 1
-      && scoped.ids.includes('tk:TW-1') && scoped.ids.includes('out:one:OX-1') && scoped.outEl && /出界/.test(scoped.outSub) && scoped.outEdge, JSON.stringify(scoped))
+    ok('G2 REPO: scope /w/one → 2 仓票 + 出界盒 2 (独立聚合非 ghost), 跨仓边 2', scoped.scope === 'cwd:/w/one' && scoped.nodes === 4 && scoped.out === 2 && scoped.edges === 2
+      && scoped.ids.includes('tk:TW-1') && scoped.ids.includes('tk:AX-1') && scoped.ids.includes('out:one:OX-1') && scoped.ids.includes('out:one:AR-9')
+      && scoped.outEdge && scoped.outEdge2, JSON.stringify({ ...scoped, ids: undefined }))
+    ok('G2 REPO 出界盒两态: OX-1 可跳转 (jumpCwd=/w/two, ⤴ 角标) / AR-9 纯提示 (无仓, 无角标, 提示语)', JSON.stringify(scoped.jumps) === JSON.stringify([{ key: 'one:AR-9', jumpCwd: '' }, { key: 'one:OX-1', jumpCwd: '/w/two' }])
+      && scoped.jumpGlyph && scoped.hintClass.includes('t-out-hint') && !scoped.hintGlyph && /无仓/.test(scoped.hintSub), JSON.stringify({ jumps: scoped.jumps, jumpGlyph: scoped.jumpGlyph, hintClass: scoped.hintClass, hintGlyph: scoped.hintGlyph, hintSub: scoped.hintSub }))
     await c.cdp.shot(shot('3tab-scope-cwd-outcluster.png'))
-    // 出界簇盒点击 → 重聚焦 cluster:<key> (成员还原)
+    // 纯提示盒点击 → 不跳转 (scope 不变)
+    await c.cdp.eval(clickNode('.dg-node[data-id="out:one:AR-9"]'))
+    await sleep(700)
+    const hintClick = await c.cdp.eval('({ scope: window.__pmDag.scope, nodes: window.__pmDag.nodes })')
+    ok('G2 REPO: 纯提示盒点击零跳转 (scope 保持 /w/one)', hintClick.scope === 'cwd:/w/one' && hintClick.nodes === 4, JSON.stringify(hintClick))
+    // 跨仓跳转: 出界盒点击 → 切成员多数仓 (/w/two) + 染选聚焦该簇
     await c.cdp.eval(clickNode('.dg-node[data-id="out:one:OX-1"]'))
     await sleep(1200)
     const refoc = await c.cdp.eval(`({
       scope: window.__pmDag.scope,
+      selVal: (document.querySelector('#dg-scope') || {}).value || '',
       nodes: window.__pmDag.nodes,
       out: window.__pmDag.outClusters,
+      sel: window.__pmDag.selected,
       ids: [...document.querySelectorAll('#dag-svg .dg-node')].map((g) => g.dataset.id),
+      selCls: ((document.querySelector('#dag-svg .dg-node[data-id="tk:OX-1"]') || {}).getAttribute('class')) || '',
     })`)
-    ok('G2 3TAB: 出界簇盒点击重聚焦 → cluster:one:OX-1 (成员票还原)', refoc.scope === 'cluster:one:OX-1' && refoc.nodes === 1 && refoc.out === 0 && refoc.ids.join() === 'tk:OX-1', JSON.stringify(refoc))
+    ok('G2 REPO: 出界盒点击跨仓跳转 → scope cwd:/w/two + 1 节点 + 染选聚焦簇 one:OX-1', refoc.scope === 'cwd:/w/two' && refoc.selVal === 'cwd:/w/two' && refoc.nodes === 1 && refoc.out === 0
+      && refoc.sel?.kind === 'cluster' && refoc.sel.key === 'one:OX-1' && refoc.ids.join() === 'tk:OX-1' && /\bdg-sel\b/.test(refoc.selCls), JSON.stringify(refoc))
     await c.cdp.shot(shot('3tab-scope-refocus-cluster.png'))
+    // G1 几何: /w/one 回切 (2 出界边场景) 采样零穿盒
+    await c.cdp.eval(`(() => {
+      const sel = document.querySelector('#dg-scope')
+      sel.value = 'cwd:/w/one'
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+      return true
+    })()`)
+    await sleep(1200)
+    const geoDag = await c.cdp.eval(geoSweep('#dag-svg', '.dg-node', '.dg-edge'))
+    ok('G1 DAG: 边采样点 vs 非端点节点盒零求交 (容差 2px)', geoDag.edges >= 2 && geoDag.violations === 0, JSON.stringify(geoDag))
     ok('D 页面零异常 (全段)', errors.length === 0, errors.slice(0, 2).join(' | '))
   } finally {
     await killChrome(c)
