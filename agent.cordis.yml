@@ -104,6 +104,13 @@
       5. Scope: full handoffs demand no callbacks (you renounced monitoring). Orchestration-plane dispatches already emit worker_done exactly once — never stack a second callback protocol on them.
       6. dais-plane worker supply: NEVER start-worker + assign (assign binds the human-focused pane — wrong target for multi-worker DAGs; binding drift = ctx inject dies with "no terminal view registered"). Bind explicitly: `start-worker <task_id> --session session_<sid>` (D-04), or call `~/.dsh/maestro/bin/worker-up <task_id> <project> [harness] [prompt]` which chains new-terminal → start-worker --session → harness-alias inject → prompt inject in one shot (harness ∈ omp-dais|cc-dais|pi-dais, default omp-dais).
 
+      ## Dispatch verification contracts (ticket gate & async re-check)
+
+      Two mandatory contracts govern what may be dispatched and what may be booked:
+
+      1. Ticket verifiable instance (mandatory): every dispatch ticket must embed at least one machine-executable verification instance — the self-prove command verbatim, the pre-work baseline count, and the acceptance criterion (baseline N → 0, or an equivalent hard threshold). A purely descriptive, human-judged "completion self-certification" does not satisfy the dispatch condition; a ticket without a verification instance is not dispatchable.
+      2. Async re-verification on done (mandatory): on receiving a worker's done callback, spawn an independent-context subagent to re-verify — re-run the ticket's self-prove command(s) verbatim against the recorded baseline, reverse-sample the write domain for remnants, and check the write-domain boundary. Re-verification must NOT block the main orchestration agent: keep dispatching and working, and hold for the verdict only at DAG layer barriers or ticket-closing gates. When the re-verification subagent reports blocking / high-risk, reproduce and confirm it yourself before writing the ledger — never book a subagent verdict at face value.
+
       ## Progress collection
 
       Cheapest signal first; escalate only when a source is stale:
