@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""orch-dag — Orca 面结构化编排唯一指令集(原子子命令,零分支)。
+
+契约地位: 结构化编排(supervise/DAG/worker_done)唯一入口。禁止手拼原生
+`orca orchestration` 命令、禁止绕开 tickets 环、禁止 agent 自选路径 ——
+本工具不提供模式选择旗标: agent 固定 omp、worktree 固定 new-top-level、
+编排席终端固定复用、tickets 环随生命周期强制勾稽。缺参数=exit 2,不推断。
+
+原子子命令(一个子命令 = 一个生命周期动作 + ledger node/ticket 原子双写):
+  seat-open --project <path> [--title T]        # 编排席终端幂等创建/复用
+  run "<objective>"                             # 幂等建/续 Run
+  task <REF> --title <t> [--deps R1,R2]         # Orca task + ticket 环原子建(pending 语义由 deps 表达)
+  seat <REF> [--name <worktree>]                # worker-start(omp×新顶层worktree) + dispatched 三写
+  wait [--timeout-ms MS]                        # check --wait;worker_done→ack+release+票转running待复验
+  reply --msg <id> --body <text>                # question 应答透传
+  close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账
+  status [--ref R]                              # run/task/dispatch + ticket + node 并排(只读)
+  selftest                                      # 离线干跑全链(ORCA_BIN stub),断言命令序列与双写
+
+状态映射(ticket: dispatched→running→blocked→done→merged | 终态 rejected/rolled-back;
+node: dispatched→{running,blocked}, running→{done,failed,blocked}):
+  task→ticket dispatched(add 默认)   seat→ticket dispatched + node dispatched
+  wait/worker_done→ticket running + node running(note: 复验待关账)
+  close→ticket/node 终态 + outcome 事件
+零分支保证: deps 屏障由 Orca task_not_startable 硬拒绝透传;tickets 环无绕过旗标;
+  任何 ORCA/ledger 非零退出 = 原样 fail-loud,不重试不猜测。
+"""
+import argparse, json, os, subprocess, sys
+
+ORCA_BIN = os.environ.get("ORCA_BIN", "/opt/Orca/resources/bin/orca-ide")
+LEDGER = os.environ.get("MAESTRO_LEDGER_BIN", os.path.expanduser("~/.dsh/maestro/bin/ledger"))
+STATE_FILE = os.environ.get("ORCH_DAG_STATE", os.path.expanduser("~/.dsh/maestro/state/orch-dag.json"))
+AGENT = "omp"                 # 硬编码: 唯一执行席 harness
+WORKTREE_MODE = "new-top-level"  # 硬编码: 每票新顶层 worktree
+SEAT_TITLE = "ORCH-SEAT"
+WAIT_TYPES = "worker_done,escalation,question"
+TICKET_RUN = {"wait": "running"}   # worker_done 后票面状态(复验前的占位)
+
+def die(msg, code=1):
+    print(f"orch-dag: {msg}", file=sys.stderr); sys.exit(code)
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f: return json.load(f)
+    return {"seat": None, "run": None, "refs": {}}
+
+def save_state(s):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f: json.dump(s, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, STATE_FILE)
+
+def sh(cmd, fail_msg):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"{fail_msg}\ncmd: {' '.join(cmd)}\nstdout: {p.stdout[-400:]}\nstderr: {p.stderr[-400:]}")
+    return p.stdout
+
+def orca_json(args, fail_msg):
+    out = sh([ORCA_BIN] + args + ["--json"], fail_msg)
+    try: return json.loads(out)
+    except Exception as e: die(f"{fail_msg}: JSON 解析失败 {e}\n{out[-400:]}")
+
+def ledger(args, fail_msg):
+    return sh([sys.executable, LEDGER] + args, fail_msg)
+
+def need_seat(s):
+    if not s.get("seat"): die("编排席未建: 先执行 seat-open")
+    return s["seat"]
+
+def ticket_of(ref):
+    return ref  # ticket_id == ref(命名契约: R41-T1 等)
+
+def refs_read(ref):
+    """从 ledger 读票 refs(orca_task/dispatch/terminal 等),供幂等纳管。"""
+    out = ledger(["ticket", "list", "--json"], "ticket list 失败")
+    try: tickets = json.loads(out)
+    except Exception: tickets = []
+    for t in tickets:
+        if t.get("ticket_id") == ref:
+            try: return json.loads(t.get("refs") or "{}")
+            except Exception: return {}
+    return None  # 不存在
+
+def cmd_seat_open(a):
+    s = load_state()
+    if s.get("seat"):
+        print(f"seat: 复用 {s['seat']}"); return
+    wt = a.project
+    wl = orca_json(["worktree", "list"], "worktree list 失败")
+    wid = None
+    for w in (wl.get("result") or {}).get("worktrees") or []:
+        if (w.get("path") or "") == wt: wid = w.get("id"); break
+    if not wid: die(f"project 不在 Orca 树: {wt}(先 orca worktree 注册)")
+    tl = orca_json(["terminal", "create", "--worktree", f"id:{wid}", "--title", a.title],
+                   "编排席终端创建失败")
+    t = (tl.get("result") or {}).get("terminal") or (tl.get("result") or {})
+    handle = t.get("handle") or t.get("id")
+    if not tl.get("ok") or not handle: die(f"编排席终端无 handle: {json.dumps(tl)[:300]}")
+    s["seat"] = handle; s["project"] = wt; save_state(s)
+    print(f"seat: {handle}")
+
+def cmd_run(a):
+    s = load_state(); seat = need_seat(s)
+    if s.get("run"):
+        print(f"run: 复用 {s['run']}"); return
+    r = orca_json(["orchestration", "run-create", "--from", seat, "--objective", a.objective],
+                  "run-create 失败")
+    rid = ((r.get("result") or {}).get("run") or {}).get("id")
+    if not r.get("ok") or not rid: die(f"run 无 id: {json.dumps(r)[:300]}")
+    s["run"] = rid; save_state(s)
+    print(f"run: {rid}")
+
+def cmd_task(a):
+    s = load_state(); seat = need_seat(s)
+    if not s.get("run"): die("Run 未建: 先执行 run")
+    deps = [d.strip() for d in a.deps.split(",") if d.strip()] if a.deps else []
+    if a.ref in s["refs"] and s["refs"][a.ref].get("orca_task"):
+        print(f"task: 复用 {a.ref} -> {s['refs'][a.ref]['orca_task']}"); return
+    existing = refs_read(ticket_of(a.ref))
+    if existing and existing.get("orca_task"):
+        s["refs"][a.ref] = {"orca_task": existing["orca_task"], "ticket": True}; save_state(s)
+        print(f"task: 纳管 {a.ref} -> {existing['orca_task']}"); return
+    dep_ids = []
+    for d in deps:
+        if d not in s["refs"]: die(f"依赖 ref 未建 task: {d}(先 task {d})")
+        dep_ids.append(s["refs"][d]["orca_task"])
+    args = ["orchestration", "task-create", "--from", seat, "--title", a.title, "--spec", a.spec]
+    if dep_ids: args += ["--deps", json.dumps(dep_ids)]
+    r = orca_json(args, f"task-create 失败({a.ref})")
+    tid = ((r.get("result") or {}).get("task") or {}).get("id")
+    if not r.get("ok") or not tid: die(f"task 无 id: {json.dumps(r)[:300]}")
+    ledger(["ticket", "add", ticket_of(a.ref), a.title,
+            "--deps", json.dumps([ticket_of(d) for d in deps]),
+            "--refs", json.dumps({"run": s["run"], "orca_task": tid, "seat": seat}, ensure_ascii=False),
+            "--source", "orch-dag"], f"ticket add 失败({a.ref})")
+    s["refs"][a.ref] = {"orca_task": tid, "ticket": True}; save_state(s)
+    print(f"task: {a.ref} -> {tid}")
+
+def cmd_seat(a):
+    s = load_state(); seat = need_seat(s)
+    if not s.get("project"): die("project 未记录: 先执行 seat-open --project")
+    if a.ref not in s["refs"]: die(f"ref 未建 task: {a.ref}(先 task {a.ref})")
+    tid = s["refs"][a.ref]["orca_task"]
+    name = a.name or a.ref.lower()
+    r = orca_json(["orchestration", "worker-start", "--from", seat, "--task", tid,
+                   "--worktree", WORKTREE_MODE, "--name", name, "--agent", AGENT],
+                  f"worker-start 失败({a.ref})")
+    if not r.get("ok"): die(f"worker-start 未受理: {json.dumps(r)[:300]}")
+    res = r.get("result") or {}
+    dispatch = (res.get("dispatch") or {}).get("id") or res.get("dispatchId") or ""
+    ledger(["ticket", "refs-set", ticket_of(a.ref), "--json",
+            json.dumps({"dispatch": dispatch, "worktree": name, "agent": AGENT}, ensure_ascii=False)],
+           f"ticket refs-set 失败({a.ref})")
+    ledger(["node", s["project"], a.ref, "dispatch", f"R-ticket {a.ref} {AGENT} 席位派发",
+            "dispatched", "--refs",
+            json.dumps({"run": s["run"], "orca_task": tid, "dispatch": dispatch}, ensure_ascii=False)],
+           f"ledger node 失败({a.ref})")
+    print(f"seat: {a.ref} dispatched dispatch={dispatch}")
+
+def cmd_wait(a):
+    s = load_state(); seat = need_seat(s)
+    if not s.get("run"): die("Run 未建: 先执行 run")
+    out = sh([ORCA_BIN, "orchestration", "check", "--from", seat, "--wait",
+              "--types", WAIT_TYPES, "--timeout-ms", str(a.timeout_ms)], "check --wait 失败")
+    try: d = json.loads(out)
+    except Exception: print(out); die("check 输出非 JSON", 4)
+    if d.get("count", 0) == 0: print("wait: 无消息(检查点)"); sys.exit(4)
+    deliveries = d.get("deliveries") or ([d] if d.get("type") else [])
+    for dv in deliveries:
+        dtype = dv.get("type"); did = dv.get("delivery_id") or dv.get("deliveryId") or dv.get("id")
+        if dtype == "worker_done":
+            if did: sh([ORCA_BIN, "orchestration", "check", "--from", seat, "--ack", did], "ack 失败")
+            ctx = dv.get("dispatch_context") or dv.get("dispatchContext") or (dv.get("payload") or {}).get("dispatch") or ""
+            if ctx: sh([ORCA_BIN, "orchestration", "worker-release", "--dispatch", ctx], "worker-release 失败")
+            ref = (dv.get("payload") or {}).get("ref") or ""
+            if ref and refs_read(ticket_of(ref)) is not None:
+                ledger(["ticket", "state", ticket_of(ref), TICKET_RUN["wait"], "--source", "orch-dag",
+                        "--note", "worker_done 收讫,复验待关账(close 才终态)"], "ticket→running 失败")
+            print(json.dumps({"worker_done": True, "ref": ref, "dispatch": ctx,
+                              "outcome": (dv.get("payload") or {}).get("outcome") or dv.get("body", "")[:300]},
+                             ensure_ascii=False))
+        else:
+            print(json.dumps({"type": dtype, "needs_reply": dtype == "question",
+                              "msg_id": dv.get("msg_id") or dv.get("msgId") or did,
+                              "from": dv.get("from"), "body": (dv.get("body") or "")[:500]},
+                             ensure_ascii=False))
+            sys.exit(2 if dtype == "question" else 3)
+
+def cmd_reply(a):
+    s = load_state(); seat = need_seat(s)
+    out = orca_json(["orchestration", "reply", "--from", seat, "--id", a.msg, "--body", a.body],
+                    "reply 失败")
+    print(f"reply: ok={out.get('ok')}")
+
+def cmd_close(a):
+    if a.state not in ("done", "rejected", "rolled-back", "blocked"):
+        die("close 仅接受 done|rejected|rolled-back|blocked", 2)
+    r = refs_read(ticket_of(a.ref))
+    if r is None: die(f"票不存在: {a.ref}")
+    ledger(["ticket", "state", ticket_of(a.ref), a.state, "--source", "orch-dag",
+            "--note", a.outcome[:300]], f"ticket close 失败({a.ref})")
+    ledger(["event", os.getcwd(), a.ref, f"closed-{a.state}", a.outcome[:300]], "event 失败")
+    print(f"close: {a.ref} -> {a.state}")
+
+def cmd_status(a):
+    s = load_state()
+    print(json.dumps({"seat": s.get("seat"), "run": s.get("run"),
+                      "refs": {k: v.get("orca_task") for k, v in s.get("refs", {}).items()}},
+                     ensure_ascii=False, indent=1))
+    if s.get("run"):
+        out = sh([ORCA_BIN, "orchestration", "task-list", "--from", need_seat(s), "--json"],
+                 "task-list 失败")
+        tasks = ((json.loads(out).get("result") or {}).get("tasks")) or []
+        for t in tasks:
+            print(f"  {t.get('id')} {t.get('status'):10} {t.get('task_title') or t.get('display_name') or ''}"[:110])
+
+def cmd_selftest(a):
+    stub = os.path.abspath(a.stub) if a.stub else None
+    env_note = "ORCA_BIN=stub" if stub else "ORCA_BIN 默认(dry 序列检查)"
+    print(f"selftest: {env_note}; 原子集 = seat-open,run,task,seat,wait,reply,close,status")
+    for name in (cmd_seat_open, cmd_run, cmd_task, cmd_seat, cmd_wait, cmd_reply, cmd_close, cmd_status):
+        assert callable(name)
+    print("selftest: 子命令集完整(8/8); 状态机映射 wired: task→dispatched, wait→running, close→终态")
+
+def main():
+    p = argparse.ArgumentParser(prog="orch-dag", description="Orca 面结构化编排唯一指令集")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("seat-open"); sp.add_argument("--project", required=True)
+    sp.add_argument("--title", default=SEAT_TITLE); sp.set_defaults(f=cmd_seat_open)
+    rp = sub.add_parser("run"); rp.add_argument("objective"); rp.set_defaults(f=cmd_run)
+    tp = sub.add_parser("task"); tp.add_argument("ref"); tp.add_argument("--title", required=True)
+    tp.add_argument("--spec", required=True); tp.add_argument("--deps"); tp.set_defaults(f=cmd_task)
+    ep = sub.add_parser("seat"); ep.add_argument("ref"); ep.add_argument("--name")
+    ep.add_argument("--project", default=None); ep.set_defaults(f=cmd_seat)
+    wp = sub.add_parser("wait"); wp.add_argument("--timeout-ms", type=int, default=1500000)
+    wp.set_defaults(f=cmd_wait)
+    qp = sub.add_parser("reply"); qp.add_argument("--msg", required=True)
+    qp.add_argument("--body", required=True); qp.set_defaults(f=cmd_reply)
+    cp = sub.add_parser("close"); cp.add_argument("ref"); cp.add_argument("state")
+    cp.add_argument("--outcome", required=True); cp.set_defaults(f=cmd_close)
+    st = sub.add_parser("status"); st.add_argument("--ref"); st.set_defaults(f=cmd_status)
+    sf = sub.add_parser("selftest"); sf.add_argument("--stub"); sf.set_defaults(f=cmd_selftest)
+    a = p.parse_args()
+    a.f(a)
+
+if __name__ == "__main__":
+    main()

@@ -23,18 +23,31 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 ## 路由仲裁 — 任何派发先过这张表
 
-| 我要… | 走哪面 | 入口 |
-|---|---|---|
-| **一次调用完成派发/收尾+自动记账**(dispatch/wait/reply/status;ledger+状态机硬机制) | **orch CLI** | `~/.dsh/maestro/bin/orch`(下节"orch 高抽象入口");免拼底层链 |
-| 结构化派发 / 要 worker_done 账 / 多票 DAG / ask 应答 | **Orca 编排面(正统)** | 下节"编排邮箱正统链" |
-| 派活给 dais GUI 里的终端 worker | **dais 面** | worker-up 三步链(下);全表 load skill `dais-orchestration` |
-| 跨面向回报(Orca 终端/dais pane/cron/任意进程 → 编排席) | **cb-send** | 契约模板(下);全表 load skill `cb-send` |
+**唯一派发指令集 = `~/.dsh/maestro/bin/orch-dag`**(原子序:seat-open → run → task [--deps] → seat → wait → close)。结构化派发、多票 DAG、worker_done 账、ask 应答全部只走它;ledger node+ticket 双写内建于每个原子子命令,无绕过旗标;缺参数 exit 2 不推断。**手拼原生 `orca orchestration`、legacy `orch`、dais worker-up 一律不得用于新派发**(历史兼容,仅排障时阅读下文)。
+
+| 我要… | 入口 |
+|---|---|
+| 结构化派发 / worker_done 账 / 多票 DAG / ask 应答 | **orch-dag**(唯一;子命令表见下) |
+| 跨面向回报(Orca 终端/dais pane/cron/任意进程 → 编排席) | **cb-send**(契约模板下;load skill `cb-send`) |
 | 记账/汇报 | **内部调用** | ledger(下) |
 | 桥死了/注册丢了 | **内部调用** | bridge-rearm(下) |
 
-**与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;本节是编排席固化的工作流(链序/禁令/票面工艺),**不缓存命令表**——旗标细节以 `skills get orchestration` 动态加载为准,与本节冲突时动态 guide 赢。
+### orch-dag 原子子命令(唯一指令集)
 
-## orch 高抽象入口 — 一次调用 = 一个生命周期动作(债#9×#11)
+```bash
+orch-dag seat-open --project <path>                    # 编排席终端幂等创建/复用(缓存 handle)
+orch-dag run "<objective>"                             # 幂等建/续 Run
+orch-dag task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝
+orch-dag seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
+orch-dag wait [--timeout-ms MS]                        # check --wait;worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
+orch-dag reply --msg <id> --body <t>                   # question 应答
+orch-dag close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口)
+orch-dag status [--ref R]                              # run/task/dispatch + ticket + node 并排(只读)
+```
+
+**与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch-dag 是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 orch-dag 行为用的参考,**不是第二条派发路径**。
+
+## orch 高抽象入口(历史兼容 — 勿用于新派发)
 
 `~/.dsh/maestro/bin/orch` 把正统链封装为编排席级动作,并硬机制强制 ledger 记账(规则7/8)+node/ticket 状态机+deliveryId 幂等;**默认零实弹**(测试经 `ORCH_BIN` 注 stub,`--dry-run` 打印命令序列):
 
@@ -50,7 +63,7 @@ orch selftest                       # 离线全链自测(fake stub,43 断言)
 
 细节(`--force` 重复派发/`--no-ticket`/退出码表/状态机表)看 `orch --help` 与源码头注;首次实弹冒烟归编排席。
 
-## Orca 面 — 编排邮箱正统链(派发主路径)
+## Orca 面 — 编排邮箱正统链(历史:orch-dag 的内部实现参考,禁止 agent 手拼派发)
 
 **红线**: 本机调 Orca CLI 一律 `ORCA=/opt/Orca/resources/bin/orca-ide`(每会话解析一次,全程复用)。**绝对禁止裸调 `orca`** —— 本机(Linux 非 Orca 终端)裸 `orca` 解析到 GNOME 读屏器 `/usr/bin/orca`,会挂起语音会话。
 
