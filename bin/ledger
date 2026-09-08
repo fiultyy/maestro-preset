@@ -9,6 +9,7 @@
 #   ledger ticket state <ticket_id> <new_state> [--force] [--note X]   # 状态机迁移;迁入 running/done 前 deps 须 done(--force 旁路并 journal)
 #   ledger ticket dep <ticket_id> <dep_id> [--rm]                      # 依赖边(自依赖/成环拒绝;dep 可指向未入库票,视为未 done)
 #   ledger ticket lease <ticket_id> [owner] [--release]                # 认领/释放租约
+#   ledger ticket refs-set <ticket_id> --json '{"k":"v"}'              # refs 定点改键(merge,幂等; PMWEB-CWD)
 #   ledger ticket list [--state X] [--since 24h] [--json]              # 回溯查询(since: <N>h|<N>d|<N>=小时)
 #   ledger ticket render [-o <path>]                                   # v4 兼容票板渲染(缺省 <maestro>/tickets.md;手写内容保留于 <!-- hand --> 区;幂等)
 # ticket 状态机: dispatched→running→blocked→done→merged,终态另含 rejected/rolled-back;非法迁移拒绝。
@@ -348,6 +349,27 @@ def cmd_ticket_lease(a):
         ticket_ev(c, a.ticket_id, 'lease', a.source, f'lease_owner={owner or "-"}')
     print(f'{a.ticket_id} lease_owner={owner or "-"}')
 
+def cmd_ticket_refs_set(a):
+    """PMWEB-CWD: refs 定点改键 — merge 语义只动 --json 给定键, 他键/state/deps/lease_owner 零触碰;
+    幂等: 给定键现值全等值 → no-op 不写不记事件。"""
+    patch = parse_json_arg(a.json, '--json', dict)
+    if not patch: die('--json 不能为空对象')
+    with ticket_db_write() as c:
+        row = get_ticket(c, a.ticket_id)
+        try: refs = json.loads(row['refs'] or '{}')
+        except (json.JSONDecodeError, TypeError): die(f'refs 非合法 JSON: {a.ticket_id}')
+        if not isinstance(refs, dict): die(f'refs 非对象: {a.ticket_id}')
+        changed = {k: v for k, v in patch.items() if refs.get(k) != v}
+        if not changed:
+            print(f'{a.ticket_id} refs unchanged (幂等 no-op)')
+            return
+        refs.update(changed)
+        c.execute("UPDATE tickets SET refs=?,updated_at=? WHERE ticket_id=?",
+                  (json.dumps(refs, ensure_ascii=False), now(), a.ticket_id))
+        ticket_ev(c, a.ticket_id, 'refs-set', a.source,
+                  'refs-set ' + ' '.join(f'{k}={json.dumps(v, ensure_ascii=False)}' for k, v in sorted(changed.items())))
+    print(f"{a.ticket_id} refs-set {', '.join(sorted(changed))}")
+
 def parse_since(raw):
     m = re.fullmatch(r'(\d+(?:\.\d+)?)(h|d)?', raw.strip())
     if not m: die('--since 格式: <N>h|<N>d|<N>(小时),如 24h')
@@ -431,6 +453,9 @@ def main():
     t.add_argument('--rm', action='store_true'); t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_dep)
     t = tsub.add_parser('lease'); t.add_argument('ticket_id'); t.add_argument('owner', nargs='?')
     t.add_argument('--release', action='store_true'); t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_lease)
+    t = tsub.add_parser('refs-set'); t.add_argument('ticket_id')
+    t.add_argument('--json', required=True, help="merge 语义: 只更新给定键, 例 '{\"cwd\":\"/path\"}'")
+    t.add_argument('--source', default='orch1'); t.set_defaults(f=cmd_ticket_refs_set)
     t = tsub.add_parser('list'); t.add_argument('--state'); t.add_argument('--since'); t.add_argument('--json', action='store_true'); t.set_defaults(f=cmd_ticket_list)
     t = tsub.add_parser('render'); t.add_argument('-o', '--out', dest='out', default=DEFAULT_TICKETS_MD); t.set_defaults(f=cmd_ticket_render)
     a = ap.parse_args()
