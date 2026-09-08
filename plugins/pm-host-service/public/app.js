@@ -62,6 +62,15 @@ const state = {
   health: null,
   acts: new Map(), // ref -> entry（页面内存态，可丢；服务侧 registry 为权威）
   sseOpen: null, // PMWEB-DAG: SSE 初态记账 —— canvas.js 是 module（晚于 classic 执行），断连事件可能先于其监听注册到达，初态由此回放
+  // PMWEB-ARCHIVE: 票看板手动归档 —— 仅终态票可归档; localStorage 本页持久 (ADR-002
+  // 红线: 页面零账本写, 归档是纯观测面折叠, 不改 ledger)。
+  archive: loadArchiveSet(),
+  archOpen: false, // 归档区展开态 (内存态, 刷新收起)
+  // PMWEB-FLEET-SIDE: 席位树展开 + 票侧栏 —— orgTicketsOpen = 展开了持票列表的席位
+  // code; fleetSide = 侧栏当前对象 (ticket 只读详情 + 最新 turn end 原文)。
+  orgTicketsOpen: new Set(),
+  fleetSide: null, // { kind: 'ticket', id } — null = 侧栏收起
+  turnEndCache: new Map(), // sessionId -> { ok, turn, step, text, err } (内存态)
 }
 
 // PW-003: consumer 每 tab 随机 —— 重载即全量快照回放；tab 内 EventSource
@@ -112,6 +121,25 @@ const refetch = {
 
 const TICKET_COLS = ['dispatched', 'running', 'blocked', 'done', 'merged', 'rejected']
 
+// PMWEB-ARCHIVE: 归档能力 —— 终态票 (cluster.js TERMINAL_STATES 同口径) 卡上出
+// 「归档」钮, 归档票从看板移入底部归档区 (可展开/还原)。纯前端折叠: localStorage
+// 持久 (key pmweb:archive:v1), 账本零写 (ADR-002 红线), 服务端 /op/tickets 不动。
+const ARCHIVE_KEY = 'pmweb:archive:v1'
+const TERMINAL_STATES = new Set(['done', 'merged', 'rejected'])
+
+function loadArchiveSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(ARCHIVE_KEY) || '[]').map(String)) } catch { return new Set() }
+}
+function saveArchiveSet(set) {
+  try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify([...set].map(String))) } catch { /* 隐私模式等: 归档退化为会话内存态 */ }
+}
+function toggleArchive(id) {
+  const idStr = String(id)
+  state.archive.has(idStr) ? state.archive.delete(idStr) : state.archive.add(idStr)
+  saveArchiveSet(state.archive)
+  renderTickets()
+}
+
 // 票卡左边框色（与 style.css 徽章色一致）
 const STATE_COLORS = {
   dispatched: '#e0a93e', running: '#4da3ff', blocked: '#e06c5f', done: '#3fbf7f',
@@ -121,7 +149,7 @@ const STATE_COLORS = {
 const emptyNote = (msg) => `<div class="empty-note">${esc(msg)}</div>`
 const viewNote = (note) => `<p class="view-note">⚠ ${esc(note)}</p>`
 
-function ticketCard(t) {
+function ticketCard(t, { archived = false } = {}) {
   const deps = parseJsonField(t.deps, [])
   const refs = parseJsonField(t.refs, {})
   const refKeys = refs && typeof refs === 'object' ? Object.keys(refs) : []
@@ -130,11 +158,16 @@ function ticketCard(t) {
   if (t.lease_owner) chips.push(`<span class="chip lease">lease: ${esc(t.lease_owner)}</span>`)
   for (const r of refKeys.slice(0, 4)) chips.push(`<span class="chip ref">${esc(r)}</span>`)
   if (refKeys.length > 4) chips.push(`<span class="chip ref">+${refKeys.length - 4}</span>`)
+  // PMWEB-ARCHIVE: 终态票卡悬停出归档钮; 归档区票卡出还原钮 (非终态不可归档)
+  const isTerminal = TERMINAL_STATES.has(t.state)
+  const act = archived
+    ? `<button type="button" class="arch-btn" data-unarch="${esc(t.ticket_id)}" title="还原到看板">↩</button>`
+    : (isTerminal ? `<button type="button" class="arch-btn" data-arch="${esc(t.ticket_id)}" title="归档 (从看板收起, 本页持久)">✕</button>` : '')
   return `
-    <div class="ticket-card" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
+    <div class="ticket-card${archived ? ' archived' : ''}" style="border-left-color: ${STATE_COLORS[t.state] || 'var(--pending)'}">
       <span class="tid">${esc(t.ticket_id)}</span><span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="title">${esc(t.title)}</span>
-      <span class="chips">${chips.join('')}</span>
+      <span class="chips">${chips.join('')}</span>${act}
     </div>`
 }
 
@@ -145,8 +178,12 @@ function renderTickets() {
   if (!r.ok) { el.innerHTML = emptyNote(`票面源不可用（服务死或网络断）：${r.err} —— 降级态，CLI/账本不受影响`); return }
   const d = r.data
   const note = d.degraded && d.note ? viewNote(`票面降级：${d.note}`) : ''
-  const list = Array.isArray(d.tickets) ? d.tickets : []
-  if (!list.length) {
+  const all = Array.isArray(d.tickets) ? d.tickets : []
+  // PMWEB-ARCHIVE: 归档票移出看板 → 底部归档区; 未知 id (账本已删) 丢弃
+  const list = []
+  const archivedList = []
+  for (const t of all) (state.archive.has(String(t.ticket_id)) ? archivedList : list).push(t)
+  if (!all.length) {
     el.innerHTML = note + emptyNote(`0 张票${d.note ? ' —— ' + esc(d.note) : '（账本为空或源暂不可用）'}`)
     return
   }
@@ -155,11 +192,33 @@ function renderTickets() {
     if (!cols.has(t.state)) cols.set(t.state, [])
     cols.get(t.state).push(t)
   }
+  // 归档区: 默认收起 (计数常显); 展开列出归档票卡 (还原钮)
+  const archSection = archivedList.length || state.archive.size
+    ? `<div class="archive-bar">
+         <button type="button" id="arch-toggle" class="${state.archOpen ? 'open' : ''}">
+           归档 <b>${archivedList.length}</b> ${state.archOpen ? '▾' : '▸'}
+         </button>
+         <span class="dim small">手动归档仅本页折叠 (localStorage), 账本不动</span>
+       </div>
+       ${state.archOpen ? `<div class="kanban archive-open">${archivedList.map((t) => ticketCard(t, { archived: true })).join('') || emptyNote('归档集非空但票面已无对应票 (账本已删/过期)')}</div>` : ''}`
+    : ''
   el.innerHTML = note + `<div class="kanban">${[...cols.entries()].map(([c, ts]) => `
     <div class="col">
       <h3><span>${esc(c)}</span><span>${ts.length}</span></h3>
-      ${ts.map(ticketCard).join('')}
-    </div>`).join('')}</div>`
+      ${ts.map((t) => ticketCard(t)).join('')}
+    </div>`).join('')}</div>` + archSection
+}
+
+// PMWEB-ARCHIVE: 归档钮/还原钮/归档区折叠 — 事件委托常驻 (SSE 全量重渲不丢)
+function wireTickets() {
+  const el = $('#view-tickets')
+  el.addEventListener('click', (e) => {
+    const arch = e.target.closest?.('[data-arch]')
+    if (arch) { toggleArchive(arch.dataset.arch); return }
+    const un = e.target.closest?.('[data-unarch]')
+    if (un) { toggleArchive(un.dataset.unarch); return }
+    if (e.target.closest?.('#arch-toggle')) { state.archOpen = !state.archOpen; renderTickets() }
+  })
 }
 
 /* ---- 渲染：席位视图 (组织图 + 小卡 + 详情浮层; PMWEB-DAG 需求 4-7) ---- */
@@ -210,14 +269,43 @@ function seatMini(s, held) {
     </button>`
 }
 
+// PMWEB-FLEET-SIDE: 席位执行的票按顺序出来 — updated_at 升序 (执行完成序),
+// 同刻回退 ticket_id 自然序 (数值感知: AND1-2 < AND1-10)。
+function orderedHeld(code) {
+  const tk = state.tickets
+  const list = tk && tk.ok && Array.isArray(tk.data.tickets)
+    ? tk.data.tickets.filter((t) => leaseCode(t.lease_owner) === code) : []
+  return list.sort((a, b) =>
+    String(a.updated_at || '').localeCompare(String(b.updated_at || '')) ||
+    String(a.ticket_id).localeCompare(String(b.ticket_id), undefined, { numeric: true }))
+}
+
 function orgBranch(code, seatsByCode, childrenOf, rendered, heldCounts) {
   const s = seatsByCode.get(code)
   if (!s || rendered.has(code)) return ''
   rendered.add(code)
   const kids = childrenOf.get(code) || []
+  // PMWEB-FLEET-SIDE: 树状展开 — 席位卡侧 chevron 展开该席位执行的票 (有序),
+  // 点票行开侧栏 (不弹窗)。默认收起; 展开态会话内存 (SSE 重渲保持)。
+  const held = orderedHeld(code)
+  const open = state.orgTicketsOpen.has(code)
+  const toggle = held.length
+    ? `<button type="button" class="org-toggle" data-org="${esc(code)}"
+         title="${open ? '收起持票列表' : '展开持票列表 (按 updated_at 执行序)'}">${open ? '▾' : '▸'} ${held.length}</button>`
+    : ''
+  const ticketsHtml = !open ? '' : (!held.length
+    ? '<div class="org-tickets dim small">无持票</div>'
+    : `<div class="org-tickets">${held.map((t, i) => `
+        <button type="button" class="tk-row" data-tk="${esc(t.ticket_id)}" title="点击在侧栏查看详情 + 最新 turn end 原文">
+          <span class="tk-idx">${i + 1}</span>
+          <span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span>
+          <span class="mono">${esc(t.ticket_id)}</span>
+          <span class="tk-title">${esc(t.title || '')}</span>
+        </button>`).join('')}</div>`)
   return `
     <div class="org-node" data-code="${esc(code)}">
-      ${seatMini(s, heldCounts.get(code) || 0)}
+      <div class="org-row">${seatMini(s, heldCounts.get(code) || 0)}${toggle}</div>
+      ${ticketsHtml}
       ${kids.length ? `<div class="org-children">${kids.map((k) => orgBranch(k, seatsByCode, childrenOf, rendered, heldCounts)).join('')}</div>` : ''}
     </div>`
 }
@@ -266,7 +354,101 @@ function renderFleet() {
   const unassignedNote = unassigned.size
     ? viewNote(`未分配持票 ${[...unassigned.values()].reduce((a, l) => a + l.length, 0)} 张（归一 code: ${[...unassigned.keys()].map((c) => esc(c)).join(', ')} —— 无席位认领，不计入任何席位）`)
     : ''
-  el.innerHTML = note + lineageNote + unassignedNote + `<div class="org-chart">${tree}${missed}</div>`
+  el.innerHTML = note + lineageNote + unassignedNote + `<div class="org-chart">${tree}${missed}</div>` + '<aside id="fleet-side" hidden></aside>'
+  renderFleetSide() // PMWEB-FLEET-SIDE: SSE 重渲后侧栏跟随 (选中票还在场才复显)
+}
+
+/* ---- PMWEB-FLEET-SIDE: 票侧栏 (只读详情 + 最新 turn end 原文) ---- */
+// 数据: 票字段 = state.tickets (零额外请求); turn end 原文 = /op/trace
+// (PM-005 只读投影) 取该票 lease 席位 session 的**最后一条带 text block 的
+// assistant/message** —— 即 agent 最近一次 end turn 的原文。turn/end 记录只带
+// (turn, reason) 无正文; trace fold (head.compact) 保尾不保头, 最新正文恒在
+// kept tail —— 取不到时如实注记, 不造数据 (降级优先)。
+function findTicket(id) {
+  const tk = state.tickets
+  const list = tk && tk.ok && Array.isArray(tk.data.tickets) ? tk.data.tickets : []
+  return list.find((t) => String(t.ticket_id) === String(id)) || null
+}
+
+function seatSessionOf(t) {
+  const code = leaseCode(t.lease_owner)
+  const fleet = state.fleet
+  const seats = fleet && fleet.ok && Array.isArray(fleet.data.seats) ? fleet.data.seats : []
+  const s = seats.find((x) => x.code === code)
+  return { code, sessionId: (s && s.sessionId) || null }
+}
+
+async function fetchTurnEnd(sid) {
+  const cached = state.turnEndCache.get(sid)
+  if (cached) return cached
+  const r = await fetchJson(`op/trace?sessionId=${encodeURIComponent(sid)}&type=${encodeURIComponent('assistant/message')}`)
+  let out
+  if (!r.ok || !r.data) out = { err: r.err || 'trace 源不可用' }
+  else if (r.data.status === 'miss') out = { err: '无会话目录 (trace status=miss — 会话已清或 sid 失效)' }
+  else {
+    const ents = (Array.isArray(r.data.entries) ? r.data.entries : []).filter((e) => e && e.type === 'assistant/message')
+    let found = null
+    for (let i = ents.length - 1; i >= 0 && !found; i--) {
+      const m = ents[i].data && ents[i].data.message
+      const blocks = Array.isArray(m && m.content) ? m.content : []
+      const text = blocks.filter((b) => b && b.type === 'text').map((b) => String(b.text || '')).join('\n').trim()
+      if (text) found = { turn: ents[i].data.turn, step: ents[i].data.step, text }
+    }
+    out = found || { err: 'trace 尾部无带 text 的 assistant/message (该会话最近未产出结论文本)' }
+  }
+  state.turnEndCache.set(sid, out)
+  return out
+}
+
+function renderFleetSide() {
+  const aside = $('#fleet-side')
+  if (!aside) return
+  const sel = state.fleetSide
+  const t = sel && sel.kind === 'ticket' ? findTicket(sel.id) : null
+  if (!t) { state.fleetSide = null; aside.hidden = true; aside.innerHTML = ''; return }
+  const deps = parseJsonField(t.deps, [])
+  const refs = parseJsonField(t.refs, {})
+  const refKeys = refs && typeof refs === 'object' ? Object.keys(refs) : []
+  const { code, sessionId } = seatSessionOf(t)
+  aside.hidden = false
+  aside.innerHTML = `
+    <div class="fs-head"><h3>票 ${esc(t.ticket_id)}</h3><button type="button" class="fs-close" title="关闭侧栏">×</button></div>
+    <p class="fs-title">${esc(t.title || '')}</p>
+    <dl class="fs-fields">
+      <dt>state</dt><dd><span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span></dd>
+      <dt>lease</dt><dd>${t.lease_owner ? `${esc(t.lease_owner)} → 席位 <span class="mono">${esc(code)}</span>` : '<span class="dim">未派发</span>'}</dd>
+      <dt>updated_at</dt><dd class="mono small">${esc(t.updated_at || '—')}</dd>
+      <dt>outcome</dt><dd class="small">${esc(t.outcome && t.outcome !== 'None' ? t.outcome : '—')}</dd>
+      <dt>deps</dt><dd>${(Array.isArray(deps) && deps.length) ? deps.map((d) => `<span class="chip dep">↳ ${esc(d)}</span>`).join(' ') : '<span class="dim">—</span>'}</dd>
+      <dt>refs</dt><dd class="small">${refKeys.length ? refKeys.map((k) => `<span class="chip ref">${esc(k)}=${esc(String(refs[k]))}</span>`).join(' ') : '<span class="dim">—</span>'}</dd>
+    </dl>
+    <div class="fs-turn">
+      <h4>最新一次 turn end 原文 <span class="dim small" id="fs-turn-meta">${sessionId ? '加载中…' : '无执行会话'}</span></h4>
+      <pre class="fs-turn-text" id="fs-turn-text">${sessionId ? '' : '<span class="dim">该票 lease 席位当前无 sessionId（fleet join 断或席位未在场）</span>'}</pre>
+    </div>`
+  const fill = (res) => {
+    const meta = $('#fs-turn-meta'); const pre = $('#fs-turn-text')
+    if (!meta || !pre) return
+    if (res.err) { meta.textContent = '不可得'; pre.innerHTML = `<span class="dim">${esc(res.err)}</span>`; return }
+    meta.textContent = `turn ${res.turn}${res.step != null ? ` · step ${res.step}` : ''} · sid ${String(sessionId).replace(/^session-/, '').slice(0, 8)}`
+    pre.textContent = res.text
+  }
+  aside.querySelector('.fs-close').addEventListener('click', () => { state.fleetSide = null; renderFleetSide() })
+  if (!sessionId) return
+  const cached = state.turnEndCache.get(sessionId)
+  if (cached) { fill(cached); return }
+  fetchTurnEnd(sessionId).then((res) => {
+    const cur = state.fleetSide // 侧栏已切走/关闭 → 丢弃 (SSE 重渲走 renderFleetSide 缓存路径)
+    if (!cur || cur.kind !== 'ticket' || String(cur.id) !== String(sel.id)) return
+    fill(res)
+  }).catch(() => { /* fetchJson 已兜 err; 此处静默保持加载中文案不再变动即降级 */ })
+}
+
+function openTicketSide(id) {
+  state.fleetSide = { kind: 'ticket', id: String(id) }
+  renderFleetSide()
+  const aside = $('#fleet-side')
+  if (aside && !aside.hidden) aside.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
 }
 
 /* ---- 席位详情浮层 (需求 7: join 现成字段全量 + 持票列表 + 血缘, 关闭返回) ---- */
@@ -289,14 +471,11 @@ function seatDetailHtml(code) {
   if (s.session && typeof s.session === 'object') {
     for (const [k, v] of Object.entries(s.session)) rows.push(sdRow(`session.${k}`, k === 'title' ? `<span class="small">${sdVal(v)}</span>` : sdVal(v)))
   }
-  // 持票列表 (持票边 lease_owner→seat; PMWEB-DATA: 同 renderFleet 归一口径)
-  const held = []
-  const tk = state.tickets
-  if (tk && tk.ok && Array.isArray(tk.data.tickets)) {
-    for (const t of tk.data.tickets) if (leaseCode(t.lease_owner) === code) held.push(t)
-  }
+  // 持票列表 (持票边 lease_owner→seat; PMWEB-DATA: 同 renderFleet 归一口径;
+  // PMWEB-FLEET-SIDE: 有序 (updated_at 执行序) + 行可点 → 侧栏, 不再止步浮层)
+  const held = orderedHeld(code)
   const heldHtml = held.length
-    ? held.map((t) => `<li><span class="mono">${esc(t.ticket_id)}</span> <span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span> <span class="dim small">${esc(t.title || '')}</span></li>`).join('')
+    ? held.map((t) => `<li><button type="button" class="tk-row" data-tk="${esc(t.ticket_id)}" title="点击在侧栏查看详情 + 最新 turn end 原文"><span class="state-badge st-${esc(t.state)}">${esc(t.state)}</span> <span class="mono">${esc(t.ticket_id)}</span> <span class="dim small">${esc(t.title || '')}</span></button></li>`).join('')
     : '<li class="dim small">无持票 (lease_owner 未指向本席位)</li>'
   // 血缘 (上下级)
   const { headOf, childrenOf } = lineageOf(seats)
@@ -327,10 +506,25 @@ function wireSeatDetail() {
   const el = $('#view-fleet')
   el.addEventListener('click', (e) => {
     const mini = e.target.closest?.('.seat-mini')
-    if (mini) openSeatDetail(mini.dataset.code)
+    if (mini) { openSeatDetail(mini.dataset.code); return }
+    // PMWEB-FLEET-SIDE: 树展开 chevron + 票行 → 侧栏
+    const tog = e.target.closest?.('.org-toggle')
+    if (tog) {
+      const code = tog.dataset.org
+      state.orgTicketsOpen.has(code) ? state.orgTicketsOpen.delete(code) : state.orgTicketsOpen.add(code)
+      renderFleet()
+      return
+    }
+    const row = e.target.closest?.('.tk-row')
+    if (row) openTicketSide(row.dataset.tk)
   })
   const dlg = $('#seat-detail')
   if (!dlg) return
+  // 浮层内持票行可点 → 关浮层开侧栏 (点击票本弹出信息窗改为侧栏显示)
+  dlg.addEventListener('click', (e) => {
+    const row = e.target.closest?.('.tk-row')
+    if (row) { dlg.close(); openTicketSide(row.dataset.tk) }
+  })
   $('#sd-close').addEventListener('click', () => dlg.close())
   dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close() }) // 点背景关闭
 }
@@ -577,7 +771,8 @@ function wireTabs() {
 function boot() {
   wireTabs()
   wireActForm()
-  wireSeatDetail() // PMWEB-DAG: 席位小卡 → 详情浮层
+  wireTickets() // PMWEB-ARCHIVE: 归档委托
+  wireSeatDetail() // PMWEB-DAG: 席位小卡 → 详情浮层; PMWEB-FLEET-SIDE: 树展开+票侧栏
   renderActs()
   loadTickets()
   loadFleet()

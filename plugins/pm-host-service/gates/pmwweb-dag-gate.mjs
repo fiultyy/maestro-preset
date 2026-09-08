@@ -27,6 +27,7 @@ import { createServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { zstdCompressSync } from 'node:zlib' // PMWEB-FLEET-SIDE: 造 session.jsonl.zstd fixture (service loadTraceLines 同格式)
 
 const LABEL = process.argv[2] ?? `manual-${process.pid}`
 const CHROME = process.argv[3] ?? process.env.CHROME_BIN ?? 'google-chrome'
@@ -338,6 +339,19 @@ async function sandboxPart() {
   const shot = (f) => `${BASE}/${f}`
   const errors = []
   const box = await startSandbox('browser')
+  // PMWEB-FLEET-SIDE fixture: w1 session trace (zstd 单帧 JSONL, loadTraceLines 同格式)。
+  // 故意先放一条纯 tool-call 的 assistant/message (turn2/step5) 再放带 text 的
+  // (turn3/step9) —— 锁「取最后一条带 text block 的消息 = agent end turn 原文」语义。
+  {
+    const lines = [
+      JSON.stringify({ seq: 1, type: 'assistant/message', data: { turn: 2, step: 5, message: { role: 'assistant', content: [{ type: 'tool-call', id: 't1' }] } } }),
+      JSON.stringify({ seq: 2, type: 'assistant/message', data: { turn: 3, step: 9, message: { role: 'assistant', content: [{ type: 'text', text: 'SMOKE-TURN-END-ALPHA 最终结论原文' }] } } }),
+      JSON.stringify({ seq: 3, type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } }),
+    ]
+    const dir = `${box.sb}/sessions/ab/session-22222222-aaaa-4bbb-8ccc-222222222222`
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(`${dir}/session.jsonl.zstd`, zstdCompressSync(Buffer.from(lines.join('\n') + '\n')))
+  }
   let c = null
   try {
     // 静态面出聚合模块
@@ -440,6 +454,75 @@ async function sandboxPart() {
     await sleep(120)
     const closed = await c.cdp.eval(`document.querySelector('#seat-detail').hasAttribute('open')`)
     ok('C 详情浮层: 关闭返回', closed === false)
+
+    // PMWEB-FLEET-SIDE: 树展开持票 (有序) + 点票行开侧栏 + 最新 turn end 原文
+    const fs0 = await c.cdp.eval(`({
+      toggles: [...document.querySelectorAll('.org-toggle')].map((b) => b.dataset.org),
+      sideHidden: document.getElementById('fleet-side') ? document.getElementById('fleet-side').hidden : null,
+    })`)
+    ok('PMWEB-FLEET-SIDE: 持票席位带展开 chevron + 侧栏容器收起', fs0.toggles.includes('w1') && fs0.sideHidden === true, JSON.stringify(fs0))
+    await c.cdp.eval(clickEl('.org-toggle[data-org="w1"]'))
+    await sleep(200)
+    const fs1 = await c.cdp.eval(`(() => {
+      const rows = [...document.querySelectorAll('.org-tickets .tk-row')]
+      return { n: rows.length, idx: rows.map((r) => r.querySelector('.tk-idx').textContent).join(','), first: rows[0] ? rows[0].dataset.tk : null }
+    })()`)
+    ok('PMWEB-FLEET-SIDE: 展开持票按序 (idx 1..n, 首行 RUN-1)', fs1.n === 1 && fs1.idx === '1' && fs1.first === 'RUN-1', JSON.stringify(fs1))
+    await c.cdp.eval(clickEl('.org-tickets .tk-row'))
+    await sleep(400)
+    const fs2 = await c.cdp.eval(`(() => {
+      const s = document.getElementById('fleet-side')
+      return { visible: s && !s.hidden, title: (s.querySelector('.fs-head h3') || {}).textContent || '', fields: s.querySelectorAll('.fs-fields dt').length }
+    })()`)
+    ok('PMWEB-FLEET-SIDE: 点票行开侧栏 (不弹窗), 字段面在场', fs2.visible && /票 /.test(fs2.title) && fs2.fields >= 5, JSON.stringify(fs2))
+    let fs3 = { meta: '', text: '' }
+    for (let i = 0; i < 20; i++) {
+      fs3 = await c.cdp.eval(`({
+        meta: (document.getElementById('fs-turn-meta') || {}).textContent || '',
+        text: (document.getElementById('fs-turn-text') || {}).textContent || '',
+      })`)
+      if (!/加载中/.test(fs3.meta)) break
+      await sleep(300)
+    }
+    ok('PMWEB-FLEET-SIDE: 最新 turn end 原文 (turn 3 · step 9 · 跳过纯 tool-call 消息)',
+      /turn 3/.test(fs3.meta) && /step 9/.test(fs3.meta) && fs3.text.includes('SMOKE-TURN-END-ALPHA'), JSON.stringify(fs3))
+    const fs4 = await c.cdp.eval(`(() => {
+      document.querySelector('.seat-mini[data-code="w1"]').click()
+      return new Promise((res) => setTimeout(() => {
+        const row = document.querySelector('#seat-detail .tk-row')
+        if (!row) { res({ row: false }); return }
+        row.click()
+        setTimeout(() => res({ row: true, dlgClosed: !document.getElementById('seat-detail').hasAttribute('open'), side: !document.getElementById('fleet-side').hidden }), 250)
+      }, 250))
+    })()`, true)
+    ok('PMWEB-FLEET-SIDE: 浮层持票行点击 → 关浮层开侧栏 (弹窗改侧栏)', fs4.row === true && fs4.dlgClosed === true && fs4.side === true, JSON.stringify(fs4))
+
+    // PMWEB-ARCHIVE: 终态票归档 → 归档区 → 还原 (localStorage 往返, 看板计数还原)
+    await c.cdp.eval(`document.querySelector('[data-view="tickets"]').click()`)
+    await sleep(300)
+    const archA = await c.cdp.eval(`({
+      cards: document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card').length,
+      btns: document.querySelectorAll('#view-tickets .arch-btn[data-arch]').length,
+      terminal: [...document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card')]
+        .filter((el) => /st-(done|merged|rejected)/.test(el.querySelector('.state-badge').className)).length,
+    })`)
+    ok('PMWEB-ARCHIVE: 仅终态票卡带归档钮 (钮数=终态卡数, 非终态不可归档)', archA.cards === 7 && archA.btns === archA.terminal, JSON.stringify(archA))
+    await c.cdp.eval(clickEl('#view-tickets .arch-btn[data-arch]'))
+    await sleep(200)
+    const archB = await c.cdp.eval(`({
+      toggle: (document.querySelector('#arch-toggle') || {}).textContent || '',
+      board: document.querySelectorAll('#view-tickets .kanban:not(.archive-open) .ticket-card').length,
+      ls: localStorage.getItem('pmweb:archive:v1'),
+    })`)
+    ok('PMWEB-ARCHIVE: 归档 → 看板 -1 + 计数 1 + localStorage 落盘', /1/.test(archB.toggle) && archB.board === 6 && !!archB.ls, JSON.stringify(archB))
+    await c.cdp.eval(clickEl('#arch-toggle'))
+    await sleep(200)
+    const archC = await c.cdp.eval(`({ open: !!document.querySelector('#view-tickets .kanban.archive-open'), un: !!document.querySelector('[data-unarch]') })`)
+    ok('PMWEB-ARCHIVE: 归档区展开 + 还原钮在场', archC.open && archC.un, JSON.stringify(archC))
+    await c.cdp.eval(clickEl('[data-unarch]'))
+    await sleep(200)
+    const archD = await c.cdp.eval(`localStorage.getItem('pmweb:archive:v1')`)
+    ok('PMWEB-ARCHIVE: 还原 → 归档集清空 (看板复原)', archD === '[]', `ls=${archD}`)
 
     // 回归: 票视图 kanban 与画布 tab 在场可用
     await c.cdp.eval(`document.querySelector('[data-view="tickets"]').click()`)
