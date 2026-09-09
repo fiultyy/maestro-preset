@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 ## 路由仲裁 — 任何派发先过这张表
 
-**唯一派发指令集 = `~/.dsh/maestro/bin/orch` 的 dag 族**(原子序:dag-seat-open → dag-run → dag-task [--deps] → dag-seat → (回调) dag-settle → dag-close)。结构化派发、多票 DAG、worker_done 账、ask 应答全部只走它;ledger node+ticket 双写内建于每个原子子命令,无绕过旗标;缺参数 exit 2 不推断;派发链四命令(dag-seat-open/run/task/seat)全路径过 bridge 武装硬门——未武装即拒。**手拼原生 `orca orchestration`、退役的 `orch-dag` 壳(运行只打印退役提示)、dais worker-up 一律不得用于新派发**(历史兼容,仅排障时阅读下文)。
+**唯一派发指令集 = `~/.dsh/maestro/bin/orch` 的 dag 族**(原子序:dag-seat-open → dag-run → dag-task [--deps] → dag-seat → (回调) dag-settle → dag-close)。结构化派发、多票 DAG、worker_done 账、ask 应答全部只走它;ledger node+ticket 双写内建于每个原子子命令,无绕过旗标;缺参数 exit 2 不推断;派发链四命令(dag-seat-open/run/task/seat)全路径过 bridge 武装硬门——未武装即拒。**手拼原生 `orca orchestration`、退役的 `orch-dag` 壳(运行只打印退役提示)、dais worker-up 一律不得用于新派发**(历史兼容,仅排障时阅读下文)。编票 DAG 前先过「编票前 grill 门」(ADR-014,下节)——拍板后才进原子序。
 
 | 我要… | 入口 |
 |---|---|
@@ -32,6 +32,15 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 | 跨面向回报(Orca 终端/dais pane/cron/任意进程 → 编排席) | **cb-send**(契约模板下;load skill `cb-send`) |
 | 记账/汇报 | **内部调用** | ledger(下) |
 | 桥死了/注册丢了 | **内部调用** | bridge-rearm(下) |
+
+### 编票前 grill 门(ADR-014,派发规划期用户确认)
+
+**supervised-run 编票 DAG 之前**,先把流程需要的**选择性**做成交互选项 grill 用户,拍板后才进原子序(第一原子命令即 dag-seat-open)。两层表述(用户裁决 #127:三票全走 session subagent 未经确认,即契约无名暗道): **指令面唯一(orch)≠ 执行车道唯一(grill 定)**——dag 族是唯一指令集(ADR-013 定谳,不动摇),执行车道(orca dag 族席位链 / 编排席 session subagent / dais 面 / 其他 harness)是真实决策变量——车道多元,都是正确路径,契约不硬编码单车道,由 grill 交互选项拍板定道。
+
+- **触发阈值(分级)**: 多票 DAG / 跨车道派发 / 含高危动作(触及生产、敏感数据、不可逆删除)→ 必 grill;单票轻修 → 一句话快速确认(车道+验收过目即可),不逐票开选项盘。
+- **必 grill 维度**: ① 执行车道(车道多元,见上)② agent harness 倾向 ③ 工作树隔离策略 ④ 票面勾稽深度(lease/refs/run 关联)⑤ 验收标准 ⑥ 高危确认门项。
+- **留痕**: grill 问答结果落票面 refs 或 ledger 事件——事后审计可查「当时为什么选这条道」;未留痕视为未 grill。
+- **门只定道,不改指令面**: grill 拍板的是执行车道,结构化派发指令集仍唯一(dag 族);本门是编票前置确认步骤,不构成第二条派发路径。
 
 ### orch dag 族原子子命令(唯一指令集)
 
