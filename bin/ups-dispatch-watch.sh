@@ -11,6 +11,9 @@
 # 2026-09-09 增(ENVELOPE-SCAN20): 信封识别窗 首行 → 前 20 行(Orca worker-start preamble 占首行,
 #   信封随任务文本后置,原 NR==1 永不命中);优先级 信封行 > preamble sidecar(后者仅无信封时走)。
 #   仍纯字符标记块匹配(只认 DSHMSG] 前缀行),零软契约,fail-open 全保持。
+# 2026-09-09 增(RECV-ROUTE): ticket-received 来路即目标对称化——to=信封 FROM(原 to=ORCH_SIG env,
+#   双编排席下 worker 属哪派恒投同一席=误投 orch1 派单唤醒 orch-p0 实证),from=SID(与 ticket-done/
+#   preamble 同族)。env ORCH_SIG 仅余 preamble ticket-running 与 done 存量回落用途。
 # env: ORCH_SIG(编排者签名) ORCH_INBOX(桥收件箱) ORCH_INFLIGHT(配对态目录) ORCH_RUNNING(running sidecar)
 STDIN="$(cat 2>/dev/null || :)"
 [ -n "$ORCH_INBOX" ] || ORCH_INBOX="$HOME/.dsh/maestro/bridge/inbox.log"
@@ -67,7 +70,7 @@ ORCH_SIG="$ORCH_SIG" ORCH_INBOX="$ORCH_INBOX" FROM="$FROM" REF="$REF" \
 OTYPE="$OTYPE" SID="$SID" NEWMSGID="$(python3 -c 'import uuid;print(uuid.uuid4())')" \
 TS="$(date +%s000)" python3 - <<'PYEOF' 2>/dev/null || :
 import json, os
-ev = {"type": "ticket-received", "from": os.environ["FROM"], "to": os.environ["ORCH_SIG"],
+ev = {"type": "ticket-received", "from": os.environ["SID"], "to": os.environ["FROM"],
       "body": f"[ref:{os.environ['REF']}] ticket received ({os.environ['OTYPE']}) session={os.environ['SID']}",
       "ref": os.environ["REF"], "msgid": os.environ["NEWMSGID"], "ts": int(os.environ["TS"]), "ver": 3}
 with open(os.environ["ORCH_INBOX"], "a", encoding="utf-8") as fh:

@@ -5,7 +5,8 @@
   ① V1 生产端单元面: bin/orch 模块级 dag_envelope/dag_orch_sig — 信封 jq 可析/from=旗标/ref=票REF/
      msgid 唯一/回落链五槽位(旗标→env ORCH_SIG→seat 落态→MAESTRO_ORCH_SIGNATURE→signature 文件→orch-p0);
      CLI 全链由 orch selftest S21e/S21f 断言(此处兼跑其尾行,全绿方过)
-  ② V2 消费端: 带信封 prompt → ups 落 inflight 5 列含 FROM + ticket-received(to=ORCH_SIG 不变);
+  ② V2 消费端: 带信封 prompt → ups 落 inflight 5 列含 FROM + ticket-received(to=信封 FROM
+     来路即目标对称化(RECV-ROUTE),from=SID 与 done 帧同族);
      旧 4 列 inflight → done to=ORCH_SIG 回落;NO-INFLIGHT 静默不变
   ③ V3 端到端仿真(文件沙盘,帧走文件不真投桥): 信封 prompt → ups → 检 inflight →
      turn-end-pair → 检 inbox 尾帧目标=信封 FROM(来路即目标)
@@ -173,9 +174,9 @@ def v2_ups_inflight_5col(tmp, base):
     print(f'[ ok ] v2 inflight 5 列含 FROM: {row}')
     frames = [json.loads(l) for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()]
     assert len(frames) == 1 and frames[0]['type'] == 'ticket-received'
-    assert frames[0]['to'] == base['ORCH_SIG'] and frames[0]['from'] == 'orch-x@session-x'
+    assert frames[0]['to'] == 'orch-x@session-x' and frames[0]['from'] == 'sess-a1'
     assert frames[0]['ref'] == 'OF11-A1'
-    print('[ ok ] v2 ticket-received to=ORCH_SIG 不变,from=信封 FROM')
+    print('[ ok ] v2 ticket-received to=信封 FROM(来路即目标),from=SID')
 
 
 def inflight_dir(base):
