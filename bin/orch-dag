@@ -125,14 +125,16 @@ def cmd_task(a):
     for d in deps:
         if d not in s["refs"]: die(f"依赖 ref 未建 task: {d}(先 task {d})")
         dep_ids.append(s["refs"][d]["orca_task"])
-    args = ["orchestration", "task-create", "--from", seat, "--title", a.title, "--spec", a.spec]
+    args = ["orchestration", "task-create", "--from", seat, "--task-title", a.title, "--spec", a.spec]
     if dep_ids: args += ["--deps", json.dumps(dep_ids)]
     r = orca_json(args, f"task-create 失败({a.ref})")
     tid = ((r.get("result") or {}).get("task") or {}).get("id")
     if not r.get("ok") or not tid: die(f"task 无 id: {json.dumps(r)[:300]}")
+    cwd = s.get("project") or ""
+    if not cwd: die("project 未记录: 先执行 seat-open --project(pm-web 票板按 refs.cwd 分组,缺 cwd 进折叠池)")
     ledger(["ticket", "add", ticket_of(a.ref), a.title,
             "--deps", json.dumps([ticket_of(d) for d in deps]),
-            "--refs", json.dumps({"run": s["run"], "orca_task": tid, "seat": seat}, ensure_ascii=False),
+            "--refs", json.dumps({"run": s["run"], "orca_task": tid, "seat": seat, "cwd": cwd}, ensure_ascii=False),
             "--source", "orch-dag"], f"ticket add 失败({a.ref})")
     s["refs"][a.ref] = {"orca_task": tid, "ticket": True}; save_state(s)
     print(f"task: {a.ref} -> {tid}")
@@ -161,7 +163,7 @@ def cmd_seat(a):
 def cmd_wait(a):
     s = load_state(); seat = need_seat(s)
     if not s.get("run"): die("Run 未建: 先执行 run")
-    out = sh([ORCA_BIN, "orchestration", "check", "--from", seat, "--wait",
+    out = sh([ORCA_BIN, "orchestration", "check", "--terminal", seat, "--json", "--wait",
               "--types", WAIT_TYPES, "--timeout-ms", str(a.timeout_ms)], "check --wait 失败")
     try: d = json.loads(out)
     except Exception: print(out); die("check 输出非 JSON", 4)
@@ -170,7 +172,7 @@ def cmd_wait(a):
     for dv in deliveries:
         dtype = dv.get("type"); did = dv.get("delivery_id") or dv.get("deliveryId") or dv.get("id")
         if dtype == "worker_done":
-            if did: sh([ORCA_BIN, "orchestration", "check", "--from", seat, "--ack", did], "ack 失败")
+            if did: sh([ORCA_BIN, "orchestration", "check", "--terminal", seat, "--ack", did], "ack 失败")
             ctx = dv.get("dispatch_context") or dv.get("dispatchContext") or (dv.get("payload") or {}).get("dispatch") or ""
             if ctx: sh([ORCA_BIN, "orchestration", "worker-release", "--dispatch", ctx], "worker-release 失败")
             ref = (dv.get("payload") or {}).get("ref") or ""
