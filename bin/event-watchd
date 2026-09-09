@@ -28,9 +28,14 @@
      ——双条件与判定(单条件不触发,VO-007 式挂死合成);连续挂死只报一次(latch),
      条件解除后复位。进程缺席 → 不判定(非本面职责)。
   ③ SLA 面: 只读打开 ledger.db(mode=ro;env MAESTRO_LEDGER 缺省 MAESTRO/ledger.db,
-      OF-005 tickets 表),非终态(dispatched/running/blocked)票 updated_at 距今 >
-      ttl_min(缺省 240)→ sla-overdue;每票 latch 只报一次,迁终态/回新鲜复位;
-      无库/无表容错为空集,不崩。
+      OF-005 tickets 表),分态+依赖感知老化(#122/SLA-TTL):
+      · dispatched/running 票: updated_at 距今 > ttl_min(缺省 240)→ sla-overdue(现行为不变);
+      · blocked 票分两支: 存在非终态 deps(∈ dispatched/running/blocked)= 设计内依赖
+        屏障,不计龄不告警;deps 全终态(done/merged/rejected/rolled-back,与 ledger
+        TICKET_TERMINAL 同源)/无 deps/dep 票不可查 = 真停摆或账本滞后,照常计龄到
+        ttl 告警——这正是 watcher 该抓的;
+      · 每票 latch 只报一次,迁终态/回新鲜/屏障生效(含解除后重计龄)复位;
+      · 无库/无表容错为空集,不崩;deps JSON 不可解析=无法判定,保守跳过(同时间戳缺/坏)。
   ④ 租约面: fleet.json(env MAESTRO_FLEET)条目 owner 在而 leaseExpiresAt 已过/
       缺失 → lease-expired(与 fleet-touch lease_alive 同 fail-open 语义);每条
       latch,续期/释放复位;owner+未过期 = 有效租约。
@@ -234,6 +239,9 @@ def scan_process_face(entry, latch, events):
 # ---------- 看守面③: SLA(OF-005 tickets 非终态超 ttl,只读) ----------
 
 TICKETS_NON_TERMINAL = ('dispatched', 'running', 'blocked')
+# 终态集与 bin/ledger TICKET_TERMINAL 同源(含 merged;任务书列举的 done/rejected/
+# rolled-back 为其子集——merged 票实质已完成,作屏障等同永久免检,故归终态)
+TICKETS_TERMINAL = ('done', 'merged', 'rejected', 'rolled-back')
 SLA_TTL_MIN_DEFAULT = 240
 
 
@@ -248,6 +256,34 @@ def parse_iso(val):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def parse_deps(val):
+    """tickets.deps JSON → list[str];缺/空 → [];坏/非数组 → None(无法判定)。"""
+    if val is None or val == '':
+        return []
+    try:
+        parsed = json.loads(val)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [str(x) for x in parsed]
+
+
+def dep_barrier(state_by_id, deps):
+    """blocked 票的依赖屏障判定(SLA-TTL 分支 2/3):
+    任一 dep 非终态(∈ dispatched/running/blocked 及未知态,保守视作在飞)→ True
+    = 设计内依赖屏障,不计龄不告警;deps 全终态/无 deps/dep 票不可查(账本无此票)
+    → False = 真停摆或账本滞后,照常计龄;deps JSON 不可解析(None)→ None
+    = 无法判定,调用方保守跳过(与时间戳缺/坏同语义)。"""
+    if deps is None:
+        return None
+    for dep in deps:
+        dep_state = state_by_id.get(dep)
+        if dep_state is not None and dep_state not in TICKETS_TERMINAL:
+            return True
+    return False
+
+
 def read_tickets():
     """只读打开 ledger tickets 表(OF-005;mode=ro);无库/无表/SQL 错 → [](容错空集)。"""
     db = os.environ.get('MAESTRO_LEDGER') or os.path.join(MAESTRO, 'ledger.db')
@@ -256,7 +292,7 @@ def read_tickets():
     except sqlite3.Error:
         return []
     try:
-        return list(con.execute('SELECT ticket_id, state, updated_at FROM tickets'))
+        return list(con.execute('SELECT ticket_id, state, updated_at, deps FROM tickets'))
     except sqlite3.Error:
         return []
     finally:
@@ -264,18 +300,26 @@ def read_tickets():
 
 
 def scan_sla_face(entry, latch, events):
-    """③ SLA 面: 非终态票 updated_at 距今 > ttl_min → sla-overdue;每票 latch
-    只报一次,迁终态/回新鲜/消失复位。返回在飞票(非终态)数 = RENEW 活动票。"""
+    """③ SLA 面: 非终态票分态+依赖感知老化(#122/SLA-TTL)——dispatched/running 按
+    updated_at 距今 > ttl_min → sla-overdue(现行为不变);blocked 分两支: 存在非终态
+    deps=设计内依赖屏障,不计龄不告警;deps 全终态/无 deps/dep 票不可查=真停摆或
+    账本滞后,照常计龄告警。每票 latch 只报一次,迁终态/回新鲜/屏障生效复位。
+    返回在飞票(非终态,含屏障中 blocked)数 = RENEW 活动票。"""
     name = entry.get('name') or 'tickets'
     ttl_min = float(entry.get('ttl_min', SLA_TTL_MIN_DEFAULT))
     now = datetime.now(timezone.utc)
     rows = read_tickets()
+    state_by_id = {tid: st for tid, st, _upd, _deps in rows}
     inflight, overdue_now = 0, set()
-    for tid, state, updated in rows:
+    for tid, state, updated, deps_raw in rows:
         key = f'sla:{tid}'
         if state not in TICKETS_NON_TERMINAL:
             continue  # 终态票: latch 由尾部统一清扫复位
         inflight += 1
+        if state == 'blocked' and dep_barrier(state_by_id, parse_deps(deps_raw)) is not False:
+            # True=设计内依赖屏障: 不计龄不告警;None=deps 不可判定: 保守跳过。
+            # 两者都不入 overdue_now → 已设 latch 由尾部清扫复位(屏障解除需重新过载)。
+            continue
         ts = parse_iso(updated)
         if ts is None:
             continue  # 时间戳缺/坏: 无法判定,保守跳过
@@ -287,7 +331,7 @@ def scan_sla_face(entry, latch, events):
                                'detail': f'ticket={tid} age={age_min:.0f}m>ttl='
                                          f'{ttl_min:g}m state={state}'})
                 latch[key] = True
-    for k in list(latch):  # 迁终态/回新鲜/消失 → latch 复位(再触发需新一轮过载)
+    for k in list(latch):  # 迁终态/回新鲜/消失/屏障生效 → latch 复位(再触发需新一轮过载)
         if k.startswith('sla:') and k not in overdue_now:
             del latch[k]
     return inflight
