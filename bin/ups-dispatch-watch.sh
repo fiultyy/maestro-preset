@@ -8,6 +8,9 @@
 # (设计同 memsvc hooks 家族; fail-open, 不阻回合)。
 # 2026-09-09 增(HOOK-ENVELOPE B′): inflight 第 5 列存信封 FROM(来路即目标);
 #   turn-end-pair.sh 的 ticket-done to 优先取之,空回落 ORCH_SIG(兼容存量 4 列)。
+# 2026-09-09 增(ENVELOPE-SCAN20): 信封识别窗 首行 → 前 20 行(Orca worker-start preamble 占首行,
+#   信封随任务文本后置,原 NR==1 永不命中);优先级 信封行 > preamble sidecar(后者仅无信封时走)。
+#   仍纯字符标记块匹配(只认 DSHMSG] 前缀行),零软契约,fail-open 全保持。
 # env: ORCH_SIG(编排者签名) ORCH_INBOX(桥收件箱) ORCH_INFLIGHT(配对态目录) ORCH_RUNNING(running sidecar)
 STDIN="$(cat 2>/dev/null || :)"
 [ -n "$ORCH_INBOX" ] || ORCH_INBOX="$HOME/.dsh/maestro/bridge/inbox.log"
@@ -26,18 +29,16 @@ SID="$(printf '%s' "$STDIN" | jq -r '.session_id // empty' 2>/dev/null || :)"
 PROMPT="$(printf '%s' "$STDIN" | jq -r '.prompt // empty' 2>/dev/null || :)"
 [ -n "$SID" ] && [ -n "$PROMPT" ] || exit 0
 
-FIRST="$(printf '%s\n' "$PROMPT" | awk 'NR==1')"
-case "$FIRST" in
-  'DSHMSG]'*) : ;;
-  *)
-    # Orca dispatch --inject preamble 分支(running 信号,零契约)
-    if printf '%s\n' "$PROMPT" | head -20 | grep -q "You are a dispatched worker\." 2>/dev/null; then
-      TASKID="$(printf '%s\n' "$PROMPT" | grep -m1 -o 'Your task ID is: *task_[0-9a-f]*' | grep -o 'task_[0-9a-f]*' | head -1)"
-      [ -n "$TASKID" ] || exit 0
-      [ -n "$ORCH_DEBUG" ] && echo "branch: DISPATCH-PREAMBLE task=$TASKID sid=$SID" >> "$ORCH_DEBUG" 2>/dev/null || :
-      ORCH_SIG="$ORCH_SIG" ORCH_RUNNING="$ORCH_RUNNING" TASKID="$TASKID" SID="$SID" \
-      NEWMSGID="$(python3 -c 'import uuid;print(uuid.uuid4())')" \
-      TS="$(date +%s000)" python3 - <<'PYRUN' 2>/dev/null || :
+ENVLINE="$(printf '%s\n' "$PROMPT" | head -20 | grep -am1 '^DSHMSG]' 2>/dev/null || :)"
+if [ -z "$ENVLINE" ]; then
+  # Orca dispatch --inject preamble 分支(running 信号,零契约;ENVELOPE-SCAN20: 仅无信封时走)
+  if printf '%s\n' "$PROMPT" | head -20 | grep -q "You are a dispatched worker\." 2>/dev/null; then
+    TASKID="$(printf '%s\n' "$PROMPT" | grep -m1 -o 'Your task ID is: *task_[0-9a-f]*' | grep -o 'task_[0-9a-f]*' | head -1)"
+    [ -n "$TASKID" ] || exit 0
+    [ -n "$ORCH_DEBUG" ] && echo "branch: DISPATCH-PREAMBLE task=$TASKID sid=$SID" >> "$ORCH_DEBUG" 2>/dev/null || :
+    ORCH_SIG="$ORCH_SIG" ORCH_RUNNING="$ORCH_RUNNING" TASKID="$TASKID" SID="$SID" \
+    NEWMSGID="$(python3 -c 'import uuid;print(uuid.uuid4())')" \
+    TS="$(date +%s000)" python3 - <<'PYRUN' 2>/dev/null || :
 import json, os
 ev = {"type": "ticket-running", "from": os.environ["SID"], "to": os.environ["ORCH_SIG"],
       "body": f"[task:{os.environ['TASKID']}] worker turn started (dispatch-injected) session={os.environ['SID']}",
@@ -45,12 +46,12 @@ ev = {"type": "ticket-running", "from": os.environ["SID"], "to": os.environ["ORC
 with open(os.environ["ORCH_RUNNING"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
 PYRUN
-      exit 0
-    fi
-    exit 0 ;;
-esac
+    exit 0
+  fi
+  exit 0
+fi
 
-ENV_JSON="${FIRST#DSHMSG]}"
+ENV_JSON="${ENVLINE#DSHMSG]}"
 FROM="$(printf '%s' "$ENV_JSON" | jq -r '.from // empty' 2>/dev/null || :)"
 REF="$(printf '%s' "$ENV_JSON" | jq -r '.ref // empty' 2>/dev/null || :)"
 OMSGID="$(printf '%s' "$ENV_JSON" | jq -r '.msgid // empty' 2>/dev/null || :)"
