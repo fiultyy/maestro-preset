@@ -148,8 +148,27 @@ def main():
             r'bytes \d+->\d+', r.stdout) is not None)
         state = json.load(open(os.path.join(st1, 'w-file.json.state.json')))
         grown = os.path.getsize(os.path.join(ev, 'new.jsonl'))
-        check('state 位点推进=当前文件大小', state['files'][os.path.join(ev, 'new.jsonl')] == grown,
+        check('state 位点推进=当前文件大小(按 entry 分桶)',
+              state['files']['relay-events'][os.path.join(ev, 'new.jsonl')] == grown,
               f"state={state['files']}")
+
+        # 多 entry 回归(真值守 2026-08-24 抓到的真 bug): 各 glob 独立分桶——
+        # 平面共享时 entry A 每轮把 entry B 的文件"清出→再落地"发 file-landed 洪水。
+        ev_b = os.path.join(tmp, 'ev-b')
+        os.makedirs(ev_b, exist_ok=True)
+        with open(os.path.join(ev_b, 'b1.jsonl'), 'w') as f:
+            f.write('{"x":1}\n')
+        cfg1m = os.path.join(tmp, 'w-file-multi.json')
+        st1m = os.path.join(tmp, 'st-file-multi')
+        write_cfg(cfg1m, {'interval': 1, 'notify': 'stdout', 'faces': {'file': [
+            {'name': 'fa', 'glob': ev + '/*.jsonl'},
+            {'name': 'fb', 'glob': ev_b + '/*.jsonl'}]}})
+        r = run_once(cfg1m, st1m)
+        check('多 entry 首轮: 全体基线零事件', 'WATCHD-EVENT' not in r.stdout, r.stdout[-150:])
+        r = run_once(cfg1m, st1m)
+        r2 = run_once(cfg1m, st1m)
+        check('多 entry 稳态: 无跨 entry 洪水', 'WATCHD-EVENT' not in r.stdout
+              and 'WATCHD-EVENT' not in r2.stdout)
 
         # DSHMSG 达 owner(notify=session-send → stub)
         StubHandler.records.clear()
@@ -165,8 +184,18 @@ def main():
         with open(os.path.join(ev2, 'x.jsonl'), 'w') as f:
             f.write('{"z":9}\n')
         r = run_once(cfg1s, st1s, extra_env={'MAESTRO_FLEET': os.path.join(tmp, 'fleet.json')})
-        env_lines = [c['payload']['content'][0]['text']
-                     for c in StubHandler.records if c.get('method') == 'session.prompt']
+        # wire 双形容忍(回流修正): session-send v4 默认 DSH_WIRE=slash → method='session/prompt'
+        # 且信文在 payload.args.request.content[0].text;dot 退路=method='session.prompt'
+        # 信文在 payload.content[0].text。断言语义=DSHMSG 达 owner,不钉死 wire 形。
+        def _env_text(c):
+            pay = c.get('payload') or {}
+            req = (pay.get('args') or {}).get('request') or {}
+            node = req if req else pay
+            ct = node.get('content') or [{}]
+            return (ct[0] or {}).get('text')
+        env_lines = [t for t in (_env_text(c) for c in StubHandler.records
+                                 if c.get('method') in ('session.prompt', 'session/prompt'))
+                     if t]
         check('事件经 session-send DSHMSG 达 owner(1 条)', len(env_lines) == 1, f'n={len(env_lines)}')
         if env_lines:
             payload = json.loads(env_lines[0].split(']', 1)[1])
@@ -222,19 +251,82 @@ def main():
         check('条件解除 → latch 复位不再报', 'WATCHD-EVENT' not in r.stdout)
         os.utime(stale_log, (old_ts, old_ts))
 
-        print('\n③④ 留位(sla/lease → NotImplemented 提示,不崩溃不投递):')
-        StubHandler.records.clear()
-        cfg3 = os.path.join(tmp, 'w-stub.json')
-        st3 = os.path.join(tmp, 'st-stub')
-        write_cfg(cfg3, {'interval': 1, 'notify': 'session-send',
-                         'owner': {'from': 'watchd', 'to': 'orch1'},
-                         'faces': {'sla': [{'name': 'ticket-ttl'}],
-                                   'lease': [{'name': 'fleet-lease'}]}})
-        r = run_once(cfg3, st3, extra_env={'MAESTRO_FLEET': os.path.join(tmp, 'fleet.json')})
-        check('sla/lease → WATCHD-STUB NotImplemented ×2', r.returncode == 0
-              and len(re.findall(r'WATCHD-STUB face=sla .*NotImplemented', r.stdout)) == 1
-              and len(re.findall(r'WATCHD-STUB face=lease .*NotImplemented', r.stdout)) == 1)
-        check('留位不投递 DSHMSG(stub 零记录)', not StubHandler.records)
+        print('\n③ SLA 面(非终态票超 ttl → sla-overdue;latch/复位;在飞票=活动票):')
+        # temp ledger: 过载票(updated 5h 前)+新鲜票+终态票;ttl=60m 只该报过载票
+        ldb = os.path.join(tmp, 'ledger.db')
+        import sqlite3 as _sq
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        _now = _dt.now(_tz.utc)
+        con = _sq.connect(ldb)
+        con.execute("""CREATE TABLE IF NOT EXISTS tickets(ticket_id TEXT PRIMARY KEY,
+            title TEXT, state TEXT, deps TEXT DEFAULT '[]', lease_owner TEXT,
+            refs TEXT DEFAULT '{}', outcome TEXT, updated_at TEXT)""")
+        con.executemany(
+            "INSERT INTO tickets(ticket_id,title,state,updated_at) VALUES(?,?,?,?)",
+            [('T-OLD', '过载票', 'running', (_now - _td(hours=5)).isoformat()),
+             ('T-NEW', '新鲜票', 'running', _now.isoformat()),
+             ('T-DONE', '终态票', 'done', (_now - _td(hours=9)).isoformat())])
+        con.commit(); con.close()
+        cfg3 = os.path.join(tmp, 'w-sla.json')
+        st3 = os.path.join(tmp, 'st-sla')
+        write_cfg(cfg3, {'interval': 1, 'notify': 'stdout',
+                         'faces': {'sla': [{'name': 'ticket-ttl', 'ttl_min': 60}]}})
+        r = run_once(cfg3, st3, extra_env={'MAESTRO_LEDGER': ldb})
+        check('过载票 → sla-overdue(新鲜/终态不报)', r.returncode == 0
+              and 'sla-overdue watch=ticket-ttl face=sla ticket=T-OLD' in r.stdout
+              and r.stdout.count('sla-overdue') == 1, r.stdout[-200:])
+        r = run_once(cfg3, st3, extra_env={'MAESTRO_LEDGER': ldb})
+        check('SLA latch: 重放零回声', 'sla-overdue' not in r.stdout)
+        con = _sq.connect(ldb)  # 票迁终态 → latch 复位语义面(再触发需新一轮过载)
+        con.execute("UPDATE tickets SET state='done' WHERE ticket_id='T-OLD'")
+        con.commit(); con.close()
+        r = run_once(cfg3, st3, extra_env={'MAESTRO_LEDGER': ldb})
+        check('票迁终态 → 不再报', 'sla-overdue' not in r.stdout)
+
+        print('\n④ 租约面(fleet owner lease 过期 → lease-expired;有效租约=活动票):')
+        flt = os.path.join(tmp, 'fleet34.json')
+        with open(flt, 'w') as fh:
+            json.dump({'fleet': {
+                'exp1': {'owner': 'orchX', 'leaseExpiresAt': '2026-08-24T00:00:00+00:00'},
+                'alive1': {'owner': 'orchY', 'leaseExpiresAt': '2099-01-01T00:00:00+00:00'},
+                'noown': {'status': 'active'}}}, fh)
+        cfg4 = os.path.join(tmp, 'w-lease.json')
+        st4 = os.path.join(tmp, 'st-lease')
+        write_cfg(cfg4, {'interval': 1, 'notify': 'stdout',
+                         'faces': {'lease': [{'name': 'fleet-lease'}]}})
+        r = run_once(cfg4, st4, extra_env={'MAESTRO_FLEET': flt})
+        check('过期租约 → lease-expired(有效/无主不报)', r.returncode == 0
+              and 'lease-expired watch=fleet-lease face=lease code=exp1 owner=orchX' in r.stdout
+              and r.stdout.count('lease-expired') == 1, r.stdout[-200:])
+        r = run_once(cfg4, st4, extra_env={'MAESTRO_FLEET': flt})
+        check('租约 latch: 重放零回声', 'lease-expired' not in r.stdout)
+
+        print('\n★ 在飞票 → RENEW 活动票(sla 面配置时寿命随在飞票延长):')
+        cfg3r = os.path.join(tmp, 'w-sla-renew.json')
+        st3r = os.path.join(tmp, 'st-sla-renew')
+        write_cfg(cfg3r, {'interval': 0.3, 'max_rounds': 2, 'notify': 'stdout',
+                          'faces': {'sla': [{'name': 'ticket-ttl', 'ttl_min': 60}]}})
+        out3r = open(os.path.join(tmp, 'sla-renew.out'), 'w+')
+        d3r = spawn_daemon(cfg3r, st3r, out3r, extra_env={'MAESTRO_LEDGER': ldb})
+        renewed3 = False
+        deadline = time.time() + 15.0   # 补丁批: 满载下 5s 窗口偏紧,放宽 15s
+        while time.time() < deadline:
+            if 'WATCHD-RENEW' in open(out3r.name).read():
+                renewed3 = True
+                break
+            if d3r.poll() is not None:
+                break
+            time.sleep(0.1)
+        check('在飞票存在 → WATCHD-RENEW 顺延', renewed3 and d3r.poll() is None,
+              f'poll={d3r.poll()} renewed={renewed3}')
+        con = _sq.connect(ldb)  # 全部迁终态 → 活动消失 → 退场
+        con.execute("UPDATE tickets SET state='done'")
+        con.commit(); con.close()
+        rc3 = d3r.wait(timeout=15)
+        c3r = open(out3r.name).read()
+        check('在飞票清空 → WATCHD-EXIT 退场(非杀)', rc3 == 0
+              and 'WATCHD-EXIT reason=max-rounds-reached' in c3r, f'rc={rc3}')
+        out3r.close()
 
         print('\n⑤ 单实例锁 + SIGTERM 优雅退出(无残留进程/锁):')
         cfg5 = os.path.join(tmp, 'w-resident.json')
@@ -271,7 +363,7 @@ def main():
         # 加载加固 b): 固定 sleep 1.0s 在满载下会错过 round2 边界;改轮询等 RENEW 落盘
         # (边界 0.6s,余量 5s;daemon 若已退出则提前跳出交由下一检查报错)。
         renewed = False
-        deadline = time.time() + 5.0
+        deadline = time.time() + 15.0   # 补丁批: 满载下 5s 窗口偏紧,放宽 15s
         while time.time() < deadline:
             if 'WATCHD-RENEW' in open(out6.name).read():
                 renewed = True
