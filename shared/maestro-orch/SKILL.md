@@ -40,7 +40,7 @@ orch-dag seat-open --project <path>                    # 编排席终端幂等�
 orch-dag run "<objective>"                             # 幂等建/续 Run
 orch-dag task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝
 orch-dag seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
-orch-dag wait [--timeout-ms MS]                        # 收尾排水(完成信号本体=回调,见「回调单车道」): worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
+orch-dag wait [--timeout-ms MS]                        # check --wait 已退役;收尾排水(完成信号本体=回调,见「回调单车道」): worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
 orch-dag reply --msg <id> --body <t>                   # question 应答
 orch-dag close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口)
 orch-dag status [--ref R]                              # run/task/dispatch + ticket + node 并排(只读)
@@ -50,7 +50,7 @@ orch-dag status [--ref R]                              # run/task/dispatch + tic
 
 ## 完成等待 — 回调单车道(ORCH-WAKE 契约,ADR-0001)
 
-**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**`check --wait` 已从操作面退役**——阻塞等待循环不再出现在任何契约;`check --peek` 仅作只读诊断(**已废弃**标记),不消费、不作等待手段。前置硬门: `orch dispatch`(含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
+**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**`check --wait` 已从操作面退役**——阻塞等待循环不再出现在任何契约;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段。前置硬门: `orch dispatch`(含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
 
 多 worker 异步收件语义(桥 inbox,凭据: ORCH-WAKE 事故定界):
 
@@ -88,7 +88,7 @@ ORCA orchestration dispatch --inject --to <terminal-handle> --task <task_id>
 # 完成等待 = 回调唯一: worker_done 原生唤醒编排席回合,不轮询(check --wait 已退役)
 ORCA orchestration check --ack <deliveryId>            # 仅对已收到的 delivery 结算
 ORCA orchestration worker-release --dispatch <ctx>
-# ORCA orchestration check --peek: 已废弃,只读诊断 —— 仅排障看未读,不消费、不作等待手段
+# ORCA orchestration check --peek: 已退役(deprecated),只读诊断 —— 仅排障看未读,不消费、不作等待手段
 ```
 
 - worker_done 原生结算 task/dispatch,**勿再补 `task-update --status completed`**(重复结算)。
