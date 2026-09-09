@@ -6,7 +6,7 @@
                 [--no-ticket] [--dry-run] [--json]
   orch settle   [--run <run_id>] [--project <key|path>] [--json]
                 (--payload-file <f> | --payload <json> | --payload -)   # 回调收讫结算(非阻塞;阻塞 wait 已退役)
-  orch dag-seat-open --project <path> [--title T]     # dag 族: 编排席终端幂等创建/复用
+  orch dag-seat-open --project <path> [--title T] [--base-branch B]   # dag 族: 编排席终端幂等创建/复用
   orch dag-run "<objective>"                          # dag 族: 幂等建/续 Run
   orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
   orch dag-seat <REF> [--name <worktree>]             # dag 族: worker-start(omp×新顶层worktree)+dispatched 双写
@@ -44,8 +44,9 @@
     agent 固定 omp、worktree 固定 new-top-level、tickets 环强制勾稽、零模式旗标;
     deps 屏障三层=本地依赖未建 fail-loud → Orca task_not_startable 硬拒绝透传 →
     ledger 票面 deps 未就绪拒迁 running/done;派发链四命令(dag-seat-open/run/task/
-    seat)同过 bridge 武装硬门(V3: 未武装拒派);状态文件 ORCH_DAG_STATE(缺省
-    <state>/orch-dag.json,承 orch-dag 旧档)。
+    seat)同过 bridge 武装硬门(V3: 未武装拒派);--base-branch 收编自 dbdeb83
+    (repo 默认基点变更后的双保险: 落 state.worker_base_ref,dag-seat 透传 worker-start);
+    状态文件 ORCH_DAG_STATE(缺省 <state>/orch-dag.json,承 orch-dag 旧档)。
   - fail-loud(ops 工具非 hook): 失败非零退出 + 明确 stderr,不静默吞;不打印任何 token/secret。
 环境:
   ORCH_BIN          覆盖 orca CLI(测试 stub 注入口;最高优先)
@@ -768,8 +769,14 @@ def dag_ticket_refs(ref):
 def cmd_dag_seat_open(a):
     bridge_arm_gate()   # ORCH-UNIFY V3: 派发链全路径过武装门
     s = dag_load()
+    if a.base_branch:   # dbdeb83 收编: worker-start 显式基点(repo 默认基点变更后的双保险)
+        s['worker_base_ref'] = a.base_branch
     if s.get('seat'):
-        print(f"seat: 复用 {s['seat']}")
+        if a.base_branch:
+            dag_save(s)
+            print(f"seat: 复用 {s['seat']}(worker_base_ref={a.base_branch})")
+        else:
+            print(f"seat: 复用 {s['seat']}")
         return
     project = os.path.abspath(a.project)
     doc = orca_json(['worktree', 'list'], 'worktree list')
@@ -859,9 +866,11 @@ def cmd_dag_seat(a):
         die(f"ref 未建 task: {a.ref}(先 orch dag-task {a.ref})", 64)
     tid = s['refs'][a.ref]['orca_task']
     name = a.name or a.ref.lower()
-    doc = orca_json(['orchestration', 'worker-start', '--from', seat, '--task', tid,
-                     '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT],
-                    f'worker-start({a.ref})')
+    ws_args = ['orchestration', 'worker-start', '--from', seat, '--task', tid,
+               '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT]
+    if s.get('worker_base_ref'):   # dbdeb83 收编: 显式基点双保险
+        ws_args += ['--base-branch', s['worker_base_ref']]
+    doc = orca_json(ws_args, f'worker-start({a.ref})')
     ctx = _dag_doc_id(doc, f'worker-start({a.ref})', 'dispatchId', 'dispatch_id', 'dispatch', prefix='ctx_')
     dag_ensure_project(s['project'])   # 账本空库自举: node 写路径要求项目在册(ledger resolve_project fail-loud)
     run_ledger(['ticket', 'refs-set', a.ref, '--json',
@@ -1651,6 +1660,18 @@ def cmd_selftest(a):
         c.check('S22 refs-set 落 dispatch/worktree/agent', str(drefs.get('dispatch', '')).startswith('ctx_')
                 and drefs.get('worktree') == 'dr-1' and drefs.get('agent') == 'omp', str(drefs))
 
+        # S22b --base-branch 双保险(dbdeb83 语义收编): state.worker_base_ref → worker-start 透传
+        p = _orch(['dag-seat-open', '--project', proj, '--base-branch', 'feat/gui-cockpit-nav'], env, cwd=proj)
+        c.check('S22b 复用席位+基点更新 rc=0', p.returncode == 0 and 'worker_base_ref' in p.stdout,
+                p.stdout + p.stderr)
+        st = json.load(open(dstate))
+        c.check('S22b state.worker_base_ref 落态', st.get('worker_base_ref') == 'feat/gui-cockpit-nav', str(st))
+        p = _orch(['dag-seat', 'DR-2'], env, cwd=proj)
+        c.check('S22b dag-seat DR-2 rc=0', p.returncode == 0, p.stderr)
+        ws2 = [x for x in calls() if x[:2] == ['orchestration', 'worker-start']]
+        c.check('S22b worker-start 带显式 --base-branch', len(ws2) == 2 and '--base-branch' in ws2[1]
+                and ws2[1][ws2[1].index('--base-branch') + 1] == 'feat/gui-cockpit-nav', str(ws2[1]))
+
         # S23 dag-settle: worker_done 回调收讫→running「复验待关账」+ 幂等 + deps 第三层屏障
         p = _orch(['dag-settle', 'DR-1', '--outcome', 'DR-1 落地'], env, cwd=proj)
         c.check('S23 settle rc=0', p.returncode == 0, p.stderr)
@@ -1747,6 +1768,7 @@ def main():
     p = sub.add_parser('dag-seat-open', help='dag 族: 编排席终端幂等创建/复用(派发链,前置 bridge 武装硬门)')
     p.add_argument('--project', required=True, help='项目路径(须在 Orca 树;缺参 argparse 层 exit 2)')
     p.add_argument('--title', default=DAG_SEAT_TITLE)
+    p.add_argument('--base-branch', help='worker-start 显式基点分支(state.worker_base_ref;缺省用 repo 默认)')
     p.set_defaults(f=cmd_dag_seat_open)
     p = sub.add_parser('dag-run', help='dag 族: 幂等建/续 Run')
     p.add_argument('objective')
