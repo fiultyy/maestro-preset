@@ -9,6 +9,9 @@
   orch dag-seat-open --project <path> [--title T] [--base-branch B]   # dag 族: 编排席终端幂等创建/复用
   orch dag-run "<objective>"                          # dag 族: 幂等建/续 Run
   orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
+  # HOOK-ENVELOPE: dag-task 落 task 文本首行自动构造 DSHMSG 派票信封(from=编排席签名,to="-",type=dispatch,ref=票REF,msgid=uuid4,ver=3;
+  #   消费端 ups 钩 NR==1 只认首行 → 落 inflight(5 列含 FROM) → turn_end 配对回 ticket-done(to=信封 FROM 来路即目标);
+  #   签名回落链: --orch-sig 旗标 → env ORCH_SIG → dag-seat --orch-sig 落态 → MAESTRO_ORCH_SIGNATURE → bridge/orch.signature → orch-p0)
   orch dag-seat <REF> [--name <worktree>]             # dag 族: worker-start(omp×新顶层worktree)+dispatched 双写
   orch reply    --msg <msg_id> (--body <text> | --body-file <f>) [--run <run_id>] [--json]
   orch status   [--run <run_id>] [--ref <ref>] [--project <key|path>] [--json]
@@ -62,7 +65,7 @@
 退出码: 0 成功 · 1 状态机/重复拒绝/bridge 未武装硬门 · 2 question(等裁决) · 3 escalation(已 ack+release)
         5 运行失败 · 64 用法错误(缺参由 argparse 层 exit 2,dag 族契约同)
 """
-import argparse, json, os, re, sqlite3, subprocess, sys, tempfile
+import argparse, json, os, re, sqlite3, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 
 # ── 路径与 CLI 解析 ───────────────────────────────────────────────────────────
@@ -834,7 +837,9 @@ def cmd_dag_task(a):
         if d not in s['refs'] or not s['refs'][d].get('orca_task'):
             die(f'依赖 ref 未建 task: {d}(先 orch dag-task {d})—— deps 硬屏障(本地层)', 1)
     dep_ids = [s['refs'][d]['orca_task'] for d in deps]
-    args = ['orchestration', 'task-create', '--from', seat, '--task-title', a.title, '--spec', a.spec]
+    sig = dag_orch_sig(a.orch_sig, s)
+    spec = dag_envelope(sig, a.ref) + '\n' + a.spec   # HOOK-ENVELOPE: 信封必须首行,任务书正文原样跟随
+    args = ['orchestration', 'task-create', '--from', seat, '--task-title', a.title, '--spec', spec]
     if dep_ids:
         args += ['--deps', json.dumps(dep_ids)]   # 第二层: Orca task_not_startable 硬拒绝透传
     doc = orca_json(args, f'task-create({a.ref})')
@@ -849,12 +854,30 @@ def cmd_dag_task(a):
                 '--source', 'orch-dag'], f'ticket add 失败({a.ref})')
     s['refs'][a.ref] = {'orca_task': tid, 'ticket': True}
     dag_save(s)
-    print(f'task: {a.ref} -> {tid}')
+    print(f'task: {a.ref} -> {tid} (信封首行 from={sig})')
 
 def dag_ensure_project(project):
     """项目未登记才补注册(幂等 upsert,同 cmd_dispatch 派发路径;账本空库自举)。"""
     if resolve_project_key(project) is None:
         run_ledger(['project', project, os.path.basename(str(project).rstrip('/')) or 'proj'])
+
+def dag_orch_sig(flag, state=None):
+    """HOOK-ENVELOPE 信封 from 编排席签名回落链: --orch-sig 旗标 → env ORCH_SIG →
+    dag state.orch_sig(dag-seat --orch-sig 落态)→ orch_sig() 既有链(MAESTRO_ORCH_SIGNATURE
+    → bridge/orch.signature)→ 'orch-p0'(消费端 ups/turn-end 同款末位兜底)。
+    禁硬编码单一席位 = 旗标/env 恒优先,字面值仅全链落空时兜底。"""
+    return ((flag or '').strip() or os.environ.get('ORCH_SIG', '').strip()
+            or ((state or {}).get('orch_sig') or '').strip() or orch_sig() or 'orch-p0')
+
+
+def dag_envelope(sig, ref):
+    """DSHMSG 派票信封(HOOK-ENVELOPE A′): 必须落 task 文本首行(消费端 ups 钩
+    awk NR==1 只认首行)。to='-'(worker 签名派发时不可知,消费端只取 from/ref/msgid);
+    type=dispatch;ref=票 REF;msgid 唯一(uuid4);ver=3。"""
+    return 'DSHMSG]' + json.dumps(
+        {'from': sig, 'to': '-', 'type': 'dispatch', 'ref': ref or 'dispatch',
+         'msgid': str(uuid.uuid4()), 'ver': 3}, ensure_ascii=False)
+
 
 def cmd_dag_seat(a):
     bridge_arm_gate()
@@ -865,6 +888,9 @@ def cmd_dag_seat(a):
     if a.ref not in s['refs'] or not s['refs'][a.ref].get('orca_task'):
         die(f"ref 未建 task: {a.ref}(先 orch dag-task {a.ref})", 64)
     tid = s['refs'][a.ref]['orca_task']
+    if a.orch_sig:   # HOOK-ENVELOPE: 席位级编排席签名落态(dag-task 信封 from 回落链一环)
+        s['orch_sig'] = a.orch_sig.strip()
+        dag_save(s)
     name = a.name or a.ref.lower()
     ws_args = ['orchestration', 'worker-start', '--from', seat, '--task', tid,
                '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT]
@@ -880,7 +906,8 @@ def cmd_dag_seat(a):
                 'dispatched', '--refs',
                 json.dumps({'run': s['run'], 'orca_task': tid, 'dispatch': ctx}, ensure_ascii=False)],
                f'ledger node 失败({a.ref})')
-    print(f'seat: {a.ref} dispatched dispatch={ctx}')
+    print(f'seat: {a.ref} dispatched dispatch={ctx}'
+          + (f" orch_sig={s['orch_sig']}" if s.get('orch_sig') else ''))
 
 def cmd_dag_settle(a):
     """worker_done 回调收讫(ADR-013 单车道): 票/node → running「复验待关账」。
@@ -1626,21 +1653,6 @@ def cmd_selftest(a):
             return None
         c.check('S21 Orca --deps 瀑布透传(V4)', tc_deps('T2') == [tid1] and tc_deps('T3') == [tid1, tid2], str(tcs))
 
-        # S21b 全新账本(ledger.db 尚未建)dag-task 不崩 + ledger 自举
-        #   (ORCH-UNIFY 修: 只读连接 connect 失败与查询失败分离;旧写法 finally 踩未绑定 c)
-        freshenv = dict(env)
-        freshenv['MAESTRO_LEDGER'] = os.path.join(tmp, 'fresh-ledger.db')
-        freshenv['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fresh2.json')
-        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {}},
-                  open(freshenv['ORCH_DAG_STATE'], 'w'))
-        p = _orch(['dag-task', 'DF-1', '--title', 'F1', '--spec', 'f1'], freshenv, cwd=proj)
-        c.check('S21b 全新账本 dag-task rc=0 无 Traceback', p.returncode == 0
-                and 'Traceback' not in p.stderr, p.stderr[-200:])
-        freshdb = sqlite3.connect(freshenv['MAESTRO_LEDGER'])
-        frow = freshdb.execute("SELECT state FROM tickets WHERE ticket_id='DF-1'").fetchone()
-        freshdb.close()
-        c.check('S21b ledger 自举写票 dispatched', bool(frow) and frow[0] == 'dispatched', str(frow))
-
         # S22 dag-seat 派发: worker-start(硬编码 omp×new-top-level)+ node/ticket/state 多写
         p = _orch(['dag-seat', 'DR-1'], env, cwd=proj)
         c.check('S22 dag-seat rc=0', p.returncode == 0, p.stderr)
@@ -1671,6 +1683,119 @@ def cmd_selftest(a):
         ws2 = [x for x in calls() if x[:2] == ['orchestration', 'worker-start']]
         c.check('S22b worker-start 带显式 --base-branch', len(ws2) == 2 and '--base-branch' in ws2[1]
                 and ws2[1][ws2[1].index('--base-branch') + 1] == 'feat/gui-cockpit-nav', str(ws2[1]))
+        # S21e 信封上车(HOOK-ENVELOPE A′): dag-task 注入文本首行=合法 DSHMSG 信封,正文原样跟随
+        def tc_spec(title):
+            for x in calls():   # 每次现读: 此 helper 供后续新 dag-task 断言复用
+                if (x[:2] == ['orchestration', 'task-create'] and '--task-title' in x
+                        and x[x.index('--task-title') + 1] == title):
+                    return x[x.index('--spec') + 1]
+            return None
+        sp1 = tc_spec('T1') or ''
+        first = sp1.split('\n', 1)[0]
+        envj = {}
+        try:
+            envj = json.loads(first[len('DSHMSG]'):]) if first.startswith('DSHMSG]') else {}
+        except json.JSONDecodeError:
+            envj = {}
+        c.check('S21e 注入文本首行 DSHMSG 信封 jq 可析', bool(envj), first[:120])
+        c.check('S21e from=回落链(env ORCH_SIG)', envj.get('from') == 'test-orch@test-session', str(envj))
+        c.check('S21e ref=票REF type=dispatch ver=3 to=-',
+                envj.get('ref') == 'DR-1' and envj.get('type') == 'dispatch'
+                and envj.get('ver') == 3 and envj.get('to') == '-', str(envj))
+        c.check('S21e msgid 唯一(uuid4)',
+                len(str(envj.get('msgid', ''))) == 36 and envj.get('msgid', '').count('-') == 4,
+                str(envj.get('msgid')))
+        c.check('S21e 正文原样跟在信封后', sp1.split('\n', 1)[1] == 's1', repr(sp1[:40]))
+        p = _orch(['dag-task', 'DR-ENV', '--title', 'TE', '--spec', 'se',
+                   '--orch-sig', 'alt-orch@session-alt'], env, cwd=proj)
+        c.check('S21e --orch-sig 覆盖回落链 rc=0', p.returncode == 0, p.stderr[-160:])
+        spe = tc_spec('TE') or ''
+        try:
+            envy = json.loads(spe.split('\n', 1)[0][len('DSHMSG]'):])
+        except (json.JSONDecodeError, IndexError):
+            envy = {}
+        c.check('S21e --orch-sig 传入值即 from', envy.get('from') == 'alt-orch@session-alt', spe[:120])
+        msg1 = str(envj.get('msgid'))
+        msg2 = str(envy.get('msgid'))
+        c.check('S21e msgid 跨票唯一', msg1 != msg2, f'{msg1} vs {msg2}')
+
+        # S21f 回落链槽位(HOOK-ENVELOPE): env 缺席时 seat 落态 → signature 文件 → 单元级末位兜底
+        fenv = dict(env)
+        fenv.pop('ORCH_SIG', None)
+        fenv['MAESTRO_HOME'] = tmp   # orch_sig() 文件链定向到 $MAESTRO_HOME/maestro/bridge/orch.signature
+        sigdir = os.path.join(tmp, 'maestro', 'bridge')
+        fbin = os.path.join(tmp, 'maestro', 'bin')   # LEDGER_BIN 随 MAESTRO_DIR 重定向 → 符号链接回真身
+        os.makedirs(fbin, exist_ok=True)
+        _real_ledger = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin', 'ledger')
+        if not os.path.exists(os.path.join(fbin, 'ledger')):
+            os.symlink(_real_ledger, os.path.join(fbin, 'ledger'))
+        os.makedirs(sigdir, exist_ok=True)
+        with open(os.path.join(sigdir, 'orch.signature'), 'w') as f:
+            f.write('file-orch@session-file')
+        freg = os.path.join(tmp, 'bridge-registry-fenv.json')
+        with open(freg, 'w') as f:
+            json.dump({'version': '4.1.0', 'consumers': {
+                'session-file': {'alias': 'file-orch', 'pid': os.getpid(), 'armedAt': now()},
+                'session-seat': {'alias': 'seat-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
+        fenv['ORCH_BRIDGE_REGISTRY'] = freg
+        fenv['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fenv.json')
+        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {}},
+                  open(fenv['ORCH_DAG_STATE'], 'w'))
+        p = _orch(['dag-task', 'DR-F1', '--title', 'FLTF', '--spec', 'ff'], fenv, cwd=proj)
+        c.check('S21f env 缺席 → signature 文件链 rc=0', p.returncode == 0, p.stderr[-200:])
+        spf = tc_spec('FLTF') or ''
+        try:
+            envf = json.loads(spf.split('\n', 1)[0][len('DSHMSG]'):])
+        except (json.JSONDecodeError, IndexError):
+            envf = {}
+        c.check('S21f 文件链签名即 from', envf.get('from') == 'file-orch@session-file', spf[:120])
+        p = _orch(['dag-seat', 'DR-F1', '--orch-sig', 'seat-orch@session-seat'], fenv, cwd=proj)
+        c.check('S21f dag-seat --orch-sig rc=0', p.returncode == 0, p.stderr[-160:])
+        stf = json.load(open(fenv['ORCH_DAG_STATE']))
+        c.check('S21f 席位级签名落 state.orch_sig', stf.get('orch_sig') == 'seat-orch@session-seat', str(stf))
+        p = _orch(['dag-task', 'DR-F2', '--title', 'FLTS', '--spec', 'f2'], fenv, cwd=proj)
+        spf2 = tc_spec('FLTS') or ''
+        try:
+            envf2 = json.loads(spf2.split('\n', 1)[0][len('DSHMSG]'):])
+        except (json.JSONDecodeError, IndexError):
+            envf2 = {}
+        c.check('S21f seat 落态签名即 from', p.returncode == 0
+                and envf2.get('from') == 'seat-orch@session-seat', spf2[:120])
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _sfl
+        _loader = _sfl('orch_mod_selftest', os.path.abspath(__file__))   # 无扩展名脚本须显式 loader
+        _spec_o = _ilu.spec_from_loader('orch_mod_selftest', _loader)
+        _om = _ilu.module_from_spec(_spec_o)
+        _loader.exec_module(_om)
+        _saved_sig = os.environ.pop('ORCH_SIG', None)
+        _saved_md = _om.MAESTRO_DIR   # 模块常量已按进程环境绑定;单元检查直接指向无 signature 的隔离路径
+        _om.MAESTRO_DIR = os.path.join(tmp, 'no-sig-home', 'maestro')
+        try:
+            c.check('S21f 全链落空末位兜底 orch-p0(消费端同款)',
+                    _om.dag_orch_sig(None, None) == 'orch-p0', _om.dag_orch_sig(None, None))
+            c.check('S21f 旗标恒优先(禁硬编码单席)',
+                    _om.dag_orch_sig('flag-orch@session-flag', {'orch_sig': 'seat@session-s'}) ==
+                    'flag-orch@session-flag', '')
+        finally:
+            if _saved_sig is not None:
+                os.environ['ORCH_SIG'] = _saved_sig
+            _om.MAESTRO_DIR = _saved_md
+
+        # S21b 全新账本(ledger.db 尚未建)dag-task 不崩 + ledger 自举
+        #   (ORCH-UNIFY 修: 只读连接 connect 失败与查询失败分离;旧写法 finally 踩未绑定 c)
+        freshenv = dict(env)
+        freshenv['MAESTRO_LEDGER'] = os.path.join(tmp, 'fresh-ledger.db')
+        freshenv['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fresh2.json')
+        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {}},
+                  open(freshenv['ORCH_DAG_STATE'], 'w'))
+        p = _orch(['dag-task', 'DF-1', '--title', 'F1', '--spec', 'f1'], freshenv, cwd=proj)
+        c.check('S21b 全新账本 dag-task rc=0 无 Traceback', p.returncode == 0
+                and 'Traceback' not in p.stderr, p.stderr[-200:])
+        freshdb = sqlite3.connect(freshenv['MAESTRO_LEDGER'])
+        frow = freshdb.execute("SELECT state FROM tickets WHERE ticket_id='DF-1'").fetchone()
+        freshdb.close()
+        c.check('S21b ledger 自举写票 dispatched', bool(frow) and frow[0] == 'dispatched', str(frow))
+
 
         # S23 dag-settle: worker_done 回调收讫→running「复验待关账」+ 幂等 + deps 第三层屏障
         p = _orch(['dag-settle', 'DR-1', '--outcome', 'DR-1 落地'], env, cwd=proj)
@@ -1778,10 +1903,12 @@ def main():
     p.add_argument('--title', required=True)
     p.add_argument('--spec', required=True)
     p.add_argument('--deps', help='逗号分隔依赖 ref(须先 dag-task 建齐)')
+    p.add_argument('--orch-sig', help='信封 from 编排席签名(HOOK-ENVELOPE;回落链: 旗标 → env ORCH_SIG → dag-seat --orch-sig 落态 → MAESTRO_ORCH_SIGNATURE → bridge/orch.signature → orch-p0)')
     p.set_defaults(f=cmd_dag_task)
     p = sub.add_parser('dag-seat', help='dag 族: worker-start(硬编码 omp×new-top-level)+dispatched 双写')
     p.add_argument('ref')
     p.add_argument('--name', help='worktree 名(缺省 ref 小写)')
+    p.add_argument('--orch-sig', help='席位级编排席签名(落 dag state.orch_sig;后续 dag-task 信封 from 回落链一环)')
     p.set_defaults(f=cmd_dag_seat)
     p = sub.add_parser('dag-settle', help='dag 族: worker_done 回调收讫→票/node running「复验待关账」')
     p.add_argument('ref')
