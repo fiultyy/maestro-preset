@@ -49,6 +49,12 @@ orch dag-seat-open --project <path> [--base-branch B]        # 编排席终端�
 orch dag-run "<objective>"                             # 幂等建/续 Run
 orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝(本地未建依赖先行 fail-loud)
 orch dag-seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
+# 信封口径(HOOK-ENVELOPE,#133 A′): dag-task 落 task 文本首行自动构造 DSHMSG 派票信封
+#   {"from":"<编排席签名>","to":"-","type":"dispatch","ref":"<票REF>","msgid":"<uuid4>","ver":3}
+#   ——消费端 ups 钩 NR==1 只认首行 → 落 inflight(5 列含 FROM)→ turn_end 配对回 ticket-done(to=信封 FROM,来路即目标);
+#   --orch-sig 用法: dag-task --orch-sig <alias>@<sessionId> 直接定信封 from;缺省回落链 = 旗标 → env ORCH_SIG →
+#   dag-seat --orch-sig(席位级落 state.orch_sig)→ env MAESTRO_ORCH_SIGNATURE → bridge/orch.signature → orch-p0(末位兜底);
+#   禁硬编码单一席位,多席各带各的 --orch-sig。
 # 完成等待 = 回调唯一(见「回调单车道」): worker_done 原生唤醒编排席回合;收讫记账:
 orch dag-settle <REF> [--outcome "<≤300字>"] [--dispatch <ctx>]   # 票/node → running「复验待关账」;重复回调幂等
 orch dag-close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口,手工)

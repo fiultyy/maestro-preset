@@ -2,6 +2,8 @@
 
 机制: 派票信封 DSHMSG]{...} 于用户 prompt 进入时解析 → 回 ticket-received + 落 inflight;
 回合终结 → 配对清 inflight + 回 ticket-done。无信封/无 inflight = 静默。fail-open。
+信封生产端已接——dag-seat 注入，来路即目标（2026-09-09 HOOK-ENVELOPE #133：dag-task 落 task 文本首行构造信封，
+inflight 第 5 列存 FROM，ticket-done 的 to 优先取之、空回落 ORCH_SIG；--orch-sig 回落链见 maestro-orch SKILL.md）。
 
 | harness | 挂载点 | 配置/文件 | 钩点映射 |
 |---|---|---|---|
