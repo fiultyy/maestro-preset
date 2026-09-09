@@ -145,9 +145,11 @@ def cmd_seat(a):
     if a.ref not in s["refs"]: die(f"ref 未建 task: {a.ref}(先 task {a.ref})")
     tid = s["refs"][a.ref]["orca_task"]
     name = a.name or a.ref.lower()
-    r = orca_json(["orchestration", "worker-start", "--from", seat, "--task", tid,
-                   "--worktree", WORKTREE_MODE, "--name", name, "--agent", AGENT],
-                  f"worker-start 失败({a.ref})")
+    ws_args = ["orchestration", "worker-start", "--from", seat, "--task", tid,
+               "--worktree", WORKTREE_MODE, "--name", name, "--agent", AGENT]
+    if s.get("worker_base_ref"):
+        ws_args += ["--base-branch", s["worker_base_ref"]]
+    r = orca_json(ws_args, f"worker-start 失败({a.ref})")
     if not r.get("ok"): die(f"worker-start 未受理: {json.dumps(r)[:300]}")
     res = r.get("result") or {}
     dispatch = (res.get("dispatch") or {}).get("id") or res.get("dispatchId") or ""
