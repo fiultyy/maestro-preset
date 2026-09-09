@@ -31,6 +31,9 @@
     delivery 不二次 ack/收尾/记账;同一 ref 重复 dispatch 默认拒(--force 放行并记 duplicate)。
   - 零实弹默认: 所有 orca-ide 调用可经 ORCH_BIN 注入 stub;--dry-run 只打印命令序列,
     零 orca/ledger 写路径调用。实弹冒烟归编排席。
+  - bridge 武装硬门(ORCH-WAKE ②): check --wait 已退役,回调是完成等待唯一手段 ——
+    dispatch(含 --dry-run)要求本席在 bridge/registry.json 有在册 consumer(非 stale),
+    否则 exit 1 并给 arm 指引;无回信地址的派工其完成信号必然丢失,故默认强制。
   - fail-loud(ops 工具非 hook): 失败非零退出 + 明确 stderr,不静默吞;不打印任何 token/secret。
 环境:
   ORCH_BIN          覆盖 orca CLI(测试 stub 注入口;最高优先)
@@ -40,8 +43,10 @@
   MAESTRO_LEDGER    ledger.db 路径覆盖(透传给 ledger CLI,自测隔离用)
   ORCH_STATE_DIR    状态文件目录覆盖(默认 <maestro>/state;自测隔离用)
   ORCH_RUNNING_LOG  running 帧 sidecar 覆盖(默认 <maestro>/orch-hooks/running.log)
-  ORCH_SIG          本席签名(to 寻址匹配;缺省 MAESTRO_ORCH_SIGNATURE 或 bridge/orch.signature)
-退出码: 0 成功 · 1 状态机/重复拒绝 · 2 question(等裁决) · 3 escalation(已 ack+release)
+  ORCH_SIG          本席签名(to 寻址匹配;缺省 MAESTRO_ORCH_SIGNATURE 或 bridge/orch.signature;
+                     亦为 bridge 武装硬门的 caller 身份)
+   ORCH_BRIDGE_REGISTRY  bridge/registry.json 路径覆盖(硬门在册检查;自测隔离用)
+退出码: 0 成功 · 1 状态机/重复拒绝/bridge 未武装硬门 · 2 question(等裁决) · 3 escalation(已 ack+release)
         4 超时检查点(不记失败) · 5 运行失败 · 64 用法错误
 """
 import argparse, json, os, re, sqlite3, subprocess, sys, tempfile
@@ -367,6 +372,38 @@ def orch_sig():
     except OSError:
         return None
 
+# ── bridge 武装硬门(ORCH-WAKE 契约修复②,用户裁决 2026-09-09) ─────────────────
+# 「CB 桥武装应该默认强制的。契约中完全移除 check --wait,反而是武装回调是唯一
+#  选项,减少 agent 行为选择性。」—— 回调是完成等待的唯一手段后,无回信地址的
+# 派工其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。故 dispatch(含 --dry-run)前置
+# 硬门: caller 会话(orch_sig() 解析 @ 后 sessionId)必须在 bridge/registry.json
+# 有在册 consumer(非 stale),否则拒绝并给 arm 指引。注册表路径可经
+# ORCH_BRIDGE_REGISTRY 覆盖(自测隔离)。
+
+def bridge_arm_gate():
+    reg = os.environ.get('ORCH_BRIDGE_REGISTRY') or os.path.join(MAESTRO_DIR, 'bridge', 'registry.json')
+    sig = orch_sig()
+
+    def refuse(why):
+        die('bridge 武装硬门: ' + why + '\n'
+            f'  本席签名: {sig or "(无 — 未设 ORCH_SIG/MAESTRO_ORCH_SIGNATURE,亦无 bridge/orch.signature)"}\n'
+            '  → arm 指引: 本会话内武装回调桥(bridge_arm;或 POST /register {"sessionId":"<本会话id>","alias":"<别名>"}'
+            ',端口见 bridge/http.port),取得 <alias>@<sessionId> 回信签名后重试。\n'
+            '  依据: check --wait 已退役,回调是完成等待唯一手段(ADR-0001 唤醒单车道)。',
+            1)
+
+    if not sig or '@' not in sig:
+        refuse('本席签名不可得或缺 @sessionId —— 无回信地址不派工')
+    sid = sig.rsplit('@', 1)[1].strip()
+    try:
+        with open(reg, encoding='utf-8') as f:
+            consumers = (json.load(f).get('consumers') or {})
+    except (OSError, json.JSONDecodeError, AttributeError) as e:
+        refuse(f'bridge/registry.json 不可读({reg}: {e})—— 桥未武装')
+    entry = consumers.get(sid)
+    if not isinstance(entry, dict) or entry.get('stale'):
+        refuse(f'本会话 {sid} 无在册 bridge consumer(stale或缺册)')
+
 def _node_hit(r):
     refs, _warn = refs_as_dict(r[3])
     return {'project': r[0], 'node_id': r[1], 'status': r[2], 'refs': refs}
@@ -535,6 +572,7 @@ def die_no_target():
 
 # ── 子命令: dispatch ─────────────────────────────────────────────────────────
 def cmd_dispatch(a):
+    bridge_arm_gate()   # ORCH-WAKE ②: 前置硬门,未武装拒绝(含 --dry-run;唯一豁免=selftest 走 ORCH_BRIDGE_REGISTRY 夹具)
     if a.spec == '-':
         spec = sys.stdin.read()
     else:
@@ -987,6 +1025,12 @@ def cmd_selftest(a):
                    ORCH_FAKE_ACKS=os.path.join(tmp, 'acks.log'), ORCH_FAKE_RELEASES=os.path.join(tmp, 'releases.log'),
                    ORCH_FAKE_REPLIES=os.path.join(tmp, 'replies.log'))
         open(env['ORCH_FAKE_SEQ'], 'w').write('0')
+        # bridge 武装硬门夹具(ORCH-WAKE ②): 在册 consumer=ORCH_SIG 的 session 段
+        breg = os.path.join(tmp, 'bridge-registry.json')
+        with open(breg, 'w') as f:
+            json.dump({'version': '4.1.0',
+                       'consumers': {'test-session': {'alias': 'test-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
+        env['ORCH_BRIDGE_REGISTRY'] = breg
 
         def calls():
             try:
@@ -1209,6 +1253,28 @@ def cmd_selftest(a):
         p = _orch(['wait', '--run', 'run_fake0'], env)
         c.check('S17b wait 解析面遇坏 refs 不崩(exit4 检查点)', p.returncode == 4, p.stdout + p.stderr)
 
+        # S18 bridge 武装硬门(ORCH-WAKE ②): 回调单车道,未武装 dispatch(含 --dry-run)拒绝 + arm 指引
+        bare = dict(env)
+        bare.pop('ORCH_SIG', None)
+        bare.pop('MAESTRO_ORCH_SIGNATURE', None)
+        bare.pop('ORCH_BRIDGE_REGISTRY', None)
+        bare['MAESTRO_HOME'] = tmp   # 隔离真机 bridge/orch.signature 兜底(硬门先于一切 ledger/orca 调用,零实弹)
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18a', '--ref', 'T-018a',
+                   '--project', proj, '--json'], bare)
+        c.check('S18a 无签名 dispatch 拒绝 rc=1', p.returncode == 1, (p.stdout + p.stderr)[-200:])
+        c.check('S18a 拒绝带 arm 指引与硬门口径', 'bridge 武装硬门' in p.stderr and 'arm 指引' in p.stderr, p.stderr[-200:])
+        bare2 = dict(env)
+        bare2['ORCH_SIG'] = 'ghost-orch@session-ghost'   # 有签名但不在册
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18b', '--ref', 'T-018b',
+                   '--project', proj, '--json'], bare2)
+        c.check('S18b 有签名未在册拒绝', p.returncode == 1 and '无在册 bridge consumer' in p.stderr, p.stderr[-200:])
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18c', '--ref', 'T-018c',
+                   '--project', proj, '--dry-run'], bare2)
+        c.check('S18c --dry-run 亦受硬门约束', p.returncode == 1 and '无在册 bridge consumer' in p.stderr, p.stderr[-200:])
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18d', '--ref', 'T-018d',
+                   '--project', proj, '--dry-run', '--json'], env)
+        c.check('S18d 在册 consumer --dry-run 放行 rc=0', p.returncode == 0, p.stderr[-200:])
+
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
     finally:
@@ -1218,7 +1284,7 @@ def cmd_selftest(a):
 def main():
     ap = argparse.ArgumentParser(prog='orch', description='Orca 编排面高抽象入口(债#9×#11)')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('dispatch', help='run绑定/创建→task→dispatch→ledger 建账,一次调用全链')
+    p = sub.add_parser('dispatch', help='run绑定/创建→task→dispatch→ledger 建账,一次调用全链;前置 bridge 武装硬门(未武装即拒,含 --dry-run)')
     p.add_argument('--spec', required=True, help='任务正文文件路径或 - (stdin)')
     p.add_argument('--to', help='目标 terminal handle(缺省时列出活体终端并退出)')
     g = p.add_mutually_exclusive_group(required=True)
@@ -1229,7 +1295,7 @@ def main():
     p.add_argument('--project', help='项目 key 或路径(默认 cwd)')
     p.add_argument('--force', action='store_true', help='重复派发放行(记 duplicate)')
     p.add_argument('--no-ticket', action='store_true', help='跳过 tickets 环(不写 pm-web 票面)')
-    p.add_argument('--dry-run', action='store_true', help='只打印命令序列,零执行')
+    p.add_argument('--dry-run', action='store_true', help='只打印命令序列,零执行(bridge 武装硬门仍生效)')
     p.add_argument('--json', action='store_true', help='机器可读摘要')
     p.set_defaults(f=cmd_dispatch)
     p = sub.add_parser('wait', help='check --wait + 收到即自动收尾(ack/release/记账);进门兼收 running 帧')

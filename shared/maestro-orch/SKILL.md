@@ -3,7 +3,8 @@ name: maestro-orch
 description: >-
   DSH maestro orchestrator's single entry skill: entry routing across planes —
   Orca orchestration mailbox (orthodox chain run-create → dispatch --inject →
-  check --wait worker_done → ack → worker-release; terminal send only as
+  worker_done callback wake → ack → worker-release; completion wait is
+  callback-only, check --wait retired; terminal send only as
   degraded fallback with cb-send contract), dais lane (worker-up three-step,
   full CLI table delegated to dais-orchestration), cross-plane callbacks
   (cb-send) — plus internal calls (signature, ledger, bridge re-arm). Use when
@@ -39,7 +40,7 @@ orch-dag seat-open --project <path>                    # 编排席终端幂等�
 orch-dag run "<objective>"                             # 幂等建/续 Run
 orch-dag task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝
 orch-dag seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
-orch-dag wait [--timeout-ms MS]                        # check --wait;worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
+orch-dag wait [--timeout-ms MS]                        # 收尾排水(完成信号本体=回调,见「回调单车道」): worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
 orch-dag reply --msg <id> --body <t>                   # question 应答
 orch-dag close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口)
 orch-dag status [--ref R]                              # run/task/dispatch + ticket + node 并排(只读)
@@ -47,18 +48,29 @@ orch-dag status [--ref R]                              # run/task/dispatch + tic
 
 **与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch-dag 是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 orch-dag 行为用的参考,**不是第二条派发路径**。
 
+## 完成等待 — 回调单车道(ORCH-WAKE 契约,ADR-0001)
+
+**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**`check --wait` 已从操作面退役**——阻塞等待循环不再出现在任何契约;`check --peek` 仅作只读诊断(**已废弃**标记),不消费、不作等待手段。前置硬门: `orch dispatch`(含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
+
+多 worker 异步收件语义(桥 inbox,凭据: ORCH-WAKE 事故定界):
+
+- **持久 FIFO**: 回调帧落盘 `<maestro>/bridge/` 持久队列,编排席离线不丢,重挂后按序排水。
+- **at-least-once + 去重**: 同一 delivery 可能投递多次;按 deliveryId 记账幂等(`state/orch-deliveries.json` / orch-dag 账),重复帧不二次收尾、不二次记账。
+- **乱序无害**: 票完成帧先于开工帧到达亦无碍——账本按现态幂等再水化(done 不回退 running;已 running/done 对重复 running 帧跳过)。
+- **join 屏障 = 票 deps,不是等待循环**: 多票汇合靠 `orch-dag task <R> --deps R1,R2`(Orca task_not_startable 硬拒绝);绝不手写轮询/睡眠等下游。
+
 ## orch 高抽象入口(历史兼容 — 勿用于新派发)
 
 `~/.dsh/maestro/bin/orch` 把正统链封装为编排席级动作,并硬机制强制 ledger 记账(规则7/8)+node/ticket 状态机+deliveryId 幂等;**默认零实弹**(测试经 `ORCH_BIN` 注 stub,`--dry-run` 打印命令序列):
 
 ```bash
 orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID> [--json] [--dry-run]   # run→task→dispatch→建账(含 tickets 环)
-orch wait  [--run <run_id>]         # check --wait+自动收尾: done→ack+release+记账;escalation→ack+release,exit3;question→不动,exit2;超时→exit4 检查点
+orch wait  [--run <run_id>]         # 完成等待=回调唯一(check --wait 已退役);本步收尾: done→ack+release+记账;escalation→ack+release,exit3;question→不动,exit2;超时→exit4 检查点
 orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;成功后重挂 wait
 orch status [--run r] [--ref r] [--json]             # run/task/ctx+ledger 节点并排(离线)
 # wait/status 进门兼收 running 帧(worker hook sidecar <maestro>/orch-hooks/running.log):
 # ticket-running → dispatch 节点 dispatched→running(幂等,现态非 dispatched 跳过)
-orch selftest                       # 离线全链自测(fake stub,43 断言)
+orch selftest                       # 离线全链自测(fake stub,58 断言,含 S18 bridge 武装硬门)
 ```
 
 细节(`--force` 重复派发/`--no-ticket`/退出码表/状态机表)看 `orch --help` 与源码头注;首次实弹冒烟归编排席。
@@ -73,10 +85,10 @@ orch selftest                       # 离线全链自测(fake stub,43 断言)
 ORCA orchestration run-create ...                                      # → run_<id>
 ORCA orchestration task-create <run_id> ...                            # → task_<id>
 ORCA orchestration dispatch --inject --to <terminal-handle> --task <task_id>
-ORCA orchestration check --wait --types worker_done,escalation,question  # 滚动收件
-#   question → orchestration reply 应答;escalation 逐条处置;超时=检查点,续滚
-ORCA orchestration check --ack <deliveryId>
+# 完成等待 = 回调唯一: worker_done 原生唤醒编排席回合,不轮询(check --wait 已退役)
+ORCA orchestration check --ack <deliveryId>            # 仅对已收到的 delivery 结算
 ORCA orchestration worker-release --dispatch <ctx>
+# ORCA orchestration check --peek: 已废弃,只读诊断 —— 仅排障看未读,不消费、不作等待手段
 ```
 
 - worker_done 原生结算 task/dispatch,**勿再补 `task-update --status completed`**(重复结算)。

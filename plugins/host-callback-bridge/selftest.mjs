@@ -15,6 +15,7 @@
  *   T10 换代注册: POST /register 新代际自注册(编排会话不再拥有链路)
  *   T11 回声分离: DSH-RE] 前缀行进 echo.log 不投递
  *   T12 投递失败退避: 目标不可达 ×maxWakeFailures → dead.log 留痕
+ *   W1 wire 层 slash 分支 requestId 断言 (ORCH-WAKE: NEW 链必填, 缺失=BRIDGE-WAKE 断腿根因)
  *
  * 用法: node selftest.mjs [--verbose]
  * 退出码: 0 = 全绿, 1 = 有失败。
@@ -27,6 +28,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { spawnSync } from 'node:child_process'
 import { activate, resolveFileDelivery, version } from './index.js'
 import { readRegistry, registerConsumer } from './core/registry.js'
+import { dshWire } from './core/wire.js'
 
 const VERBOSE = process.argv.includes('--verbose')
 let passed = 0
@@ -839,6 +841,38 @@ async function deployScene() {
   }
 }
 
+/** ORCH-WAKE: wire 层 slash 分支 requestId 断言(离线纯单测,零服务器;BRIDGE-WAKE 断腿根因回归面)。 */
+async function wireSlashScene() {
+  const prevWire = process.env.DSH_WIRE
+  const prevHome = process.env.DSH_HOME
+  const home = mkdtempSync(join(tmpdir(), 'si003-wire-'))
+  try {
+    // 离线铸 cookie fixture: 32B base64url secret 写临时 $DSH_HOME/.credentials.yaml。
+    const secret = Buffer.alloc(32, 7).toString('base64url')
+    writeFileSync(join(home, '.credentials.yaml'), `records:\n  client-connection/browser-session:\n    secret: ${secret}\n`)
+    process.env.DSH_HOME = home
+    process.env.DSH_WIRE = 'slash'
+    const prompt = dshWire('session.prompt', { sessionId: 'session-x', mode: 'queue', content: [{ type: 'text', text: 'ORCA-CB] {}' }] }, 3080)
+    ok('w1:slash-prompt-path-and-args-envelope', prompt.path === '/api/session/prompt'
+      && prompt.body?.method === 'session/prompt' && prompt.body?.payload?.args?.request?.sessionId === 'session-x')
+    const reqId = prompt.body?.payload?.args?.request?.requestId
+    ok('w1:slash-requestId-uuid-present', typeof reqId === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(reqId), String(reqId))
+    ok('w1:slash-requestId-unique-per-call', reqId !== dshWire('session.prompt', { sessionId: 'session-x' }, 3080).body.payload.args.request.requestId)
+    ok('w1:slash-blanket-requestId-list-cancel', typeof dshWire('session.list', {}, 3080).body?.payload?.args?.request?.requestId === 'string'
+      && typeof dshWire('session.cancel', { sessionId: 's' }, 3080).body?.payload?.args?.request?.requestId === 'string')
+    ok('w1:slash-cookie-header-present', typeof prompt.headers?.cookie === 'string' && prompt.headers.cookie.startsWith('dsh-auth-'))
+    process.env.DSH_WIRE = 'dot'
+    const dot = dshWire('session.prompt', { sessionId: 'session-x' }, 3080)
+    ok('w1:dot-branch-byte-stable-no-requestId', dot.path === '/api/session.prompt'
+      && dot.body.payload?.sessionId === 'session-x' && dot.body.payload?.requestId === undefined && typeof dot.body.rpcId === 'string')
+  } finally {
+    if (prevWire === undefined) delete process.env.DSH_WIRE; else process.env.DSH_WIRE = prevWire
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  }
+}
+
 function spawnSyncJson(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' })
   return r.status === 0 ? r.stdout.trim().split('\n').filter((l) => l.length > 0) : []
@@ -846,6 +880,7 @@ function spawnSyncJson(cmd, args) {
 
 async function main() {
   console.log(`host-callback-bridge selftest v${version}`)
+  await wireSlashScene()  // ORCH-WAKE: W1 (slash requestId 断腿根因回归, 离线)
   await mainScene()
   await standbyScene()
   await takeoverScene()

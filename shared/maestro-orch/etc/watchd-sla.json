@@ -1,0 +1,14 @@
+{
+  "interval": 300,
+  "max_rounds": 0,
+  "notify": "session-send",
+  "owner": {
+    "from": "watchd",
+    "to": "session-af290650-4c34-4fb6-bc21-7cbc947bf706"
+  },
+  "faces": {
+    "sla": [
+      { "name": "tickets", "ttl_min": 240 }
+    ]
+  }
+}

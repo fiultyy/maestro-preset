@@ -7,6 +7,8 @@
 //   POST /api/<method>   payload 原样（client-request 信封）。
 // slash（DSH_WIRE=slash）= NEW rebase/dh1-slim-on-master 链（T0 探针实测，无点号兼容层）：
 //   POST /api/<ns>/<verb>   payload 包 {args:{request}}   method 字段同步斜杠名。
+//   request 内注入 requestId（uuid4，NEW 契约必填=user message source.rpcId；口径同
+//   bin/session-send v4 修复——缺它新宿主 400，BRIDGE-WAKE 断腿根因，ORCH-WAKE 修复）。
 //   且全部 /api/* 过浏览器鉴权闸（client-connection）：cookie = dsh-auth-<b64u(sha256(authority))>
 //   = v1.<b64u({version,authority,issuedAt,expiresAt})>.<b64u(hmac-sha256(secret,body))>，
 //   secret = $DSH_HOME/.credentials.yaml records 下 client-connection/browser-session 的
@@ -59,9 +61,14 @@ export function dshWire(method, payload, port) {
   }
   const cookie = mintWireCookie(port, readWireSecret())
   const [namespace, verb] = method.split('.')
+  // ORCH-WAKE (2026-09-09): NEW 链契约必填 requestId —— user message source.rpcId,
+  // 口径同 bin/session-send v4 修复 (dict(payload, requestId=uuid4), requestId 权威胜出)。
+  // BRIDGE-WAKE 断腿事实: slash 分支缺它 → 新宿主 400 → 3 次退避死信 → 唤醒腿断
+  // (ADR-0001 修订节「唯一性入口+唤醒单车道」)。dot 支保持逐字节不变。
+  const request = { ...(payload ?? {}), requestId: randomUUID() }
   return {
     path: `/api/${namespace}/${verb}`,
-    body: { type: 'client-request', rpcId: randomUUID(), method: `${namespace}/${verb}`, payload: { args: { request: payload ?? {} } } },
+    body: { type: 'client-request', rpcId: randomUUID(), method: `${namespace}/${verb}`, payload: { args: { request } } },
     headers: { 'content-type': 'application/json', cookie },
   }
 }

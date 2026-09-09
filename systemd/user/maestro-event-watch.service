@@ -1,0 +1,12 @@
+[Unit]
+Description=maestro event-watchd 单轮巡检(SLA 催办/文件/进程/租约四类看守面)
+Documentation=file://%h/tools/maestro-preset/bin/event-watchd
+# 节奏由 maestro-event-watch.timer 驱动;本单元恒为 oneshot --once。
+# event-watchd 内建 flock 单实例锁(<state>/watchd.lock),timer 重叠触发自动 exit 3 让位。
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 %h/.dsh/maestro/bin/event-watchd --config %h/.dsh/maestro/etc/watchd-sla.json --once
+# 事件出口: notify=session-send → 编排席收件(原生唤醒回合);owner 失联 → alerts.log(用户可见告警面,升级终点)
+SyslogIdentifier=maestro-event-watch
+Nice=5

@@ -1,0 +1,12 @@
+[Unit]
+Description=maestro event-watchd 周期巡检节奏(每 5 分钟一轮 SLA 等看守面扫描)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# 宿主休眠错过的不补跑(巡检是瞬时快照,补跑无意义,且 latch 保证漏报窗口 ≤ 一轮)
+Persistent=false
+Unit=maestro-event-watch.service
+
+[Install]
+WantedBy=timers.target
