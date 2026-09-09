@@ -6,6 +6,10 @@
                 [--no-ticket] [--dry-run] [--json]
   orch wait     [--run <run_id>] [--timeout-ms 1500000]
                 [--types worker_done,escalation,question] [--json]
+  orch dag-seat-open --project <path> [--title T]     # dag 族: 编排席终端幂等创建/复用
+  orch dag-run "<objective>"                          # dag 族: 幂等建/续 Run
+  orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
+  orch dag-seat <REF> [--name <worktree>]             # dag 族: worker-start(omp×新顶层worktree)+dispatched 双写
   orch reply    --msg <msg_id> (--body <text> | --body-file <f>) [--run <run_id>] [--json]
   orch status   [--run <run_id>] [--ref <ref>] [--project <key|path>] [--json]
   orch selftest                       # 离线自测(fake ORCH_BIN stub 全链走查,零实弹)
@@ -34,6 +38,13 @@
   - bridge 武装硬门(ORCH-WAKE ②): check --wait 已退役,回调是完成等待唯一手段 ——
     dispatch(含 --dry-run)要求本席在 bridge/registry.json 有在册 consumer(非 stale),
     否则 exit 1 并给 arm 指引;无回信地址的派工其完成信号必然丢失,故默认强制。
+  - dag 族(ORCH-UNIFY 收编自 orch-dag,唯一入口=orch): 原子生命周期
+    dag-seat-open→dag-run→dag-task[--deps]→dag-seat→(回调)dag-settle→dag-close;
+    agent 固定 omp、worktree 固定 new-top-level、tickets 环强制勾稽、零模式旗标;
+    deps 屏障三层=本地依赖未建 fail-loud → Orca task_not_startable 硬拒绝透传 →
+    ledger 票面 deps 未就绪拒迁 running/done;派发链四命令(dag-seat-open/run/task/
+    seat)同过 bridge 武装硬门(V3: 未武装拒派);状态文件 ORCH_DAG_STATE(缺省
+    <state>/orch-dag.json,承 orch-dag 旧档)。
   - fail-loud(ops 工具非 hook): 失败非零退出 + 明确 stderr,不静默吞;不打印任何 token/secret。
 环境:
   ORCH_BIN          覆盖 orca CLI(测试 stub 注入口;最高优先)
@@ -679,6 +690,164 @@ def cmd_dispatch(a):
             print(ticket_note)
         print(f"下一步: orch wait --run {run_id}")
 
+# ── dag 族(ORCH-UNIFY 收编自 orch-dag;唯一入口=orch) ─────────────────────────
+# 原子生命周期: dag-seat-open→dag-run→dag-task[--deps]→dag-seat→(回调)dag-settle→dag-close。
+# 契约(承 orch-dag,审计 2cfc6b2 定谳语义原样保留): agent 固定 omp、worktree 固定
+# new-top-level、tickets 环随生命周期强制勾稽、零模式旗标、缺参 fail-loud(argparse 层
+# exit 2);deps 屏障三层=本地依赖未建拒绝 → Orca task_not_startable 硬拒绝透传 →
+# ledger 票面 deps 未就绪拒迁 running/done。派发链四命令(dag-seat-open/run/task/seat)
+# 同过 bridge 武装硬门(V3: 未武装拒派)。wait 已退役: 完成等待=回调(ADR-013),
+# 收讫记账 dag-settle(票/node→running「复验待关账」),终态 dag-close(手工)。
+DAG_AGENT = 'omp'                    # 硬编码: 唯一执行席 harness(审计③: 减少选择性,记录即可)
+DAG_WORKTREE = 'new-top-level'       # 硬编码: 每票新顶层 worktree
+DAG_SEAT_TITLE = 'ORCH-SEAT'
+
+def dag_state_path():
+    return os.environ.get('ORCH_DAG_STATE') or state_file('orch-dag.json')
+
+def dag_load():
+    s = _read_json(dag_state_path(), {})
+    s.setdefault('seat', None)
+    s.setdefault('run', None)
+    s.setdefault('project', None)
+    s.setdefault('refs', {})
+    return s
+
+def dag_save(s):
+    _atomic_write_json(dag_state_path(), s)
+
+def dag_need_seat(s):
+    if not s.get('seat'):
+        die('编排席未建: 先执行 orch dag-seat-open --project <path>', 64)
+    return s['seat']
+
+def _dag_doc_id(doc, what, *names, prefix):
+    """orca-ide 返回形态双兼容归一(orch-dag 旧嵌套 result.run.id 与 orch 扁平 run=xx)。"""
+    hit = find_key(doc, *names)
+    if isinstance(hit, dict):
+        hit = hit.get('id') or hit.get('dispatchId')
+    if not isinstance(hit, str):
+        hit = find_prefixed(doc, prefix)
+    if not hit:
+        die(f'{what} 输出无 id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
+    return hit
+
+def dag_ticket_refs(ref):
+    """从 ledger.db 只读票 refs(orca_task 等),供幂等纳管;票/表不存在→None。"""
+    try:
+        c = read_only_db()
+        row = c.execute("SELECT refs FROM tickets WHERE ticket_id=?", (ref,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+    if not row:
+        return None
+    refs, _warn = refs_as_dict(row[0])
+    return refs
+
+def cmd_dag_seat_open(a):
+    bridge_arm_gate()   # ORCH-UNIFY V3: 派发链全路径过武装门
+    s = dag_load()
+    if s.get('seat'):
+        print(f"seat: 复用 {s['seat']}")
+        return
+    project = os.path.abspath(a.project)
+    doc = orca_json(['worktree', 'list'], 'worktree list')
+    wl = find_key(doc, 'worktrees')
+    wid = None
+    for w in (wl if isinstance(wl, list) else []):
+        if isinstance(w, dict) and (w.get('path') or '') == project:
+            wid = w.get('id')
+            break
+    if not wid:
+        die(f'project 不在 Orca 树: {project}(先 orca worktree 注册)', 5)
+    tl = orca_json(['terminal', 'create', '--worktree', f'id:{wid}', '--title', a.title],
+                   '编排席终端创建')
+    t = find_key(tl, 'terminal')
+    t = t if isinstance(t, dict) else {}
+    handle = t.get('handle') or t.get('id')
+    if not handle:
+        die(f'编排席终端无 handle: {json.dumps(tl, ensure_ascii=False)[:300]}', 5)
+    s['seat'] = handle
+    s['project'] = project
+    dag_save(s)
+    print(f'seat: {handle}')
+
+def cmd_dag_run(a):
+    bridge_arm_gate()
+    s = dag_load()
+    seat = dag_need_seat(s)
+    if s.get('run'):
+        print(f"run: 复用 {s['run']}")
+        return
+    doc = orca_json(['orchestration', 'run-create', '--from', seat, '--objective', a.objective],
+                    'run-create')
+    rid = _dag_doc_id(doc, 'run-create', 'runId', 'run_id', 'run', prefix='run_')
+    s['run'] = rid
+    dag_save(s)
+    print(f'run: {rid}')
+
+def cmd_dag_task(a):
+    bridge_arm_gate()
+    s = dag_load()
+    seat = dag_need_seat(s)
+    if not s.get('run'):
+        die('Run 未建: 先执行 orch dag-run "<objective>"', 64)
+    if a.ref in s['refs'] and s['refs'][a.ref].get('orca_task'):
+        print(f"task: 复用 {a.ref} -> {s['refs'][a.ref]['orca_task']}")
+        return
+    existing = dag_ticket_refs(a.ref)
+    if existing and existing.get('orca_task'):
+        s['refs'][a.ref] = {'orca_task': existing['orca_task'], 'ticket': True}
+        dag_save(s)
+        print(f"task: 纳管 {a.ref} -> {existing['orca_task']}")
+        return
+    deps = [d.strip() for d in (a.deps or '').split(',') if d.strip()]
+    for d in deps:   # deps 屏障第一层: 本地依赖未建 fail-loud(不推断)
+        if d not in s['refs'] or not s['refs'][d].get('orca_task'):
+            die(f'依赖 ref 未建 task: {d}(先 orch dag-task {d})—— deps 硬屏障(本地层)', 1)
+    dep_ids = [s['refs'][d]['orca_task'] for d in deps]
+    args = ['orchestration', 'task-create', '--from', seat, '--task-title', a.title, '--spec', a.spec]
+    if dep_ids:
+        args += ['--deps', json.dumps(dep_ids)]   # 第二层: Orca task_not_startable 硬拒绝透传
+    doc = orca_json(args, f'task-create({a.ref})')
+    tid = _dag_doc_id(doc, f'task-create({a.ref})', 'taskId', 'task_id', 'task', prefix='task_')
+    cwd = s.get('project') or ''
+    if not cwd:   # 341a100 语义保持: 建票强制 cwd(pm-web 票板按 refs.cwd 分组)
+        die('project 未记录: 先执行 orch dag-seat-open --project(pm-web 票板按 refs.cwd 分组,缺 cwd 进折叠池)', 1)
+    run_ledger(['ticket', 'add', a.ref, a.title,
+                '--deps', json.dumps(deps),
+                '--refs', json.dumps({'run': s['run'], 'orca_task': tid, 'seat': seat, 'cwd': cwd},
+                                     ensure_ascii=False),
+                '--source', 'orch-dag'], f'ticket add 失败({a.ref})')
+    s['refs'][a.ref] = {'orca_task': tid, 'ticket': True}
+    dag_save(s)
+    print(f'task: {a.ref} -> {tid}')
+
+def cmd_dag_seat(a):
+    bridge_arm_gate()
+    s = dag_load()
+    seat = dag_need_seat(s)
+    if not s.get('project'):
+        die('project 未记录: 先执行 orch dag-seat-open --project', 64)
+    if a.ref not in s['refs'] or not s['refs'][a.ref].get('orca_task'):
+        die(f"ref 未建 task: {a.ref}(先 orch dag-task {a.ref})", 64)
+    tid = s['refs'][a.ref]['orca_task']
+    name = a.name or a.ref.lower()
+    doc = orca_json(['orchestration', 'worker-start', '--from', seat, '--task', tid,
+                     '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT],
+                    f'worker-start({a.ref})')
+    ctx = _dag_doc_id(doc, f'worker-start({a.ref})', 'dispatchId', 'dispatch_id', 'dispatch', prefix='ctx_')
+    run_ledger(['ticket', 'refs-set', a.ref, '--json',
+                json.dumps({'dispatch': ctx, 'worktree': name, 'agent': DAG_AGENT}, ensure_ascii=False)],
+               f'ticket refs-set 失败({a.ref})')
+    run_ledger(['node', s['project'], a.ref, 'dispatch', f'R-ticket {a.ref} {DAG_AGENT} 席位派发',
+                'dispatched', '--refs',
+                json.dumps({'run': s['run'], 'orca_task': tid, 'dispatch': ctx}, ensure_ascii=False)],
+               f'ledger node 失败({a.ref})')
+    print(f'seat: {a.ref} dispatched dispatch={ctx}')
+
 # ── 子命令: wait ─────────────────────────────────────────────────────────────
 def settle_node(project, node_id, to_status, event_type, detail):
     """收果记账(规则8): node 迁移(自动补 running 中间态已由路径求导覆盖 node 侧表)+
@@ -939,6 +1108,17 @@ elif argv[:2] == ['orchestration', 'dispatch']:
     open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
     cid = f'ctx_fake{n}'
     out({'ctx': cid, 'dispatchId': cid, 'injected': True})
+elif argv[:1] == ['worktree'] and argv[1:2] == ['list']:
+    out({'ok': True, 'result': {'worktrees': [{'id': 'wt_fake', 'path': os.environ.get('ORCH_FAKE_WTPATH', '/nonexistent')}]}})
+elif argv[:1] == ['terminal'] and argv[1:2] == ['create']:
+    out({'ok': True, 'result': {'terminal': {'handle': 'term_seat', 'id': 'term_seat'}}})
+elif argv[:2] == ['orchestration', 'worker-start']:
+    n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
+    open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
+    cid = f'ctx_dag{n}'
+    out({'ok': True, 'result': {'dispatch': {'id': cid}}, 'dispatchId': cid})
+elif argv[:2] == ['orchestration', 'task-list']:
+    out({'ok': True, 'result': {'tasks': []}})
 elif argv[:2] == ['orchestration', 'check'] and '--wait' in argv:
     fx = os.environ.get('ORCH_FAKE_DELIVERY')
     if not fx:
@@ -1275,6 +1455,96 @@ def cmd_selftest(a):
                    '--project', proj, '--dry-run', '--json'], env)
         c.check('S18d 在册 consumer --dry-run 放行 rc=0', p.returncode == 0, p.stderr[-200:])
 
+        # ── S19-S22 dag 族收编(ORCH-UNIFY;offline fixture,零实弹) ────────────────
+        env['ORCH_FAKE_WTPATH'] = proj
+        dstate = os.path.join(tmp, 'state', 'orch-dag.json')   # ORCH_STATE_DIR 已隔离,承 orch-dag 旧档路径
+
+        # S19 未武装拒派(V3: dag 派发链过 bridge 武装硬门,S18 口径)
+        dag_bare = dict(env)
+        for k in ('ORCH_SIG', 'MAESTRO_ORCH_SIGNATURE', 'ORCH_BRIDGE_REGISTRY'):
+            dag_bare.pop(k, None)
+        dag_bare['MAESTRO_HOME'] = tmp
+        for dargs in (['dag-seat-open', '--project', proj], ['dag-run', 'x'],
+                      ['dag-task', 'DX-1', '--title', 't', '--spec', 's'], ['dag-seat', 'DX-1']):
+            p = _orch(dargs, dag_bare, cwd=proj)
+            c.check(f'S19 未武装 {dargs[0]} 拒绝 rc=1', p.returncode == 1, (p.stdout + p.stderr)[-160:])
+        p = _orch(['dag-seat-open', '--project', proj], dag_bare, cwd=proj)
+        c.check('S19 拒绝带 arm 指引', 'bridge 武装硬门' in p.stderr and 'arm 指引' in p.stderr, p.stderr[-200:])
+        ghost = dict(env)
+        ghost['ORCH_SIG'] = 'ghost-orch@session-ghost'   # 有签名但不在册
+        p = _orch(['dag-seat', 'DR-1'], ghost, cwd=proj)
+        c.check('S19 有签名未在册 dag-seat 拒绝', p.returncode == 1 and '无在册 bridge consumer' in p.stderr,
+                p.stderr[-160:])
+
+        # S20 seat-open/run 建立与幂等复用
+        p = _orch(['dag-seat-open', '--project', proj], env, cwd=proj)
+        c.check('S20 dag-seat-open rc=0', p.returncode == 0, p.stderr)
+        st = json.load(open(dstate))
+        c.check('S20 seat+project 落态', st.get('seat') == 'term_seat' and st.get('project') == proj, str(st))
+        _orch(['dag-seat-open', '--project', proj], env, cwd=proj)
+        c.check('S20 seat-open 幂等(终端只开一次)',
+                sum(1 for x in calls() if x[:2] == ['terminal', 'create']) == 1, str(calls()[-3:]))
+        p = _orch(['dag-run', 'R41 类瀑布重放'], env, cwd=proj)
+        c.check('S20 dag-run rc=0', p.returncode == 0, p.stderr)
+        st = json.load(open(dstate))
+        c.check('S20 run 落态 run_*', str(st.get('run', '')).startswith('run_'), str(st))
+        n_rc = sum(1 for x in calls() if x[:2] == ['orchestration', 'run-create'])
+        p = _orch(['dag-run', 'again'], env, cwd=proj)
+        c.check('S20 run 幂等复用(不重 create)', p.returncode == 0
+                and sum(1 for x in calls() if x[:2] == ['orchestration', 'run-create']) == n_rc)
+        fresh = dict(env)
+        fresh['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fresh.json')
+        p = _orch(['dag-run', 'x'], fresh, cwd=proj)
+        c.check('S20b 未建 seat 先 run 拒绝 exit=64', p.returncode == 64 and 'dag-seat-open' in p.stderr,
+                p.stderr[-160:])
+
+        # S21 deps 硬屏障(本地层 fail-loud)+ R41 类瀑布重放(V4)
+        p = _orch(['dag-task', 'DR-2', '--title', 'T2', '--spec', 's2', '--deps', 'DR-1X'], env, cwd=proj)
+        c.check('S21 依赖未建拒绝 rc=1(本地屏障)', p.returncode == 1 and 'deps 硬屏障' in p.stderr, p.stderr[-200:])
+        c.check('S21 拒绝零副作用(票未建)', get_ticket('DR-2') is None, str(get_ticket('DR-2')))
+        p = _orch(['dag-task', 'DR-1', '--title', 'T1', '--spec', 's1'], env, cwd=proj)
+        c.check('S21 dag-task DR-1 rc=0', p.returncode == 0, p.stderr)
+        t1 = get_ticket('DR-1')
+        c.check('S21 票初始 dispatched', bool(t1) and t1['state'] == 'dispatched', str(t1))
+        refs1 = dag_ticket_refs('DR-1') or {}
+        c.check('S21 票 refs.cwd/orca_task 双写(341a100 语义)', refs1.get('cwd') == proj
+                and str(refs1.get('orca_task', '')).startswith('task_'), str(refs1))
+        st = json.load(open(dstate))
+        c.check('S21 state.refs 记 orca_task', str(st['refs']['DR-1'].get('orca_task', '')).startswith('task_'), str(st))
+        p = _orch(['dag-task', 'DR-2', '--title', 'T2', '--spec', 's2', '--deps', 'DR-1'], env, cwd=proj)
+        c.check('S21 dag-task DR-2(dep DR-1) rc=0', p.returncode == 0, p.stderr)
+        p = _orch(['dag-task', 'DR-3', '--title', 'T3', '--spec', 's3', '--deps', 'DR-1,DR-2'], env, cwd=proj)
+        c.check('S21 瀑布 DR-3(deps R1,R2) rc=0', p.returncode == 0, p.stderr)
+        st = json.load(open(dstate))
+        tid1, tid2 = st['refs']['DR-1']['orca_task'], st['refs']['DR-2']['orca_task']
+        tcs = [x for x in calls() if x[:2] == ['orchestration', 'task-create']]
+
+        def tc_deps(title):
+            for x in tcs:
+                if '--task-title' in x and x[x.index('--task-title') + 1] == title:
+                    return json.loads(x[x.index('--deps') + 1]) if '--deps' in x else []
+            return None
+        c.check('S21 Orca --deps 瀑布透传(V4)', tc_deps('T2') == [tid1] and tc_deps('T3') == [tid1, tid2], str(tcs))
+
+        # S22 dag-seat 派发: worker-start(硬编码 omp×new-top-level)+ node/ticket/state 多写
+        p = _orch(['dag-seat', 'DR-1'], env, cwd=proj)
+        c.check('S22 dag-seat rc=0', p.returncode == 0, p.stderr)
+        node = get_node(proj, 'DR-1')
+        nrefs = json.loads((node or {}).get('refs') or '{}')
+        c.check('S22 node dispatched(kind=dispatch)', bool(node) and node['status'] == 'dispatched'
+                and node['kind'] == 'dispatch', str(node))
+        c.check('S22 node refs run/orca_task/dispatch',
+                all(nrefs.get(k) for k in ('run', 'orca_task', 'dispatch')), str(nrefs))
+        ws = [x for x in calls() if x[:2] == ['orchestration', 'worker-start']]
+        c.check('S22 worker-start 硬编码 omp×new-top-level', len(ws) == 1
+                and ws[0][ws[0].index('--agent') + 1] == 'omp'
+                and ws[0][ws[0].index('--worktree') + 1] == 'new-top-level', str(ws))
+        c.check('S22 票态仍 dispatched', (get_ticket('DR-1') or {}).get('state') == 'dispatched',
+                str(get_ticket('DR-1')))
+        drefs = dag_ticket_refs('DR-1') or {}
+        c.check('S22 refs-set 落 dispatch/worktree/agent', str(drefs.get('dispatch', '')).startswith('ctx_')
+                and drefs.get('worktree') == 'dr-1' and drefs.get('agent') == 'omp', str(drefs))
+
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
     finally:
@@ -1320,6 +1590,23 @@ def main():
     p.add_argument('--project')
     p.add_argument('--json', action='store_true')
     p.set_defaults(f=cmd_status)
+    p = sub.add_parser('dag-seat-open', help='dag 族: 编排席终端幂等创建/复用(派发链,前置 bridge 武装硬门)')
+    p.add_argument('--project', required=True, help='项目路径(须在 Orca 树;缺参 argparse 层 exit 2)')
+    p.add_argument('--title', default=DAG_SEAT_TITLE)
+    p.set_defaults(f=cmd_dag_seat_open)
+    p = sub.add_parser('dag-run', help='dag 族: 幂等建/续 Run')
+    p.add_argument('objective')
+    p.set_defaults(f=cmd_dag_run)
+    p = sub.add_parser('dag-task', help='dag 族: Orca task+ticket 环原子建(deps 硬屏障)')
+    p.add_argument('ref')
+    p.add_argument('--title', required=True)
+    p.add_argument('--spec', required=True)
+    p.add_argument('--deps', help='逗号分隔依赖 ref(须先 dag-task 建齐)')
+    p.set_defaults(f=cmd_dag_task)
+    p = sub.add_parser('dag-seat', help='dag 族: worker-start(硬编码 omp×new-top-level)+dispatched 双写')
+    p.add_argument('ref')
+    p.add_argument('--name', help='worktree 名(缺省 ref 小写)')
+    p.set_defaults(f=cmd_dag_seat)
     p = sub.add_parser('selftest', help='离线自测(fake ORCH_BIN stub 全链走查)')
     p.set_defaults(f=cmd_selftest)
     p = sub.add_parser('_transition', help=argparse.SUPPRESS)
