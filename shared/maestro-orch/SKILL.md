@@ -52,6 +52,8 @@ orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca ta
 
 **完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**阻塞式 check 等待(--wait)已从代码与契约双双退役**——阻塞等待循环不出现在任何活代码;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段;收讫结算: dag 票用 `orch dag-settle`,正统链票用 `orch settle`(非阻塞,结算回调唤醒携带的 delivery 文档)。前置硬门: 派发路径(`orch dispatch` 与 dag 族四派发命令,含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
 
+> SLA 告警分态语义注记(#122,SLA-TTL,只增不改): event-watchd 的 sla 面对非终态票分态+依赖感知老化——dispatched/running 维持墙钟计龄到 ttl 告警(不变);blocked 票若存在非终态 deps(∈ dispatched/running/blocked)属设计内依赖屏障,不计龄不告警;deps 全终态(ledger TICKET_TERMINAL 同源)/无 deps/dep 票不可查视为真停摆或账本滞后,照常计龄到 ttl 告警——编排席收到 blocked 票 sla-overdue 即账本态滞后信号,优先核对票 deps 现态。
+
 多 worker 异步收件语义(桥 inbox,凭据: ORCH-WAKE 事故定界):
 
 - **持久 FIFO**: 回调帧落盘 `<maestro>/bridge/` 持久队列,编排席离线不丢,重挂后按序排水。
