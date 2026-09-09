@@ -836,6 +836,10 @@ def cmd_dag_task(a):
     for d in deps:   # deps 屏障第一层: 本地依赖未建 fail-loud(不推断)
         if d not in s['refs'] or not s['refs'][d].get('orca_task'):
             die(f'依赖 ref 未建 task: {d}(先 orch dag-task {d})—— deps 硬屏障(本地层)', 1)
+    bad = [d for d in deps if not ticket_exists(d)]   # CONTRACT-HYGIENE 建票前预校验: 票号必须 ledger 已在(杜绝 R41/R42 式双前缀写账伪影);
+    if bad:   # ticket_exists 即 #133 同族已修安全助手(connect/查询分离,无 UnboundLocalError);先于 task-create 与 ticket add,exit 2 零落票
+        die(f'deps 票号 ledger 不可解析: {", ".join(bad)}'
+            f'(先 orch dag-task 建齐依赖,或修正票号后重建)—— 建票前预校验 fail-loud,零落票: {a.ref}', 2)
     dep_ids = [s['refs'][d]['orca_task'] for d in deps]
     sig = dag_orch_sig(a.orch_sig, s)
     spec = dag_envelope(sig, a.ref) + '\n' + a.spec   # HOOK-ENVELOPE: 信封必须首行,任务书正文原样跟随
@@ -1653,6 +1657,26 @@ def cmd_selftest(a):
             return None
         c.check('S21 Orca --deps 瀑布透传(V4)', tc_deps('T2') == [tid1] and tc_deps('T3') == [tid1, tid2], str(tcs))
 
+        # S21c deps 建票前预校验(CONTRACT-HYGIENE): refs 在而 ledger 无 → exit 2 列坏票号,零落票(Orca task 也不建)
+        #   R41/R42 写账伪影同型复现: dag state 有 orca_task、ledger 票号缺/错双前缀 → 机器锁 fail-loud
+        n_tc = len([x for x in calls() if x[:2] == ['orchestration', 'task-create']])
+        st = json.load(open(dstate))
+        st['refs']['DR-GHOST'] = {'orca_task': 'task_ghost', 'ticket': True}
+        st['refs']['DR-GHOST2'] = {'orca_task': 'task_ghost2', 'ticket': True}
+        json.dump(st, open(dstate, 'w'))
+        p = _orch(['dag-task', 'DR-BAD', '--title', 'TB', '--spec', 'sb',
+                   '--deps', 'DR-GHOST,DR-GHOST2,DR-1'], env, cwd=proj)
+        c.check('S21c 坏 deps(state 有 ledger 无)拒绝 rc=2', p.returncode == 2
+                and 'DR-GHOST' in p.stderr and 'DR-GHOST2' in p.stderr, p.stderr[-200:])
+        c.check('S21c 指引只列坏票号(好票 DR-1 不在发言)', 'DR-1' not in p.stderr, p.stderr[-200:])
+        c.check('S21c 拒绝零落票(ledger 无 DR-BAD)', get_ticket('DR-BAD') is None, str(get_ticket('DR-BAD')))
+        st = json.load(open(dstate))
+        c.check('S21c 拒绝零落账(state.refs 无 DR-BAD)', 'DR-BAD' not in st['refs'], str(sorted(st['refs'])))
+        c.check('S21c 拒绝零 Orca task(先于 task-create 断)',
+                len([x for x in calls() if x[:2] == ['orchestration', 'task-create']]) == n_tc, str(calls()[-2:]))
+        p = _orch(['dag-task', 'DR-4', '--title', 'T4', '--spec', 's4', '--deps', 'DR-3'], env, cwd=proj)
+        c.check('S21c 好 deps 不回归 rc=0', p.returncode == 0, p.stderr)
+
         # S22 dag-seat 派发: worker-start(硬编码 omp×new-top-level)+ node/ticket/state 多写
         p = _orch(['dag-seat', 'DR-1'], env, cwd=proj)
         c.check('S22 dag-seat rc=0', p.returncode == 0, p.stderr)
@@ -1844,6 +1868,24 @@ def cmd_selftest(a):
         # S26 全程零 --wait orca 调用(V1 机器断言;阻塞等待已退役,完成信号=回调)
         bad = [x for x in calls() if '--wait' in x]
         c.check('S26 全程零 --wait orca 调用(V1)', not bad, str(bad[:2]))
+
+        # S27 票面卫生条款在册(CONTRACT-HYGIENE V1): SKILL/cordis 各一处 grep 可见
+        #   面自适应: 契约对面(SKILL+cordis 同面成对,仓内与 agent-presets bin 同布局)优先;
+        #   纯运行时镜像(~/.dsh/maestro)只有孤 SKILL 陈旧镜像、无 cordis,不成对 → 回落 .agent-presets 契约面
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        faces = [here, os.path.join(MAESTRO_HOME, '.agent-presets', 'maestro')]
+        pair = next((f for f in faces
+                     if os.path.isfile(os.path.join(f, 'shared', 'maestro-orch', 'SKILL.md'))
+                     and os.path.isfile(os.path.join(f, 'agent.cordis.yml'))), None)
+        skill_md = open(os.path.join(pair, 'shared', 'maestro-orch', 'SKILL.md'),
+                        encoding='utf-8').read() if pair else ''
+        cordis_yml = open(os.path.join(pair, 'agent.cordis.yml'),
+                          encoding='utf-8').read() if pair else ''
+        c.check('S27 卫生条款 SKILL.md 在册', bool(skill_md) and '票面卫生(CONTRACT-HYGIENE)' in skill_md
+                and '禁留无主测试票' in skill_md, f'face={pair}')
+        c.check('S27 卫生条款 agent.cordis.yml 在册', bool(cordis_yml)
+                and 'Ticket hygiene (CONTRACT-HYGIENE)' in cordis_yml
+                and 'reject-on-sight' in cordis_yml, f'face={pair}')
 
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
