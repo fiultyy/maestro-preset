@@ -4,7 +4,7 @@ description: >-
   DSH maestro orchestrator's single entry skill: entry routing across planes —
   Orca orchestration mailbox (orthodox chain run-create → dispatch --inject →
   worker_done callback wake → ack → worker-release; completion wait is
-  callback-only, check --wait retired; terminal send only as
+  callback-only, blocking waits retired; terminal send only as
   degraded fallback with cb-send contract), dais lane (worker-up three-step,
   full CLI table delegated to dais-orchestration), cross-plane callbacks
   (cb-send) — plus internal calls (signature, ledger, bridge re-arm). Use when
@@ -24,58 +24,58 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
 ## 路由仲裁 — 任何派发先过这张表
 
-**唯一派发指令集 = `~/.dsh/maestro/bin/orch-dag`**(原子序:seat-open → run → task [--deps] → seat → wait → close)。结构化派发、多票 DAG、worker_done 账、ask 应答全部只走它;ledger node+ticket 双写内建于每个原子子命令,无绕过旗标;缺参数 exit 2 不推断。**手拼原生 `orca orchestration`、legacy `orch`、dais worker-up 一律不得用于新派发**(历史兼容,仅排障时阅读下文)。
+**唯一派发指令集 = `~/.dsh/maestro/bin/orch` 的 dag 族**(原子序:dag-seat-open → dag-run → dag-task [--deps] → dag-seat → (回调) dag-settle → dag-close)。结构化派发、多票 DAG、worker_done 账、ask 应答全部只走它;ledger node+ticket 双写内建于每个原子子命令,无绕过旗标;缺参数 exit 2 不推断;派发链四命令(dag-seat-open/run/task/seat)全路径过 bridge 武装硬门——未武装即拒。**手拼原生 `orca orchestration`、退役的 `orch-dag` 壳(运行只打印退役提示)、dais worker-up 一律不得用于新派发**(历史兼容,仅排障时阅读下文)。
 
 | 我要… | 入口 |
 |---|---|
-| 结构化派发 / worker_done 账 / 多票 DAG / ask 应答 | **orch-dag**(唯一;子命令表见下) |
+| 结构化派发 / worker_done 账 / 多票 DAG / ask 应答 | **orch dag 族**(唯一;子命令表见下) |
 | 跨面向回报(Orca 终端/dais pane/cron/任意进程 → 编排席) | **cb-send**(契约模板下;load skill `cb-send`) |
 | 记账/汇报 | **内部调用** | ledger(下) |
 | 桥死了/注册丢了 | **内部调用** | bridge-rearm(下) |
 
-### orch-dag 原子子命令(唯一指令集)
+### orch dag 族原子子命令(唯一指令集)
 
 ```bash
-orch-dag seat-open --project <path>                    # 编排席终端幂等创建/复用(缓存 handle)
-orch-dag run "<objective>"                             # 幂等建/续 Run
-orch-dag task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝
-orch-dag seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
-orch-dag wait [--timeout-ms MS]                        # check --wait 已退役;收尾排水(完成信号本体=回调,见「回调单车道」): worker_done→ack+release+票转 running(复验待关账);question exit2/escalation exit3/超时 exit4
-orch-dag reply --msg <id> --body <t>                   # question 应答
-orch-dag close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口)
-orch-dag status [--ref R]                              # run/task/dispatch + ticket + node 并排(只读)
+orch dag-seat-open --project <path> [--base-branch B]        # 编排席终端幂等创建/复用(缓存 handle;--base-branch=worker-start 显式基点双保险)
+orch dag-run "<objective>"                             # 幂等建/续 Run
+orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝(本地未建依赖先行 fail-loud)
+orch dag-seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
+# 完成等待 = 回调唯一(见「回调单车道」): worker_done 原生唤醒编排席回合;收讫记账:
+orch dag-settle <REF> [--outcome "<≤300字>"] [--dispatch <ctx>]   # 票/node → running「复验待关账」;重复回调幂等
+orch dag-close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口,手工)
+orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca task 并排(只读)
 ```
 
-**与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch-dag 是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 orch-dag 行为用的参考,**不是第二条派发路径**。
+**与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch dag 族是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 dag 族行为用的参考,**不是第二条派发路径**。
 
-## 完成等待 — 回调单车道(ORCH-WAKE 契约,ADR-0001)
+## 完成等待 — 回调单车道(ORCH-WAKE 契约,ADR-013)
 
-**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**`check --wait` 已从操作面退役**——阻塞等待循环不再出现在任何契约;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段。前置硬门: `orch dispatch`(含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
+**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**阻塞式 check 等待(--wait)已从代码与契约双双退役**——阻塞等待循环不出现在任何活代码;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段;收讫结算: dag 票用 `orch dag-settle`,正统链票用 `orch settle`(非阻塞,结算回调唤醒携带的 delivery 文档)。前置硬门: 派发路径(`orch dispatch` 与 dag 族四派发命令,含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
 
 多 worker 异步收件语义(桥 inbox,凭据: ORCH-WAKE 事故定界):
 
 - **持久 FIFO**: 回调帧落盘 `<maestro>/bridge/` 持久队列,编排席离线不丢,重挂后按序排水。
-- **at-least-once + 去重**: 同一 delivery 可能投递多次;按 deliveryId 记账幂等(`state/orch-deliveries.json` / orch-dag 账),重复帧不二次收尾、不二次记账。
+- **at-least-once + 去重**: 同一 delivery 可能投递多次;按 deliveryId 记账幂等(`state/orch-deliveries.json` / dag 票现态幂等),重复帧不二次收尾、不二次记账。
 - **乱序无害**: 票完成帧先于开工帧到达亦无碍——账本按现态幂等再水化(done 不回退 running;已 running/done 对重复 running 帧跳过)。
-- **join 屏障 = 票 deps,不是等待循环**: 多票汇合靠 `orch-dag task <R> --deps R1,R2`(Orca task_not_startable 硬拒绝);绝不手写轮询/睡眠等下游。
+- **join 屏障 = 票 deps,不是等待循环**: 多票汇合靠 `orch dag-task <R> --deps R1,R2`(Orca task_not_startable 硬拒绝);绝不手写轮询/睡眠等下游。
 
-## orch 高抽象入口(历史兼容 — 勿用于新派发)
+## orch 其余子命令(正统链单票派发 + 收讫/应答/视图)
 
-`~/.dsh/maestro/bin/orch` 把正统链封装为编排席级动作,并硬机制强制 ledger 记账(规则7/8)+node/ticket 状态机+deliveryId 幂等;**默认零实弹**(测试经 `ORCH_BIN` 注 stub,`--dry-run` 打印命令序列):
+`~/.dsh/maestro/bin/orch` 除 dag 族外,还承载正统链单票封装与收尾工具,硬机制强制 ledger 记账(规则7/8)+node/ticket 状态机+deliveryId 幂等;**默认零实弹**(测试经 `ORCH_BIN` 注 stub,`--dry-run` 打印命令序列):
 
 ```bash
-orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID> [--json] [--dry-run]   # run→task→dispatch→建账(含 tickets 环)
-orch wait  [--run <run_id>]         # 完成等待=回调唯一(check --wait 已退役);本步收尾: done→ack+release+记账;escalation→ack+release,exit3;question→不动,exit2;超时→exit4 检查点
-orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;成功后重挂 wait
+orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID> [--json] [--dry-run]   # run→task→dispatch→建账(含 tickets 环;前置武装硬门)
+orch settle [--run r] (--payload-file <f> | --payload -)   # 回调收讫结算(非阻塞): worker_done→ack+release+记账 done;escalation→ack+release exit3;question→不动 exit2
+orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;完成信号仍走回调
 orch status [--run r] [--ref r] [--json]             # run/task/ctx+ledger 节点并排(离线)
-# wait/status 进门兼收 running 帧(worker hook sidecar <maestro>/orch-hooks/running.log):
+# status/settle 进门兼收 running 帧(worker hook sidecar <maestro>/orch-hooks/running.log):
 # ticket-running → dispatch 节点 dispatched→running(幂等,现态非 dispatched 跳过)
-orch selftest                       # 离线全链自测(fake stub,58 断言,含 S18 bridge 武装硬门)
+orch selftest                       # 离线全链自测(fake stub,110 断言,含 S18 武装硬门 + S19-S26 dag 族全链)
 ```
 
 细节(`--force` 重复派发/`--no-ticket`/退出码表/状态机表)看 `orch --help` 与源码头注;首次实弹冒烟归编排席。
 
-## Orca 面 — 编排邮箱正统链(历史:orch-dag 的内部实现参考,禁止 agent 手拼派发)
+## Orca 面 — 编排邮箱正统链(dag 族与 dispatch 的内部实现参考,禁止 agent 手拼派发)
 
 **红线**: 本机调 Orca CLI 一律 `ORCA=/opt/Orca/resources/bin/orca-ide`(每会话解析一次,全程复用)。**绝对禁止裸调 `orca`** —— 本机(Linux 非 Orca 终端)裸 `orca` 解析到 GNOME 读屏器 `/usr/bin/orca`,会挂起语音会话。
 
@@ -85,7 +85,7 @@ orch selftest                       # 离线全链自测(fake stub,58 断言,含
 ORCA orchestration run-create ...                                      # → run_<id>
 ORCA orchestration task-create <run_id> ...                            # → task_<id>
 ORCA orchestration dispatch --inject --to <terminal-handle> --task <task_id>
-# 完成等待 = 回调唯一: worker_done 原生唤醒编排席回合,不轮询(check --wait 已退役)
+# 完成等待 = 回调唯一: worker_done 原生唤醒编排席回合,不轮询(阻塞式 check 等待已退役)
 ORCA orchestration check --ack <deliveryId>            # 仅对已收到的 delivery 结算
 ORCA orchestration worker-release --dispatch <ctx>
 # ORCA orchestration check --peek: 已退役(deprecated),只读诊断 —— 仅排障看未读,不消费、不作等待手段
