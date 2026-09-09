@@ -6,6 +6,8 @@
 # 随回合终结快速回收, python 解释器启动(~50ms+)必输退出竞速(p1-p3/run1-4 全灭),
 # jq 单二进制与存活 trace 同速级。ups 侧不在竞速窗口, 保留 python。
 # env: ORCH_SIG ORCH_INBOX ORCH_INFLIGHT [ORCH_IDLE_ALL]
+# 2026-09-09 增(HOOK-ENVELOPE B′): ticket-done 的 to 优先取 inflight 第 5 列(信封 FROM,
+#   来路即目标,双编排者不串席);空(存量 4 列/探针)回落 ORCH_SIG。turn-idle 分支保持 ORCH_SIG。
 STDIN="$(cat 2>/dev/null || :)"
 [ -n "$ORCH_INBOX" ] || ORCH_INBOX="$HOME/.dsh/maestro/bridge/inbox.log"
 [ -n "$ORCH_INFLIGHT" ] || ORCH_INFLIGHT="$HOME/.dsh/maestro/orch-hooks/inflight"
@@ -24,13 +26,15 @@ INFILE="$ORCH_INFLIGHT/$SID"
 if [ -s "$INFILE" ]; then
   REF="$(awk -F'\t' 'NR==1{print $1}' "$INFILE" 2>/dev/null)"
   OTYPE="$(awk -F'\t' 'NR==1{print $4}' "$INFILE" 2>/dev/null)"
+  TO_SIG="$(awk -F'\t' 'NR==1{print $5}' "$INFILE" 2>/dev/null)"   # HOOK-ENVELOPE: 信封来路 FROM
   [ -n "$REF" ] || REF="dispatch"
-  [ -n "$ORCH_DEBUG" ] && echo "branch: PAIRED ref=$REF rm=$INFILE pre-size=$(wc -c <"$INFILE" 2>/dev/null) t1=$(date +%s%3N)" >> "$ORCH_DEBUG" 2>/dev/null || :
+  [ -n "$TO_SIG" ] || TO_SIG="$ORCH_SIG"   # 存量 4 列 inflight/探针 → 回落本席 ORCH_SIG
+  [ -n "$ORCH_DEBUG" ] && echo "branch: PAIRED ref=$REF to=$TO_SIG rm=$INFILE pre-size=$(wc -c <"$INFILE" 2>/dev/null) t1=$(date +%s%3N)" >> "$ORCH_DEBUG" 2>/dev/null || :
   rm -f "$INFILE" 2>/dev/null || :
-  jq -cn --arg sig "$ORCH_SIG" --arg from "$SID" \
+  jq -cn --arg sig "$ORCH_SIG" --arg to "$TO_SIG" --arg from "$SID" \
         --arg ref "$REF" --arg otype "$OTYPE" \
         --arg ts "$(date +%s000)" '
-        {"type":"ticket-done","from":$from,"to":$sig,
+        {"type":"ticket-done","from":$from,"to":$to,
          "body":("[ref:" + $ref + "] worker turn done (paired; ticket type=" + $otype + ")"),
          "ref":$ref,"msgid":(now*1000|floor|tostring),"ts":($ts|tonumber),"ver":3}' \
     >> "$ORCH_INBOX" 2>"${ORCH_DEBUG:-/dev/null}" || :

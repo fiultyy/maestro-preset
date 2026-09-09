@@ -6,6 +6,8 @@
 #   done 不在此发(原生 worker_done 负责,防双报),不落 inflight。
 # 无信封非派票(人打字/普通 prompt)=静默。Tolerates everything: 任何缺失/失败 exit 0
 # (设计同 memsvc hooks 家族; fail-open, 不阻回合)。
+# 2026-09-09 增(HOOK-ENVELOPE B′): inflight 第 5 列存信封 FROM(来路即目标);
+#   turn-end-pair.sh 的 ticket-done to 优先取之,空回落 ORCH_SIG(兼容存量 4 列)。
 # env: ORCH_SIG(编排者签名) ORCH_INBOX(桥收件箱) ORCH_INFLIGHT(配对态目录) ORCH_RUNNING(running sidecar)
 STDIN="$(cat 2>/dev/null || :)"
 [ -n "$ORCH_INBOX" ] || ORCH_INBOX="$HOME/.dsh/maestro/bridge/inbox.log"
@@ -58,7 +60,7 @@ case "$REF" in ''|'-') REF="dispatch" ;; esac
 [ -n "$ORCH_DEBUG" ] && echo "branch: ENVELOPE from=$FROM ref=$REF sid=$SID" >> "$ORCH_DEBUG" 2>/dev/null || :
 
 mkdir -p "$ORCH_INFLIGHT" 2>/dev/null || :
-printf '%s\t%s\t%s\t%s\n' "$REF" "$OMSGID" "$(date +%s)" "$OTYPE" > "$ORCH_INFLIGHT/$SID" 2>/dev/null || :
+printf '%s\t%s\t%s\t%s\t%s\n' "$REF" "$OMSGID" "$(date +%s)" "$OTYPE" "$FROM" > "$ORCH_INFLIGHT/$SID" 2>/dev/null || :
 
 ORCH_SIG="$ORCH_SIG" ORCH_INBOX="$ORCH_INBOX" FROM="$FROM" REF="$REF" \
 OTYPE="$OTYPE" SID="$SID" NEWMSGID="$(python3 -c 'import uuid;print(uuid.uuid4())')" \
