@@ -59,6 +59,7 @@ orch dag-seat <REF> [--name <worktree>]                # worker-start(固定 omp
 orch dag-settle <REF> [--outcome "<≤300字>"] [--dispatch <ctx>]   # 票/node → running「复验待关账」;重复回调幂等
 orch dag-close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口,手工)
 orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca task 并排(只读)
+# 票面卫生(CONTRACT-HYGIENE): 测试票(非真实派发目的的 ledger ticket)即建即拒——dag-close rejected 关账,理由必填(outcome/note);生产 ledger 禁留无主测试票
 ```
 
 **与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch dag 族是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 dag 族行为用的参考,**不是第二条派发路径**。
