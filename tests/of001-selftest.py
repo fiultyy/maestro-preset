@@ -54,10 +54,18 @@ class StubHandler(BaseHTTPRequestHandler):
 
 
 def envelope_lines():
-    """stub 收到的所有 DSHMSG 信封原文(含前缀)。"""
+    """stub 收到的所有 DSHMSG 信封原文(含前缀)。
+    wire 双形容忍(与 of006 回流修正同源): session-send v4 默认 DSH_WIRE=slash →
+    信文在 payload.args.request.content[0].text;dot 退路在 payload.content[0].text。"""
     out = []
     for rec in StubHandler.records:
-        out.append(rec['payload']['content'][0]['text'])
+        pay = rec.get('payload') or {}
+        req = (pay.get('args') or {}).get('request') or {}
+        node = req if req else pay
+        ct = node.get('content') or [{}]
+        text = (ct[0] or {}).get('text')
+        if text:
+            out.append(text)
     return out
 
 
