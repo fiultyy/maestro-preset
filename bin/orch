@@ -302,12 +302,17 @@ def resolve_project_key(ident):
         c.close()
 
 def get_node(project_ident, node_id):
-    """只读取 node 行;无表/无行返回 None。"""
+    """只读取 node 行;无表/无行/库未建返回 None。
+    (ORCH-UNIFY 修: connect 失败与查询失败分离——库文件不存在时 mode=ro connect 即抛,
+    旧写法 finally 踩未绑定 c → UnboundLocalError。)"""
     key = resolve_project_key(project_ident)
     if not key:
         return None
     try:
         c = read_only_db()
+    except sqlite3.OperationalError:
+        return None
+    try:
         row = c.execute("SELECT node_id,kind,title,status,owner,refs,updated_at FROM nodes WHERE project_key=? AND node_id=?",
                         (key, node_id)).fetchone()
         return dict(zip(['node_id', 'kind', 'title', 'status', 'owner', 'refs', 'updated_at'], row)) if row else None
@@ -331,9 +336,12 @@ def refs_as_dict(raw):
     return {}, f'refs 为 {type(v).__name__} 非 dict: {str(raw)[:60]}'
 
 def find_node_by_run(run_id):
-    """跨项目按 refs.run 找 orch 节点(wait 无 last-run 时兜底)。"""
+    """跨项目按 refs.run 找 orch 节点(settle 无 last-run 时兜底);库未建/无表→None。"""
     try:
         c = read_only_db()
+    except sqlite3.OperationalError:
+        return None
+    try:
         rows = c.execute("SELECT project_key,node_id,kind,title,status,refs FROM nodes WHERE refs LIKE ?",
                          (f'%{run_id}%',)).fetchall()
     except sqlite3.OperationalError:
@@ -349,6 +357,9 @@ def find_node_by_run(run_id):
 def get_ticket(tid):
     try:
         c = read_only_db()
+    except sqlite3.OperationalError:
+        return None
+    try:
         row = c.execute("SELECT ticket_id,state,lease_owner FROM tickets WHERE ticket_id=?", (tid,)).fetchone()
         return {'state': row[1], 'lease_owner': row[2]} if row else None
     except sqlite3.OperationalError:
@@ -359,6 +370,9 @@ def get_ticket(tid):
 def ticket_exists(tid):
     try:
         c = read_only_db()
+    except sqlite3.OperationalError:
+        return False
+    try:
         return c.execute("SELECT 1 FROM tickets WHERE ticket_id=?", (tid,)).fetchone() is not None
     except sqlite3.OperationalError:
         return False
@@ -733,9 +747,13 @@ def _dag_doc_id(doc, what, *names, prefix):
     return hit
 
 def dag_ticket_refs(ref):
-    """从 ledger.db 只读票 refs(orca_task 等),供幂等纳管;票/表不存在→None。"""
+    """从 ledger.db 只读票 refs(orca_task 等),供幂等纳管;票/表/库未建→None。
+    (connect 失败与查询失败分离,同 get_ticket 修法。)"""
     try:
         c = read_only_db()
+    except sqlite3.OperationalError:
+        return None
+    try:
         row = c.execute("SELECT refs FROM tickets WHERE ticket_id=?", (ref,)).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -825,6 +843,11 @@ def cmd_dag_task(a):
     dag_save(s)
     print(f'task: {a.ref} -> {tid}')
 
+def dag_ensure_project(project):
+    """项目未登记才补注册(幂等 upsert,同 cmd_dispatch 派发路径;账本空库自举)。"""
+    if resolve_project_key(project) is None:
+        run_ledger(['project', project, os.path.basename(str(project).rstrip('/')) or 'proj'])
+
 def cmd_dag_seat(a):
     bridge_arm_gate()
     s = dag_load()
@@ -839,6 +862,7 @@ def cmd_dag_seat(a):
                      '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT],
                     f'worker-start({a.ref})')
     ctx = _dag_doc_id(doc, f'worker-start({a.ref})', 'dispatchId', 'dispatch_id', 'dispatch', prefix='ctx_')
+    dag_ensure_project(s['project'])   # 账本空库自举: node 写路径要求项目在册(ledger resolve_project fail-loud)
     run_ledger(['ticket', 'refs-set', a.ref, '--json',
                 json.dumps({'dispatch': ctx, 'worktree': name, 'agent': DAG_AGENT}, ensure_ascii=False)],
                f'ticket refs-set 失败({a.ref})')
@@ -847,6 +871,77 @@ def cmd_dag_seat(a):
                 json.dumps({'run': s['run'], 'orca_task': tid, 'dispatch': ctx}, ensure_ascii=False)],
                f'ledger node 失败({a.ref})')
     print(f'seat: {a.ref} dispatched dispatch={ctx}')
+
+def cmd_dag_settle(a):
+    """worker_done 回调收讫(ADR-013 单车道): 票/node → running「复验待关账」。
+    --dispatch 给出时顺带 worker-release(Orca 原生 worker_done 场景)。
+    幂等: 已 running 及之后现态跳过;ledger 票面 deps 未就绪拒迁 → fail-loud(屏障第三层)。"""
+    for line in sweep_running_frames():
+        print(f'orch: {line}', file=sys.stderr)
+    row = get_ticket(a.ref)
+    if row is None:
+        die(f'票不存在: {a.ref}(dag 族票以 ref 为 ticket_id,先 orch dag-task)', 1)
+    if row['state'] in ('dispatched', 'blocked'):
+        run_ledger(['ticket', 'state', a.ref, 'running', '--source', 'orch-dag',
+                    '--note', 'worker_done 收讫,复验待关账(dag-close 才终态)'],
+                   f'ticket→running 失败({a.ref})')
+    else:
+        print(f"settle: 票 {a.ref} 现态 {row['state']},幂等跳过(非 dispatched/blocked)")
+    project = dag_load().get('project') or os.getcwd()
+    node = get_node(project, a.ref)
+    if node and node['status'] in ('dispatched', 'blocked'):
+        try:
+            node_transition(project, a.ref, 'running', 'worker_done', (a.outcome or '回调收讫')[:300],
+                            source='orch-dag', auto_path=True)
+        except SystemExit as e:
+            print(f'orch: WARN node 记账跳过({e.code}): {a.ref}', file=sys.stderr)
+    if a.dispatch:
+        rc, _, err = run_orca(['orchestration', 'worker-release', '--dispatch', a.dispatch])
+        if rc != 0:
+            print(f'orch: WARN worker-release 失败(rc={rc}): {(err or "").strip()[:200]}(账已记 running)',
+                  file=sys.stderr)
+    print(f'settle: {a.ref} → running(复验待关账) outcome={(a.outcome or "")[:80]}')
+
+def cmd_dag_close(a):
+    """复验后关账(唯一终态入口,手工): ticket 终态 + node 合法同步 + closed 事件。
+    rejected/rolled-back 为票面语义,node 只记事件(node 状态机无此二态)。"""
+    if a.state not in ('done', 'rejected', 'rolled-back', 'blocked'):
+        die('close 仅接受 done|rejected|rolled-back|blocked', 64)
+    if get_ticket(a.ref) is None:
+        die(f'票不存在: {a.ref}', 1)
+    run_ledger(['ticket', 'state', a.ref, a.state, '--source', 'orch-dag',
+                '--note', (a.outcome or '')[:300]], f'ticket close 失败({a.ref})')
+    project = dag_load().get('project') or os.getcwd()
+    node = get_node(project, a.ref)
+    node_map = {'done': 'done', 'blocked': 'blocked'}
+    if node and a.state in node_map and node['status'] not in NODE_TERMINAL:
+        try:
+            node_transition(project, a.ref, node_map[a.state], f'closed-{a.state}',
+                            (a.outcome or '')[:300], source='orch-dag', auto_path=True)
+        except SystemExit as e:
+            print(f'orch: WARN node 记账跳过({e.code}): {a.ref}', file=sys.stderr)
+    dag_ensure_project(project)   # 账本空库自举: closed 事件要求项目在册
+    run_ledger(['event', project, a.ref, f'closed-{a.state}', (a.outcome or '')[:300],
+                '--source', 'orch-dag'], f'event 失败({a.ref})')
+    print(f'close: {a.ref} -> {a.state}')
+
+def cmd_dag_status(a):
+    for line in sweep_running_frames():
+        print(f'orch: {line}', file=sys.stderr)
+    s = dag_load()
+    doc = {'seat': s.get('seat'), 'run': s.get('run'), 'project': s.get('project'),
+           'refs': {k: v.get('orca_task') for k, v in s.get('refs', {}).items()}}
+    if a.json:
+        print(json.dumps(doc, ensure_ascii=False))
+    else:
+        print(json.dumps(doc, ensure_ascii=False, indent=1))
+    if s.get('run') and s.get('seat'):
+        out = orca_json(['orchestration', 'task-list', '--from', s['seat']], 'task-list')
+        tasks = find_key(out, 'tasks')
+        for t in (tasks if isinstance(tasks, list) else []):
+            if isinstance(t, dict):
+                print(f"  {t.get('id')} {str(t.get('status')):10} "
+                      f"{t.get('task_title') or t.get('display_name') or ''}"[:110])
 
 # ── 子命令: wait ─────────────────────────────────────────────────────────────
 def settle_node(project, node_id, to_status, event_type, detail):
@@ -1526,6 +1621,21 @@ def cmd_selftest(a):
             return None
         c.check('S21 Orca --deps 瀑布透传(V4)', tc_deps('T2') == [tid1] and tc_deps('T3') == [tid1, tid2], str(tcs))
 
+        # S21b 全新账本(ledger.db 尚未建)dag-task 不崩 + ledger 自举
+        #   (ORCH-UNIFY 修: 只读连接 connect 失败与查询失败分离;旧写法 finally 踩未绑定 c)
+        freshenv = dict(env)
+        freshenv['MAESTRO_LEDGER'] = os.path.join(tmp, 'fresh-ledger.db')
+        freshenv['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fresh2.json')
+        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {}},
+                  open(freshenv['ORCH_DAG_STATE'], 'w'))
+        p = _orch(['dag-task', 'DF-1', '--title', 'F1', '--spec', 'f1'], freshenv, cwd=proj)
+        c.check('S21b 全新账本 dag-task rc=0 无 Traceback', p.returncode == 0
+                and 'Traceback' not in p.stderr, p.stderr[-200:])
+        freshdb = sqlite3.connect(freshenv['MAESTRO_LEDGER'])
+        frow = freshdb.execute("SELECT state FROM tickets WHERE ticket_id='DF-1'").fetchone()
+        freshdb.close()
+        c.check('S21b ledger 自举写票 dispatched', bool(frow) and frow[0] == 'dispatched', str(frow))
+
         # S22 dag-seat 派发: worker-start(硬编码 omp×new-top-level)+ node/ticket/state 多写
         p = _orch(['dag-seat', 'DR-1'], env, cwd=proj)
         c.check('S22 dag-seat rc=0', p.returncode == 0, p.stderr)
@@ -1544,6 +1654,50 @@ def cmd_selftest(a):
         drefs = dag_ticket_refs('DR-1') or {}
         c.check('S22 refs-set 落 dispatch/worktree/agent', str(drefs.get('dispatch', '')).startswith('ctx_')
                 and drefs.get('worktree') == 'dr-1' and drefs.get('agent') == 'omp', str(drefs))
+
+        # S23 dag-settle: worker_done 回调收讫→running「复验待关账」+ 幂等 + deps 第三层屏障
+        p = _orch(['dag-settle', 'DR-1', '--outcome', 'DR-1 落地'], env, cwd=proj)
+        c.check('S23 settle rc=0', p.returncode == 0, p.stderr)
+        c.check('S23 票 running', (get_ticket('DR-1') or {}).get('state') == 'running', str(get_ticket('DR-1')))
+        c.check('S23 node running', (get_node(proj, 'DR-1') or {}).get('status') == 'running')
+        p = _orch(['dag-settle', 'DR-1'], env, cwd=proj)
+        c.check('S23 重复收讫幂等 rc=0', p.returncode == 0 and '幂等跳过' in p.stdout, p.stdout + p.stderr)
+        c.check('S23 node 仍 running', (get_node(proj, 'DR-1') or {}).get('status') == 'running')
+        p = _orch(['dag-settle', 'DR-2'], env, cwd=proj)   # DR-2 dep DR-1(未 done)→ ledger deps 门拒
+        c.check('S23 提前收讫 ledger deps 门 fail-loud rc=5', p.returncode == 5
+                and 'deps 未就绪' in (p.stdout + p.stderr), (p.stdout + p.stderr)[-200:])
+        c.check('S23 DR-2 票态未动', (get_ticket('DR-2') or {}).get('state') == 'dispatched')
+
+        # S24 dag-close: 复验后关账(唯一终态入口);rejected 只记事件不同步 node
+        p = _orch(['dag-close', 'DR-1', 'done', '--outcome', '复验通过'], env, cwd=proj)
+        c.check('S24 close done rc=0', p.returncode == 0, p.stderr)
+        c.check('S24 票 done', (get_ticket('DR-1') or {}).get('state') == 'done', str(get_ticket('DR-1')))
+        c.check('S24 node done', (get_node(proj, 'DR-1') or {}).get('status') == 'done')
+        con = sqlite3.connect(db)
+        ev_done = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-done'").fetchone()[0]
+        con.close()
+        c.check('S24 closed-done 事件记账', ev_done >= 1, f'closed-done 事件数={ev_done}')
+        _orch(['dag-seat', 'DR-2'], env, cwd=proj)   # deps DR-1 已 done,可派发
+        p = _orch(['dag-close', 'DR-2', 'rejected', '--outcome', '复验不过'], env, cwd=proj)
+        c.check('S24 close rejected rc=0', p.returncode == 0, p.stderr)
+        c.check('S24 票 rejected', (get_ticket('DR-2') or {}).get('state') == 'rejected')
+        c.check('S24 node 不同步(仍 dispatched,事件已记)',
+                (get_node(proj, 'DR-2') or {}).get('status') == 'dispatched')
+        con = sqlite3.connect(db)
+        ev_rej = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-2' AND event_type='closed-rejected'").fetchone()[0]
+        con.close()
+        c.check('S24 closed-rejected 事件记账', ev_rej >= 1, f'closed-rejected 事件数={ev_rej}')
+
+        # S25 dag-status 只读视图
+        p = _orch(['dag-status', '--json'], env, cwd=proj)
+        try:
+            sdoc = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:
+            sdoc = {}
+        c.check('S25 dag-status --json 结构', p.returncode == 0 and sdoc.get('seat') == 'term_seat'
+                and str((sdoc.get('refs') or {}).get('DR-1', '')).startswith('task_'), p.stdout[:200])
+        p = _orch(['dag-status'], env, cwd=proj)
+        c.check('S25 dag-status 文本 rc=0(走 task-list stub)', p.returncode == 0, p.stderr[-160:])
 
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
@@ -1607,6 +1761,20 @@ def main():
     p.add_argument('ref')
     p.add_argument('--name', help='worktree 名(缺省 ref 小写)')
     p.set_defaults(f=cmd_dag_seat)
+    p = sub.add_parser('dag-settle', help='dag 族: worker_done 回调收讫→票/node running「复验待关账」')
+    p.add_argument('ref')
+    p.add_argument('--outcome', default='', help='≤300字 收讫摘要(入事件)')
+    p.add_argument('--dispatch', help='顺带 worker-release 的 dispatch id(Orca 原生 worker_done 场景)')
+    p.set_defaults(f=cmd_dag_settle)
+    p = sub.add_parser('dag-close', help='dag 族: 复验后关账(唯一终态入口,手工)')
+    p.add_argument('ref')
+    p.add_argument('state', choices=['done', 'rejected', 'rolled-back', 'blocked'])
+    p.add_argument('--outcome', required=True, help='≤300字 关账摘要')
+    p.set_defaults(f=cmd_dag_close)
+    p = sub.add_parser('dag-status', help='dag 族: seat/run/refs+Orca task 并排(只读)')
+    p.add_argument('--ref')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(f=cmd_dag_status)
     p = sub.add_parser('selftest', help='离线自测(fake ORCH_BIN stub 全链走查)')
     p.set_defaults(f=cmd_selftest)
     p = sub.add_parser('_transition', help=argparse.SUPPRESS)
