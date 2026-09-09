@@ -7,7 +7,12 @@
      DSHMSG 达 owner(notify=session-send 经 stub fleet/server,信封含 msgid)
   ② 进程面合成场景: 假进程低 CPU+旧 mtime 双条件命中;单条件(低CPU新日志 / 高CPU旧日志)不误报;
      连续挂死 latch 只报一次;进程缺席不判定不崩溃
-  ③④ 留位断言: sla/lease 配置项 → WATCHD-STUB NotImplemented 提示,exit 0 不崩溃,不投递 DSHMSG
+  ③ SLA 面: 过载票超 ttl → sla-overdue;新鲜/终态不报;latch 重放零回声;迁终态复位
+  ③b SLA 依赖感知(#122/SLA-TTL): blocked+非终态 deps(∈ dispatched/running/blocked)=设计内
+     依赖屏障不计龄零告警(含 dep blocked 瀑布形);blocked+deps 全终态/无 deps/dep 票不可查
+     =照常计龄告警;屏障解除(dep 迁终态)转计龄/屏障生效(dep 回在飞)复位 latch;
+     dispatched/running 零变化(running 带在飞 dep 不豁免,deps 逻辑只触及 blocked)
+  ④ 租约面: fleet owner lease 过期 → lease-expired;有效租约不报;latch/复位
   ⑤ 单实例锁 + SIGTERM 优雅退出: 后起实例 exit 3 打印持有者;TERM → WATCHD-SHUTDOWN exit 0 无残留
   ★ 自续期(D-09 ②,任务书 bin 范围): max_rounds 到期边界有活动(存活目标)→WATCHD-RENEW 顺延;
     活动消失 → WATCHD-EXIT 退场,无残留进程
@@ -282,6 +287,68 @@ def main():
         con.commit(); con.close()
         r = run_once(cfg3, st3, extra_env={'MAESTRO_LEDGER': ldb})
         check('票迁终态 → 不再报', 'sla-overdue' not in r.stdout)
+
+        print('\n③b SLA 依赖感知(blocked 两支: 非终态 deps=屏障不计龄;'
+              '全终态/无 deps/dep 票不可查=计龄;#122/SLA-TTL):')
+        # 独立 temp ledger;blocked 票一律 updated 5h 前(ttl=60m,若计龄必触发):
+        #   屏障支: T-BAR(dep running)/T-BAR2(dep blocked,R41 瀑布形) → 零告警
+        #   计龄支: T-STALL(dep done)/T-NODEP(无 deps)/T-MISS(dep 票不可查) → 各响一次
+        #   零变化支: T-DISP(dispatched)/T-RUN(running 且带在飞 dep,deps 逻辑不触及)
+        #             → 照常计龄(现行为钉死)
+        ldb2 = os.path.join(tmp, 'ledger2.db')
+        _old = (_now - _td(hours=5)).isoformat()
+        con = _sq.connect(ldb2)
+        con.execute("""CREATE TABLE IF NOT EXISTS tickets(ticket_id TEXT PRIMARY KEY,
+            title TEXT, state TEXT, deps TEXT DEFAULT '[]', lease_owner TEXT,
+            refs TEXT DEFAULT '{}', outcome TEXT, updated_at TEXT)""")
+        con.executemany(
+            "INSERT INTO tickets(ticket_id,title,state,deps,updated_at) VALUES(?,?,?,?,?)",
+            [('T-BAR', 'blocked 等在飞 dep(屏障)', 'blocked', '["T-DEP-RUN"]', _old),
+             ('T-DEP-RUN', 'dep 在飞', 'running', '[]', _now.isoformat()),
+             ('T-BAR2', 'blocked 等blocked dep(瀑布形屏障)', 'blocked', '["T-DEP-BLK"]', _old),
+             ('T-DEP-BLK', 'dep blocked', 'blocked', '[]', _old),
+             ('T-STALL', 'blocked 但 dep 已 done', 'blocked', '["T-DEP-DONE"]', _old),
+             ('T-DEP-DONE', 'dep 终态', 'done', '[]', _old),
+             ('T-NODEP', 'blocked 无 deps', 'blocked', '[]', _old),
+             ('T-MISS', 'blocked 但 dep 票不可查', 'blocked', '["T-NO-SUCH"]', _old),
+             ('T-DISP', 'dispatched 老化(零变化支)', 'dispatched', '[]', _old),
+             ('T-RUN', 'running 带在飞 dep(deps 不触及,零变化支)', 'running',
+              '["T-DEP-RUN"]', _old)])
+        con.commit(); con.close()
+        cfg3b = os.path.join(tmp, 'w-sla-dep.json')
+        st3b = os.path.join(tmp, 'st-sla-dep')
+        write_cfg(cfg3b, {'interval': 1, 'notify': 'stdout',
+                          'faces': {'sla': [{'name': 'ticket-ttl', 'ttl_min': 60}]}})
+        r = run_once(cfg3b, st3b, extra_env={'MAESTRO_LEDGER': ldb2})
+        fired = [l for l in r.stdout.splitlines() if 'sla-overdue' in l]
+        check('屏障支: blocked+dep running/blocked 不计龄零告警',
+              r.returncode == 0 and not any('ticket=T-BAR' in l for l in fired),
+              f'fired={len(fired)}')
+        check('计龄支: dep done/无 deps/dep 票不可查 → sla-overdue 各一次',
+              sum('ticket=T-STALL ' in l for l in fired) == 1
+              and sum('ticket=T-NODEP ' in l for l in fired) == 1
+              and sum('ticket=T-MISS ' in l for l in fired) == 1)
+        check('零变化支: dispatched/running 照常计龄(running 带在飞 dep 不豁免)',
+              sum('ticket=T-DISP ' in l for l in fired) == 1
+              and sum('ticket=T-RUN ' in l for l in fired) == 1)
+        check('本轮 sla-overdue 总数=6(屏障两票零回声;T-DEP-BLK 自身无 deps 照常计龄)',
+              len(fired) == 6)
+        r = run_once(cfg3b, st3b, extra_env={'MAESTRO_LEDGER': ldb2})
+        check('依赖感知 latch: 重放零回声', 'sla-overdue' not in r.stdout)
+        con = _sq.connect(ldb2)  # 屏障解除: dep 迁终态 → T-BAR 转入计龄支
+        con.execute("UPDATE tickets SET state='done' WHERE ticket_id='T-DEP-RUN'")
+        con.commit(); con.close()
+        r = run_once(cfg3b, st3b, extra_env={'MAESTRO_LEDGER': ldb2})
+        check('屏障解除(dep 迁终态) → T-BAR 转计龄告警', 'ticket=T-BAR age=' in r.stdout)
+        con = _sq.connect(ldb2)  # 屏障生效反向: dep 回在飞 → T-STALL 转屏障(latch 已复位)
+        # updated_at 同步刷新——真实账本状态迁移会盖 updated_at(否则 dep 自身按旧
+        # 时间戳计龄告警,那是对台账写的失真,非屏障语义缺陷)
+        con.execute("UPDATE tickets SET state='running',updated_at=? WHERE ticket_id='T-DEP-DONE'",
+                    (_now.isoformat(),))
+        con.commit(); con.close()
+        r = run_once(cfg3b, st3b, extra_env={'MAESTRO_LEDGER': ldb2})
+        check('屏障生效(dep 回在飞) → T-STALL 不再报(latch 随屏障复位)',
+              'sla-overdue' not in r.stdout)
 
         print('\n④ 租约面(fleet owner lease 过期 → lease-expired;有效租约=活动票):')
         flt = os.path.join(tmp, 'fleet34.json')
