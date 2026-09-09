@@ -12,6 +12,8 @@
   ④ 回归: running sidecar 分支不回归(preamble prompt → ticket-running 帧,零 inflight 零 inbox);
      turn-idle 分支 to=ORCH_SIG
   ⑤ 部署面 cmp: 仓内 bin/ ↔ ~/.dsh/maestro/bin/ ↔ ~/.dsh/.agent-presets/maestro/bin/ 三面一致
+  ⑥ ENVELOPE-SCAN20(#136): 信封识别窗=前 20 行 + 信封>preamble 优先级 — preamble 占首行信封
+      第 3 行 → 信封命中;第 20/21 行边界钉死;仅 preamble 无信封 sidecar 不变;e2e done 帧原文
 
 域隔离: ORCH_INBOX/ORCH_INFLIGHT/ORCH_RUNNING 全指 tempfile,零真桥流量,不触真实会话。
 """
@@ -261,6 +263,95 @@ def v4_no_envelope_silent(tmp, base):
     after = sum(1 for _ in open(base['ORCH_INBOX'], encoding='utf-8'))
     assert before == after and not os.path.exists(os.path.join(inflight_dir(base), 'sess-plain'))
     print('[ ok ] v4 无信封普通 prompt 静默不变')
+
+
+# ── ⑥ ENVELOPE-SCAN20: 信封识别窗前 20 行 + 信封>preamble 优先级 ─────────────
+def _envline(from_sig, ref):
+    return envelope_prompt(from_sig, ref).split('\n', 1)[0]
+
+
+@case
+def v1_scan20_env_after_preamble(tmp, base):
+    """preamble 占首行 + 信封第 3 行 → 信封分支优先(原 NR==1 永不命中的场景)。"""
+    e = dict(base)
+    run_before = sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip())
+    prompt = ('You are a dispatched worker.\n'
+              'Your coordinator handle: term_c\n'
+              + _envline('orch-s20@session-s20', 'OF11-S20A') + '\n'
+              + '正文若干\n')
+    p = run_script(UPS, {'session_id': 'sess-s20a', 'prompt': prompt}, e)
+    assert p.returncode == 0, p.stderr
+    row = open(os.path.join(inflight_dir(base), 'sess-s20a'), encoding='utf-8').read().rstrip('\n')
+    cols = row.split('\t')
+    assert len(cols) == 5 and cols[0] == 'OF11-S20A' and cols[4] == 'orch-s20@session-s20', cols
+    assert sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip()) == run_before
+    frames = [json.loads(l) for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()]
+    assert frames[-1]['type'] == 'ticket-received' and frames[-1]['ref'] == 'OF11-S20A', frames[-1]
+    print('[ ok ] v1 preamble 首行+信封第 3 行 → 信封命中(sidecar 零帧),inflight 5 列第 5 列=FROM')
+
+
+@case
+def v1_scan20_boundary_20_21(tmp, base):
+    """信封恰在第 20 行 → 命中;第 21 行 → 不命中(无 preamble → 静默)。"""
+    e = dict(base)
+    p20 = '\n'.join(f'填充第{i}行' for i in range(1, 20)) + '\n' \
+        + _envline('orch-b20@session-b20', 'OF11-S20B')
+    p = run_script(UPS, {'session_id': 'sess-b20', 'prompt': p20}, e)
+    assert p.returncode == 0, p.stderr
+    row = open(os.path.join(inflight_dir(base), 'sess-b20'), encoding='utf-8').read().rstrip('\n')
+    assert len(row.split('\t')) == 5 and row.split('\t')[4] == 'orch-b20@session-b20', row
+    in_before = sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip())
+    run_before = sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip())
+    p21 = '\n'.join(f'填充第{i}行' for i in range(1, 21)) + '\n' \
+        + _envline('orch-b21@session-b21', 'OF11-S20C')
+    p = run_script(UPS, {'session_id': 'sess-b21', 'prompt': p21}, e)
+    assert p.returncode == 0, p.stderr
+    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-b21'))
+    assert sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()) == in_before
+    assert sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip()) == run_before
+    print('[ ok ] v1 边界钉死: 信封第 20 行命中 / 第 21 行不命中(静默零落盘)')
+
+
+@case
+def v3_scan20_preamble_only_sidecar(tmp, base):
+    """仅 preamble(第 19 行,窗内)无信封 → sidecar 分支行为不变。"""
+    e = dict(base)
+    in_before = sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip())
+    lines = [f'填充第{i}行' for i in range(1, 19)]
+    lines += ['You are a dispatched worker.', 'Your task ID is: task_0f11c20']
+    p = run_script(UPS, {'session_id': 'sess-s20p', 'prompt': '\n'.join(lines)}, e)
+    assert p.returncode == 0, p.stderr
+    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-s20p'))
+    assert sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()) == in_before
+    run = [json.loads(l) for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip()]
+    assert run and run[-1]['type'] == 'ticket-running' and run[-1]['ref'] == 'task_0f11c20', run[-1]
+    print('[ ok ] v3 仅 preamble 无信封 → sidecar 照走(running.log 落 ticket-running,零 inbox 零 inflight)')
+
+
+@case
+def v3_scan20_e2e_done_frame(tmp, base):
+    """ENVELOPE-SCAN20 端到端沙盘: preamble+信封 prompt → ups → turn-end-pair → done 帧 to=信封 FROM。"""
+    e = dict(base)
+    prompt = ('You are a dispatched worker.\n'
+              'Your coordinator handle: term_e2e\n'
+              + _envline('orch-e20@session-e20', 'OF11-S20E2E') + '\n'
+              + '任务书正文\n')
+    p = run_script(UPS, {'session_id': 'sess-e20', 'prompt': prompt}, e)
+    assert p.returncode == 0, p.stderr
+    row = open(os.path.join(inflight_dir(base), 'sess-e20'), encoding='utf-8').read().rstrip('\n')
+    assert len(row.split('\t')) == 5 and row.split('\t')[4] == 'orch-e20@session-e20', row
+    p = run_script(PAIR, {'session_id': 'sess-e20'}, e)
+    assert p.returncode == 0, p.stderr
+    raw_done = ''
+    for l in open(base['ORCH_INBOX'], encoding='utf-8'):
+        if '"ticket-done"' in l and 'OF11-S20E2E' in l:
+            raw_done = l.rstrip('\n')
+    assert raw_done, 'done 帧缺失'
+    d = json.loads(raw_done)
+    assert d['to'] == 'orch-e20@session-e20', d   # 来路即目标
+    assert d['from'] == 'sess-e20' and d['ver'] == 3, d
+    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-e20'))   # 配对清态
+    print(f'[ ok ] v3 scan20 e2e done 帧原文: {raw_done}')
 
 
 # ── ⑤ 部署面 cmp ─────────────────────────────────────────────────────────────
