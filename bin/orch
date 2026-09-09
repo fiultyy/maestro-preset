@@ -4,8 +4,8 @@
   orch dispatch --spec <file|-> [--to <handle>] [--run <run_id> | --new-run "<objective>"]
                 [--title <t>] [--ref <ref>] [--project <key|path>] [--force]
                 [--no-ticket] [--dry-run] [--json]
-  orch wait     [--run <run_id>] [--timeout-ms 1500000]
-                [--types worker_done,escalation,question] [--json]
+  orch settle   [--run <run_id>] [--project <key|path>] [--json]
+                (--payload-file <f> | --payload <json> | --payload -)   # 回调收讫结算(非阻塞;阻塞 wait 已退役)
   orch dag-seat-open --project <path> [--title T]     # dag 族: 编排席终端幂等创建/复用
   orch dag-run "<objective>"                          # dag 族: 幂等建/续 Run
   orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
@@ -17,8 +17,9 @@
                                       # 内部: 显式状态机迁移(自测/人工修复用)
 机制:
   - 正统链封装(链序固化): run-create/run-use → task-create → dispatch --inject →
-    check --wait → (worker_done: check --ack + worker-release | escalation: ack+release |
-    question: 不动,等编排席 reply) ;旗标以 orca-ide 动态 guide 为准,链序以本文件为准。
+    完成等待=回调单车道(worker_done 原生唤醒编排席回合,ADR-013;收讫结算 orch settle:
+    worker_done→check --ack+worker-release+记账 | escalation→ack+release |
+    question→不动,等编排席 reply);旗标以 orca-ide 动态 guide 为准,链序以本文件为准。
   - ledger 自动建账(编排席规则7/8 硬机制): dispatch → node(dispatched)+event;
     收果 → node done/blocked + outcome 事件(≤300字);tickets 环(ticket add/lease/state)
     同步勾稽 —— pm-host-service PM-003 票源 = `ledger ticket list --json`(ledger.db
@@ -28,14 +29,14 @@
     同态重写=幂等 no-op;表外流转一律拒绝(exit 1)。ledger ticket 侧另有内置状态机,
     本工具按其迁移表求最短合法路径逐步迁移,拒绝即 fail-loud。
   - running 帧消费(orch-hooks sidecar,worker 侧 turn-start hook 产出;桥 inbox 不涉及):
-    wait/status 进门先 tail 增量(字节游标,原子推进)收 type=ticket-running 帧 →
+    status/settle/dag-status/dag-settle 进门先 tail 增量(字节游标,原子推进)收 type=ticket-running 帧 →
     dispatch 节点(及 ticket 环)dispatched→running;寻址(to==ORCH_SIG)+ref/task 双路
     解析(ref→node_id;task_*→refs.task;body [task:..] 兜底)+现态幂等(已 running/done 跳过)。
-  - 幂等: deliveryId 记账于 <state>/orch-deliveries.json(原子写),重复 wait 收到同一
+  - 幂等: deliveryId 记账于 <state>/orch-deliveries.json(原子写),重复 settle 收到同一
     delivery 不二次 ack/收尾/记账;同一 ref 重复 dispatch 默认拒(--force 放行并记 duplicate)。
   - 零实弹默认: 所有 orca-ide 调用可经 ORCH_BIN 注入 stub;--dry-run 只打印命令序列,
     零 orca/ledger 写路径调用。实弹冒烟归编排席。
-  - bridge 武装硬门(ORCH-WAKE ②): check --wait 已退役,回调是完成等待唯一手段 ——
+  - bridge 武装硬门(ORCH-WAKE ②): --wait 阻塞等待已退役(ADR-013),回调是完成等待唯一手段 ——
     dispatch(含 --dry-run)要求本席在 bridge/registry.json 有在册 consumer(非 stale),
     否则 exit 1 并给 arm 指引;无回信地址的派工其完成信号必然丢失,故默认强制。
   - dag 族(ORCH-UNIFY 收编自 orch-dag,唯一入口=orch): 原子生命周期
@@ -58,7 +59,7 @@
                      亦为 bridge 武装硬门的 caller 身份)
    ORCH_BRIDGE_REGISTRY  bridge/registry.json 路径覆盖(硬门在册检查;自测隔离用)
 退出码: 0 成功 · 1 状态机/重复拒绝/bridge 未武装硬门 · 2 question(等裁决) · 3 escalation(已 ack+release)
-        4 超时检查点(不记失败) · 5 运行失败 · 64 用法错误
+        5 运行失败 · 64 用法错误(缺参由 argparse 层 exit 2,dag 族契约同)
 """
 import argparse, json, os, re, sqlite3, subprocess, sys, tempfile
 from datetime import datetime, timezone
@@ -398,7 +399,7 @@ def orch_sig():
         return None
 
 # ── bridge 武装硬门(ORCH-WAKE 契约修复②,用户裁决 2026-09-09) ─────────────────
-# 「CB 桥武装应该默认强制的。契约中完全移除 check --wait,反而是武装回调是唯一
+# 「CB 桥武装应该默认强制的。契约中完全移除阻塞 check(--wait),反而是武装回调是唯一
 #  选项,减少 agent 行为选择性。」—— 回调是完成等待的唯一手段后,无回信地址的
 # 派工其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。故 dispatch(含 --dry-run)前置
 # 硬门: caller 会话(orch_sig() 解析 @ 后 sessionId)必须在 bridge/registry.json
@@ -414,7 +415,7 @@ def bridge_arm_gate():
             f'  本席签名: {sig or "(无 — 未设 ORCH_SIG/MAESTRO_ORCH_SIGNATURE,亦无 bridge/orch.signature)"}\n'
             '  → arm 指引: 本会话内武装回调桥(bridge_arm;或 POST /register {"sessionId":"<本会话id>","alias":"<别名>"}'
             ',端口见 bridge/http.port),取得 <alias>@<sessionId> 回信签名后重试。\n'
-            '  依据: check --wait 已退役,回调是完成等待唯一手段(ADR-0001 唤醒单车道)。',
+            '  依据: --wait 阻塞等待已退役,回调是完成等待唯一手段(ADR-013 唤醒单车道)。',
             1)
 
     if not sig or '@' not in sig:
@@ -702,7 +703,7 @@ def cmd_dispatch(a):
               + (' [duplicate]' if duplicate else ''))
         if ticket_note:
             print(ticket_note)
-        print(f"下一步: orch wait --run {run_id}")
+        print('下一步: 完成等待=回调(worker_done 原生唤醒,ADR-013);收讫结算 orch settle --payload-file <delivery>')
 
 # ── dag 族(ORCH-UNIFY 收编自 orch-dag;唯一入口=orch) ─────────────────────────
 # 原子生命周期: dag-seat-open→dag-run→dag-task[--deps]→dag-seat→(回调)dag-settle→dag-close。
@@ -954,7 +955,8 @@ def settle_node(project, node_id, to_status, event_type, detail):
         print(f'orch: WARN ledger node 记账跳过({e.code}): {node_id}', file=sys.stderr)
         return None
 
-def resolve_wait_target(a):
+def resolve_settle_target(a):
+    """settle 收讫对象解析: --run/--project 显式优先,缺省 last-run 指针 → refs 兜底。"""
     run = a.run
     rec = None
     if not run:
@@ -1039,7 +1041,7 @@ def settle_message(msg, run, project, node_id, ref, top_delivery):
         msg_id = msg.get('id') or ''
         print(f'question 待裁决: msg_id={msg_id}')
         print(f'  应答: orch reply --msg {msg_id} --body "<text>" --run {run}')
-        print(f'  然后重挂: orch wait --run {run}')
+        print('  应答后剩余完成信号仍走回调(worker_done 原生唤醒),无需轮询')
         return ('question', 2)
 
     # status/heartbeat/未知类型: ack 即可,不动账
@@ -1052,34 +1054,38 @@ def settle_message(msg, run, project, node_id, ref, top_delivery):
     print(f'{mtype or "unknown"}: ack, 账不动')
     return ('status', 0)
 
-def cmd_wait(a):
-    run, project, node_id, ref = resolve_wait_target(a)
+def cmd_settle(a):
+    """回调收讫结算(非阻塞,ADR-013 单车道): 完成信号=回调唤醒本席回合,唤醒携带的
+    delivery 文档(ex-阻塞 check 输出形态 {"deliveryId":..,"messages":[..]})经
+    --payload-file/--payload/- 传入,逐条 settle(ack/release/记账)。
+    退出码随消息类型: worker_done 0 / question 2 / escalation 3。"""
+    if a.payload_file and a.payload is not None:
+        die('--payload-file 与 --payload 二选一', 64)
+    if a.payload_file:
+        try:
+            with open(a.payload_file, encoding='utf-8') as f:
+                blob = f.read()
+        except OSError as e:
+            die(f'--payload-file 不可读: {e}', 64)
+    elif a.payload == '-':
+        blob = sys.stdin.read()
+    elif a.payload:
+        blob = a.payload
+    else:
+        die('缺 --payload-file/--payload(回调唤醒应携带 delivery 文档;阻塞拉取已退役)', 64)
+    if not blob.strip():
+        die('payload 为空(无可结算;完成信号本体=回调,不轮询)', 64)
+    run, project, node_id, ref = resolve_settle_target(a)
     for line in sweep_running_frames():   # 进门先收 running 帧(hook sidecar)
         print(f'orch: {line}', file=sys.stderr)
-    types = a.types
-    argv = ['orchestration', 'check', '--wait', '--run', run, '--types', types,
-            '--timeout-ms', str(a.timeout_ms)]
-    rc, out, err = run_orca(argv + ['--json'], timeout=a.timeout_ms / 1000.0 + 30)
-    for line in sweep_running_frames():   # 阻塞期间到达的帧一并收掉
-        print(f'orch: {line}', file=sys.stderr)
-    if rc != 0:
-        blob = (err or out or '').strip()
-        if not blob or any(k in blob.lower() for k in ('timeout', 'timed out', 'deadline', '超时')):
-            print(f'checkpoint: check --wait 超时/无消息(rc={rc}),续滚: orch wait --run {run}', file=sys.stderr)
-            sys.exit(4)
-        die(f'check --wait 失败(rc={rc}): {blob[:400]}', 5)
-    if not out.strip():
-        print(f'checkpoint: 无消息返回,续滚: orch wait --run {run}', file=sys.stderr)
-        sys.exit(4)
     try:
-        doc = json.loads(out)
+        doc = json.loads(blob)
     except json.JSONDecodeError:
-        die(f'check --wait 输出非 JSON: {out.strip()[:400]}', 5)
+        die('payload 非 JSON(期待 {"deliveryId":..,"messages":[..]} 形态)', 64)
     delivery_id = find_delivery_id(doc)
     messages = find_messages(doc)
     if not messages:
-        print(f'checkpoint: delivery={delivery_id or "?"} 无消息,续滚: orch wait --run {run}', file=sys.stderr)
-        sys.exit(4)
+        die(f'delivery={delivery_id or "?"} 无消息,无可结算', 64)
     worst, actions = 0, []
     for msg in messages:
         action, code = settle_message(msg, run, project, node_id, ref, delivery_id)
@@ -1112,7 +1118,7 @@ def cmd_reply(a):
         return
     orca_json(['orchestration', 'reply', '--id', a.msg, '--body', body, '--run', run], 'reply')
     print(f'replied: {a.msg} (run={run})')
-    print(f'重挂: orch wait --run {run} 收后续 worker_done')
+    print('后续完成信号仍走回调(worker_done 原生唤醒),无需重挂轮询')
 
 # ── 子命令: status(离线合并视图: node 生命周期 + refs(run/task/ctx) 并排) ─────
 def cmd_status(a):
@@ -1214,12 +1220,6 @@ elif argv[:2] == ['orchestration', 'worker-start']:
     out({'ok': True, 'result': {'dispatch': {'id': cid}}, 'dispatchId': cid})
 elif argv[:2] == ['orchestration', 'task-list']:
     out({'ok': True, 'result': {'tasks': []}})
-elif argv[:2] == ['orchestration', 'check'] and '--wait' in argv:
-    fx = os.environ.get('ORCH_FAKE_DELIVERY')
-    if not fx:
-        sys.stderr.write('check --wait: timed out after 100ms\n')
-        sys.exit(124)
-    sys.stdout.write(open(fx).read())
 elif argv[:2] == ['orchestration', 'check'] and '--ack' in argv:
     with open(os.environ['ORCH_FAKE_ACKS'], 'a') as f:
         f.write(argv[argv.index('--ack') + 1] + '\n')
@@ -1362,13 +1362,12 @@ def cmd_selftest(a):
         con.close()
         c.check('S3 duplicate 已记账', dup >= 1)
 
-        # S4 wait worker_done → ack+release+node done+ticket done+lease release
+        # S4 settle worker_done(回调收讫)→ ack+release+node done+ticket done+lease release
         resetspy()
         fx = delivery([{'id': 'm1', 'type': 'worker_done',
                         'payload': json.dumps({'taskId': s['task'], 'dispatchId': s['ctx'], 'outcome': '全部落地'})}],
                       'dlv_1')
-        env['ORCH_FAKE_DELIVERY'] = fx
-        p = _orch(['wait', '--run', s['run']], env)
+        p = _orch(['settle', '--run', s['run'], '--payload-file', fx], env)
         c.check('S4 worker_done rc=0', p.returncode == 0, p.stderr + p.stdout)
         c.check('S4 node done', get_node(proj, 'T-001')['status'] == 'done')
         c.check('S4 ticket done+lease 释放', get_ticket('T-001') == {'state': 'done', 'lease_owner': None},
@@ -1376,8 +1375,8 @@ def cmd_selftest(a):
         c.check('S4 ack 恰一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
         c.check('S4 release 恰一次 ctx', open(env['ORCH_FAKE_RELEASES']).read().split() == [s['ctx']],
                 open(env['ORCH_FAKE_RELEASES']).read())
-        # S5 幂等重放: 同 delivery 再 wait 不二次 ack/记账
-        p = _orch(['wait', '--run', s['run']], env)
+        # S5 幂等重放: 同 delivery 再 settle 不二次 ack/记账
+        p = _orch(['settle', '--run', s['run'], '--payload-file', fx], env)
         c.check('S5 重放 rc=0 且 skip', p.returncode == 0 and 'already settled' in p.stdout, p.stdout + p.stderr)
         c.check('S5 ack 仍一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
         c.check('S5 node 仍 done(未重复迁移)', get_node(proj, 'T-001')['status'] == 'done')
@@ -1388,31 +1387,28 @@ def cmd_selftest(a):
                    '--ref', 'T-002', '--project', proj, '--json'], env)
         s2 = json.loads(p.stdout.strip().splitlines()[-1])
         fx = delivery([{'id': 'm2', 'type': 'question', 'subject': '用 A 还是 B?', 'payload': ''}], 'dlv_2')
-        env['ORCH_FAKE_DELIVERY'] = fx
-        p = _orch(['wait', '--run', s2['run'], '--json'], env)
+        p = _orch(['settle', '--run', s2['run'], '--payload-file', fx, '--json'], env)
         c.check('S6 question rc=2', p.returncode == 2, p.stdout + p.stderr)
         acks = open(env['ORCH_FAKE_ACKS']).read().split() if os.path.exists(env['ORCH_FAKE_ACKS']) else []
         c.check('S6 不 ack', 'dlv_2' not in acks and not acks, str(acks))
         c.check('S6 node blocked', get_node(proj, 'T-002')['status'] == 'blocked')
         c.check('S6 ticket blocked', get_ticket('T-002')['state'] == 'blocked', str(get_ticket('T-002')))
-        c.check('S6 打印 reply 模板', f"orch reply --msg m2" in p.stdout and 'wait' in p.stdout, p.stdout)
+        c.check('S6 打印 reply 模板', 'orch reply --msg m2' in p.stdout and '回调' in p.stdout, p.stdout)
 
         # S7 escalation → ack+release+blocked, rc=3
         resetspy()
         fx = delivery([{'id': 'm3', 'type': 'escalation', 'payload': json.dumps({'dispatchId': s2['ctx'],
                                                                                 'outcome': '卡在依赖'})}], 'dlv_3')
-        env['ORCH_FAKE_DELIVERY'] = fx
-        p = _orch(['wait', '--run', s2['run']], env)
+        p = _orch(['settle', '--run', s2['run'], '--payload-file', fx], env)
         c.check('S7 escalation rc=3', p.returncode == 3, p.stdout + p.stderr)
         c.check('S7 已 ack', 'dlv_3' in open(env['ORCH_FAKE_ACKS']).read().split())
         c.check('S7 已 release', s2['ctx'] in open(env['ORCH_FAKE_RELEASES']).read().split())
         c.check('S7 node blocked', get_node(proj, 'T-002')['status'] == 'blocked')
 
-        # S8 超时 → checkpoint rc=4, 账不动
+        # S8 缺 payload → 用法拒绝 exit=64, 账不动(阻塞拉取已退役,无超时检查点语义)
         resetspy()
-        env.pop('ORCH_FAKE_DELIVERY')
-        p = _orch(['wait', '--run', s2['run']], env)
-        c.check('S8 超时 checkpoint rc=4', p.returncode == 4, p.stdout + p.stderr)
+        p = _orch(['settle', '--run', s2['run']], env)
+        c.check('S8 缺 payload 拒绝 exit=64', p.returncode == 64, p.stderr)
         c.check('S8 零 ack', not os.path.exists(env['ORCH_FAKE_ACKS']))
         c.check('S8 node 态不变(blocked)', get_node(proj, 'T-002')['status'] == 'blocked')
 
@@ -1432,7 +1428,7 @@ def cmd_selftest(a):
         # S11 reply → stub 记录 + 提示重挂
         resetspy()
         p = _orch(['reply', '--msg', 'm2', '--body', '选 A', '--run', s2['run']], env)
-        c.check('S11 reply rc=0 + 重挂提示', p.returncode == 0 and 'wait' in p.stdout, p.stdout + p.stderr)
+        c.check('S11 reply rc=0 + 回调提示', p.returncode == 0 and '回调' in p.stdout, p.stdout + p.stderr)
         rep = [json.loads(l) for l in open(env['ORCH_FAKE_REPLIES'])]
         c.check('S11 reply 抵达 stub', len(rep) == 1 and rep[0]['id'] == 'm2', str(rep))
 
@@ -1461,8 +1457,7 @@ def cmd_selftest(a):
         resetspy()
         fx = delivery([{'id': 'm4', 'type': 'worker_done',
                         'payload': json.dumps({'dispatchId': 'ctx_x', 'outcome': 'S14'})}], 'dlv_4')
-        env['ORCH_FAKE_DELIVERY'] = fx
-        p = _orch(['wait', '--run', s2['run']], env)
+        p = _orch(['settle', '--run', s2['run'], '--payload-file', fx], env)
         c.check('S14 新 delivery 正常收口 rc=0', p.returncode == 0, p.stdout + p.stderr)
         c.check('S14 ack 到位', 'dlv_4' in open(env['ORCH_FAKE_ACKS']).read().split())
 
@@ -1523,10 +1518,11 @@ def cmd_selftest(a):
                 and 'BAD-LIST' in p.stdout and 'BAD-NULL' in p.stdout, p.stderr[-300:])
         p = _orch(['status', '--project', proj, '--json'], env)
         c.check('S17 --json 亦不崩且带 refs_warn', p.returncode == 0 and '"refs_warn"' in p.stdout, p.stdout[:120])
-        # S17b wait 解析面(find_node_by_run 扫到 list 型 refs)不崩
-        env.pop('ORCH_FAKE_DELIVERY', None)
-        p = _orch(['wait', '--run', 'run_fake0'], env)
-        c.check('S17b wait 解析面遇坏 refs 不崩(exit4 检查点)', p.returncode == 4, p.stdout + p.stderr)
+        # S17b settle 解析面(find_node_by_run 扫到 list 型 refs)不崩
+        fx5 = delivery([{'id': 'm5', 'type': 'worker_done',
+                         'payload': json.dumps({'dispatchId': 'ctx_x', 'outcome': 'S17b'})}], 'dlv_5')
+        p = _orch(['settle', '--run', 'run_fake0', '--project', proj, '--payload-file', fx5], env)
+        c.check('S17b settle 解析面遇坏 refs 不崩 rc=0', p.returncode == 0, p.stdout + p.stderr)
 
         # S18 bridge 武装硬门(ORCH-WAKE ②): 回调单车道,未武装 dispatch(含 --dry-run)拒绝 + arm 指引
         bare = dict(env)
@@ -1699,6 +1695,10 @@ def cmd_selftest(a):
         p = _orch(['dag-status'], env, cwd=proj)
         c.check('S25 dag-status 文本 rc=0(走 task-list stub)', p.returncode == 0, p.stderr[-160:])
 
+        # S26 全程零 --wait orca 调用(V1 机器断言;阻塞等待已退役,完成信号=回调)
+        bad = [x for x in calls() if '--wait' in x]
+        c.check('S26 全程零 --wait orca 调用(V1)', not bad, str(bad[:2]))
+
         print(f'== selftest 完成: {c.n_pass} passed / {c.n_fail} failed')
         return 0 if c.n_fail == 0 else 1
     finally:
@@ -1722,14 +1722,14 @@ def main():
     p.add_argument('--dry-run', action='store_true', help='只打印命令序列,零执行(bridge 武装硬门仍生效)')
     p.add_argument('--json', action='store_true', help='机器可读摘要')
     p.set_defaults(f=cmd_dispatch)
-    p = sub.add_parser('wait', help='check --wait + 收到即自动收尾(ack/release/记账);进门兼收 running 帧')
+    p = sub.add_parser('settle', help='回调收讫结算(非阻塞): worker_done→ack+release+记账;escalation exit3;question exit2')
     p.add_argument('--run', help='run id(缺省用 last-run 指针)')
-    p.add_argument('--timeout-ms', type=int, default=1500000)
-    p.add_argument('--types', default='worker_done,escalation,question')
     p.add_argument('--project', help='覆盖项目解析(默认 last-run/refs 兜底)')
+    p.add_argument('--payload', help='delivery 文档(JSON 字面量;- 读 stdin)')
+    p.add_argument('--payload-file', help='delivery 文档文件路径')
     p.add_argument('--json', action='store_true')
-    p.set_defaults(f=cmd_wait)
-    p = sub.add_parser('reply', help='应答 question;成功后提示重挂 wait')
+    p.set_defaults(f=cmd_settle)
+    p = sub.add_parser('reply', help='应答 question(完成信号仍走回调)')
     p.add_argument('--msg', required=True, help='message id')
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--body')
