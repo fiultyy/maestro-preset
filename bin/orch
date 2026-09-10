@@ -62,10 +62,12 @@
   ORCH_SIG          本席签名(to 寻址匹配;缺省 MAESTRO_ORCH_SIGNATURE 或 bridge/orch.signature;
                      亦为 bridge 武装硬门的 caller 身份)
    ORCH_BRIDGE_REGISTRY  bridge/registry.json 路径覆盖(硬门在册检查;自测隔离用)
+   ORCH_STALL_RESCUE     dispatch/worker-start 注入 stalled 补发空 Enter(默认 1 开;0=旧行为直败)
+   ORCH_STALL_RESCUE_TIMEOUT  补发后尾部增长重查窗口秒数(默认 25)
 退出码: 0 成功 · 1 状态机/重复拒绝/bridge 未武装硬门 · 2 question(等裁决) · 3 escalation(已 ack+release)
         5 运行失败 · 64 用法错误(缺参由 argparse 层 exit 2,dag 族契约同)
 """
-import argparse, json, os, re, sqlite3, subprocess, sys, tempfile, uuid
+import argparse, json, os, re, sqlite3, subprocess, sys, tempfile, time, uuid
 from datetime import datetime, timezone
 
 # ── 路径与 CLI 解析 ───────────────────────────────────────────────────────────
@@ -275,6 +277,113 @@ def msg_payload_dict(msg):
         except json.JSONDecodeError:
             return {}
     return p if isinstance(p, dict) else {}
+
+# ── F1(最小版): agent_prompt_stalled 检出→补发空 Enter→重查 ────────────────────
+# 根因: 引擎注入=括号粘贴→盲定时(500ms+ingest)→单发 \r→30s 轮询 working;
+# fresh omp 终端瞬态可吞掉唯一 \r → 草稿滞留 composer → 引擎判 agent_prompt_stalled。
+# 人工 Enter 即恢复(补上提交键)。此处自动化同一动作: 检出失败文本含该码 →
+# terminal send 单发空 Enter(\r) → terminal read 尾部增长证实回合已起。
+# env: ORCH_STALL_RESCUE=0 关闭(A/B 实验用);ORCH_STALL_RESCUE_TIMEOUT 秒数(默认 25)。
+STALLED_CODE = 'agent_prompt_stalled'
+
+def is_stall_failure(out, err):
+    return STALLED_CODE in (out or '') or STALLED_CODE in (err or '')
+
+def stall_rescue_enabled():
+    return os.environ.get('ORCH_STALL_RESCUE', '1') != '0'
+
+def terminal_probe(handle):
+    """读终端尾部快照(tail 文本长度+latestCursor),供补发前后增长对比;失败 None。"""
+    rc, out, err = run_orca(['terminal', 'read', '--terminal', handle, '--limit', '40'], timeout=30)
+    if rc != 0:
+        return None
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    t = find_key(doc, 'terminal')
+    t = t if isinstance(t, dict) else {}
+    tail = t.get('tail')
+    text = '\n'.join(tail) if isinstance(tail, list) else ''
+    return {'len': len(text), 'cursor': str(t.get('latestCursor') or '')}
+
+def stalled_rescue(handle):
+    """单发空 Enter 并在窗口内重查;返回 (ok, 时延秒, note)。仅补提交键,不重发草稿。"""
+    t0 = time.monotonic()
+    base = terminal_probe(handle)
+    rc, out, err = run_orca(['terminal', 'send', '--terminal', handle, '--text', '', '--enter'], timeout=30)
+    if rc != 0 and 'text' in (err or '') + (out or ''):   # 仅校验类拒绝(零字节落盘)才回退裸 CR
+        rc, out, err = run_orca(['terminal', 'send', '--terminal', handle, '--text', '\r'], timeout=30)
+    if rc != 0:
+        return False, 0.0, f'send 失败 rc={rc}: {(err or out).strip()[:120]}'
+    deadline = t0 + float(os.environ.get('ORCH_STALL_RESCUE_TIMEOUT', '25'))
+    while time.monotonic() < deadline:
+        time.sleep(4)
+        cur = terminal_probe(handle)
+        if cur is None or base is None:
+            continue          # 读失败不构成增长证据,续等下一轮
+        if cur['cursor'] != base['cursor'] or abs(cur['len'] - base['len']) >= 24:
+            return True, round(time.monotonic() - t0, 1), \
+                f"tail 增长 cursor {base['cursor'] or '?'}→{cur['cursor'] or '?'}"
+    return False, round(time.monotonic() - t0, 1), '窗口内尾部无增长'
+
+def _doc_from_output(s):
+    if not s:
+        return {}
+    try:
+        d = json.loads(s)
+    except json.JSONDecodeError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+def find_dispatch_ctx(doc):
+    v = find_key(doc, 'dispatchId', 'dispatch_id', 'dispatch')
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict) and isinstance(v.get('id'), str):
+        return v['id']
+    return find_prefixed(doc, 'ctx_')
+
+def find_agent_handle(doc):
+    v = find_key(doc, 'agentTerminalHandle', 'agent_terminal_handle', 'startupTerminal', 'agentTerminal')
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict) and isinstance(v.get('handle'), str):
+        return v['handle']
+    return None
+
+def orca_json_stall_rescue(argv, what, rescue_handle=None, rescue_task=None, timeout=90):
+    """orca_json 同契约;唯一差异: rc!=0 且错误文本含 agent_prompt_stalled 时启动补发。
+    成功 → 返回 {'dispatchId': ctx, '_stall_rescued': '...s', '_stall_handle': h};
+    失败/不识别 → 与 orca_json 同样 die(exit 5)。零常驻进程,纯调用内联完成。"""
+    rc, out, err = run_orca(argv + ['--json'], timeout=timeout)
+    if rc == 0:
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            die(f'{what} 输出非 JSON: {(out or err).strip()[:400]}', 5)
+    if not is_stall_failure(out, err) or not stall_rescue_enabled():
+        die(f'{what} 失败(rc={rc}): {(err or out).strip()[:400]}', 5)
+    print(f'orch: WARN {what}: 检出 {STALLED_CODE}(草稿滞留 composer,缺提交键)'
+          f' → 补发空 Enter 修复', file=sys.stderr)
+    fdoc = _doc_from_output(out) or _doc_from_output(err)
+    handle = rescue_handle or find_agent_handle(fdoc)
+    ctx = find_dispatch_ctx(fdoc)
+    if (not handle or not ctx) and rescue_task:   # dispatch-show 双兜底(ctx/handle 均
+        rc2, out2, err2 = run_orca(['orchestration', 'dispatch-show', '--task', rescue_task], timeout=30)
+        d2 = _doc_from_output(out2) or _doc_from_output(err2)
+        handle = handle or find_agent_handle(d2)
+        ctx = ctx or find_dispatch_ctx(d2)
+    if not handle:
+        die(f'{what} stalled 补发中止: 目标 terminal handle 不可解析(ctx={ctx or "?"})', 5)
+    ok, latency, note = stalled_rescue(handle)
+    if not ok:
+        die(f'{what} stalled(补发未恢复: {note}) rc={rc}: {(err or out).strip()[:300]}', 5)
+    print(f'orch: stalled 补发成功: 回合已恢复({note},{latency}s;engine 侧 ctx 仍记 failed,'
+          f'worker_done 迟到可被收养)', file=sys.stderr)
+    if not ctx:
+        die(f'{what} stalled 补发成功但 ctx id 不可解析(dispatch-show 亦无)', 5)
+    return {'dispatchId': ctx, '_stall_rescued': f'{latency}s', '_stall_handle': handle}
 
 # ── ledger 调用(复用既有工具,零直写) ─────────────────────────────────────────
 def run_ledger(args, check=True):
@@ -653,18 +762,21 @@ def cmd_dispatch(a):
         if not task_id:
             die(f'task-create 输出无 task id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
 
-    # 3. dispatch --inject
+    # 3. dispatch --inject(F1: stalled→自动补发空 Enter 后继续)
+    stall_note = None
     if a.dry_run:
         plan([orca_bin(), 'orchestration', 'dispatch', '--task', task_id, '--to', a.to or '<handle>',
               '--inject', '--json'])
         ctx = '<ctx_id>'
     else:
-        doc = orca_json(['orchestration', 'dispatch', '--task', task_id, '--to', a.to, '--inject'], 'dispatch')
+        doc = orca_json_stall_rescue(['orchestration', 'dispatch', '--task', task_id, '--to', a.to, '--inject'],
+                                     'dispatch', rescue_handle=a.to, rescue_task=task_id)
         ctx = (find_key(doc, 'dispatchId', 'dispatch_id', 'ctx', 'dispatch')
                if isinstance(find_key(doc, 'dispatchId', 'dispatch_id', 'ctx', 'dispatch'), str)
                else find_prefixed(doc, 'ctx_'))
         if not ctx:
             die(f'dispatch 输出无 ctx id: {json.dumps(doc, ensure_ascii=False)[:300]}', 5)
+        stall_note = doc.get('_stall_rescued') if isinstance(doc, dict) else None
 
     if a.dry_run:
         sys.exit(0)
@@ -688,7 +800,8 @@ def cmd_dispatch(a):
     run_ledger(['node', project, node_id, 'dispatch', title, 'dispatched', '--owner', a.to or '', '--refs', refs_json])
     run_ledger(['event', project, node_id, 'dispatched',
                 f'orch dispatch -> {a.to} ctx={ctx} run={run_id} task={task_id}'
-                + (' | duplicate(--force)' if duplicate else ''),
+                + (' | duplicate(--force)' if duplicate else '')
+                + (f' | stall-rescued({stall_note})' if stall_note else ''),
                 '--source', 'orch'])
     # tickets 环(#11): 票源=ledger.db tickets 表(PM-003),写它 pm-web 才更新
     ticket_note = ''
@@ -707,6 +820,8 @@ def cmd_dispatch(a):
     else:
         print(f"dispatched: {node_id} -> {a.to} (run={run_id} task={task_id} ctx={ctx})"
               + (' [duplicate]' if duplicate else ''))
+        if stall_note:
+            print(f'stall-rescued: agent_prompt_stalled 已补发空 Enter 恢复({stall_note})')
         if ticket_note:
             print(ticket_note)
         print('下一步: 完成等待=回调(worker_done 原生唤醒,ADR-013);收讫结算 orch settle --payload-file <delivery>')
@@ -912,18 +1027,26 @@ def cmd_dag_seat(a):
                '--worktree', DAG_WORKTREE, '--name', name, '--agent', DAG_AGENT]
     if s.get('worker_base_ref'):   # dbdeb83 收编: 显式基点双保险
         ws_args += ['--base-branch', s['worker_base_ref']]
-    doc = orca_json(ws_args, f'worker-start({a.ref})')
+    doc = orca_json_stall_rescue(ws_args, f'worker-start({a.ref})', rescue_task=tid)   # F1: stalled→补发空 Enter
     ctx = _dag_doc_id(doc, f'worker-start({a.ref})', 'dispatchId', 'dispatch_id', 'dispatch', prefix='ctx_')
+    stall_note = (doc.get('_stall_rescued') or '') if isinstance(doc, dict) else ''
     dag_ensure_project(s['project'])   # 账本空库自举: node 写路径要求项目在册(ledger resolve_project fail-loud)
     run_ledger(['ticket', 'refs-set', a.ref, '--json',
-                json.dumps({'dispatch': ctx, 'worktree': name, 'agent': DAG_AGENT}, ensure_ascii=False)],
+                json.dumps(dict({'dispatch': ctx, 'worktree': name, 'agent': DAG_AGENT},
+                                **({'stall_rescued': stall_note} if stall_note else {})),
+                           ensure_ascii=False)],
                f'ticket refs-set 失败({a.ref})')
     run_ledger(['node', s['project'], a.ref, 'dispatch', f'R-ticket {a.ref} {DAG_AGENT} 席位派发',
                 'dispatched', '--refs',
                 json.dumps({'run': s['run'], 'orca_task': tid, 'dispatch': ctx}, ensure_ascii=False)],
                f'ledger node 失败({a.ref})')
+    run_ledger(['event', s['project'], a.ref, 'dispatched',
+                f'dag-seat worker-start ctx={ctx} task={tid}'
+                + (f' | stall-rescued({stall_note})' if stall_note else ''),
+                '--source', 'orch-dag'])
     print(f'seat: {a.ref} dispatched dispatch={ctx}'
-          + (f" orch_sig={s['orch_sig']}" if s.get('orch_sig') else ''))
+          + (f" orch_sig={s['orch_sig']}" if s.get('orch_sig') else '')
+          + (f' stall-rescued({stall_note})' if stall_note else ''))
 
 def cmd_dag_settle(a):
     """worker_done 回调收讫(ADR-013 单车道): 票/node → running「复验待关账」。
@@ -1246,6 +1369,16 @@ with open(log, 'a') as f:
     f.write(json.dumps(argv, ensure_ascii=False) + '\n')
 def out(doc):
     print(json.dumps(doc, ensure_ascii=False))
+def stall_once():
+    # F1 用例夹具: ORCH_FAKE_STALL 文件为 '1' 时本次调用模拟 agent_prompt_stalled(随即自复位)
+    p = os.environ.get('ORCH_FAKE_STALL', '')
+    try:
+        hit = open(p).read().strip() == '1'
+    except OSError:
+        return False
+    if hit:
+        open(p, 'w').write('0')
+    return hit
 if argv[:2] == ['terminal', 'list']:
     out({'terminals': [{'id': 'term_a', 'title': 'A', 'connected': True},
                        {'id': 'term_b', 'title': 'B', 'connected': False}]})
@@ -1263,6 +1396,10 @@ elif argv[:2] == ['orchestration', 'task-create']:
     tid = f'task_fake{n}'
     out({'task': tid, 'taskId': tid, 'id': tid})
 elif argv[:2] == ['orchestration', 'dispatch']:
+    if stall_once():   # F1: 注入后 30s 轮询 working 超时 → 引擎报 stalled(exit 1)
+        out({'ok': False, 'error': {'code': 'agent_prompt_stalled',
+                                    'message': 'Agent did not start working after prompt injection'}})
+        sys.exit(1)
     n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
     open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
     cid = f'ctx_fake{n}'
@@ -1272,10 +1409,42 @@ elif argv[:1] == ['worktree'] and argv[1:2] == ['list']:
 elif argv[:1] == ['terminal'] and argv[1:2] == ['create']:
     out({'ok': True, 'result': {'terminal': {'handle': 'term_seat', 'id': 'term_seat'}}})
 elif argv[:2] == ['orchestration', 'worker-start']:
+    if stall_once():   # F1: worker-start 注入同样可 stalled
+        out({'ok': False, 'result': {'dispatchId': 'ctx_stallWS', 'state': 'failed',
+                                      'failedStage': 'agent_prompt', 'lastError': 'agent_prompt_stalled'}})
+        sys.exit(1)
     n = open(os.environ['ORCH_FAKE_SEQ']).read().strip() or '0'
     open(os.environ['ORCH_FAKE_SEQ'], 'w').write(str(int(n) + 1))
     cid = f'ctx_dag{n}'
     out({'ok': True, 'result': {'dispatch': {'id': cid}}, 'dispatchId': cid})
+elif argv[:2] == ['orchestration', 'dispatch-show']:   # F1: stalled 后 ctx/handle 兜底发现面
+    out({'ok': True, 'result': {'dispatch': {'id': 'ctx_stall1'},
+                                'worker': {'agent_terminal_handle': 'term_stall'}}})
+elif argv[:1] == ['terminal'] and argv[1:2] == ['send']:   # F1: 补发空 Enter 落点
+    with open(os.environ['ORCH_FAKE_SENDS'], 'a') as f:
+        f.write(json.dumps(argv, ensure_ascii=False) + '\n')
+    out({'ok': True, 'result': {'send': {'handle': argv[argv.index('--terminal') + 1],
+                                         'accepted': True, 'bytesWritten': 1}}})
+elif argv[:1] == ['terminal'] and argv[1:2] == ['read']:   # F1: 尾部增长重查(补发后每读必增)
+    h = argv[argv.index('--terminal') + 1] if '--terminal' in argv else '?'
+    sent = False
+    try:
+        sent = any('--enter' in l or "\\r" in l for l in open(os.environ['ORCH_FAKE_SENDS']))
+    except OSError:
+        pass
+    n = 0
+    try:
+        n = len(open(os.environ['ORCH_FAKE_READS']).readlines())
+        open(os.environ['ORCH_FAKE_READS'], 'a').write('x\n')
+    except OSError:
+        open(os.environ['ORCH_FAKE_READS'], 'w').write('x\n')
+    if sent:   # 回合已起: 尾部持续增长(草稿行→turn-start 帧)
+        out({'ok': True, 'result': {'terminal': {'handle': h, 'status': 'running',
+                                                 'tail': ['draft…'] * 5 + [f'turn-start {n}'] * 3,
+                                                 'latestCursor': str(9000 + n)}}})
+    else:      # 草稿滞留: 尾部静止
+        out({'ok': True, 'result': {'terminal': {'handle': h, 'status': 'running',
+                                                 'tail': ['draft…'] * 5, 'latestCursor': '8000'}}})
 elif argv[:2] == ['orchestration', 'task-list']:
     out({'ok': True, 'result': {'tasks': []}})
 elif argv[:2] == ['orchestration', 'check'] and '--ack' in argv:
@@ -1356,7 +1525,9 @@ def cmd_selftest(a):
                    ORCH_RUNNING_LOG=runlog, ORCH_SIG='test-orch@test-session',
                    ORCH_FAKE_LOG=os.path.join(tmp, 'calls.log'), ORCH_FAKE_SEQ=os.path.join(tmp, 'seq'),
                    ORCH_FAKE_ACKS=os.path.join(tmp, 'acks.log'), ORCH_FAKE_RELEASES=os.path.join(tmp, 'releases.log'),
-                   ORCH_FAKE_REPLIES=os.path.join(tmp, 'replies.log'))
+                   ORCH_FAKE_REPLIES=os.path.join(tmp, 'replies.log'),
+                   ORCH_FAKE_SENDS=os.path.join(tmp, 'sends.log'), ORCH_FAKE_READS=os.path.join(tmp, 'reads.log'),
+                   ORCH_FAKE_STALL=os.path.join(tmp, 'stall.flag'))
         open(env['ORCH_FAKE_SEQ'], 'w').write('0')
         # bridge 武装硬门夹具(ORCH-WAKE ②): 在册 consumer=ORCH_SIG 的 session 段
         breg = os.path.join(tmp, 'bridge-registry.json')
@@ -1373,7 +1544,8 @@ def cmd_selftest(a):
             except FileNotFoundError:
                 return []
         def resetspy():
-            for f in ('ORCH_FAKE_LOG', 'ORCH_FAKE_ACKS', 'ORCH_FAKE_RELEASES', 'ORCH_FAKE_REPLIES'):
+            for f in ('ORCH_FAKE_LOG', 'ORCH_FAKE_ACKS', 'ORCH_FAKE_RELEASES', 'ORCH_FAKE_REPLIES',
+                      'ORCH_FAKE_SENDS', 'ORCH_FAKE_READS'):
                 if os.path.exists(env[f]):
                     os.unlink(env[f])
 
@@ -1925,6 +2097,50 @@ def cmd_selftest(a):
                 and str((sdoc.get('refs') or {}).get('DR-1', '')).startswith('task_'), p.stdout[:200])
         p = _orch(['dag-status'], env, cwd=proj)
         c.check('S25 dag-status 文本 rc=0(走 task-list stub)', p.returncode == 0, p.stderr[-160:])
+
+        # S28 F1 dispatch 注入 stalled→补发空 Enter→重查恢复→链路续走
+        resetspy()
+        open(env['ORCH_FAKE_STALL'], 'w').write('1')
+        env2 = dict(env, ORCH_STALL_RESCUE_TIMEOUT='9')
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_stall',
+                   '--new-run', 'F1 复现', '--ref', 'T-F1', '--project', proj, '--json'], env2, cwd=proj)
+        c.check('S28 stalled 补发后 rc=0', p.returncode == 0, p.stderr[-300:])
+        try:
+            s28 = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:
+            s28 = {}
+        c.check('S28 ctx 经 dispatch-show 兜底解析', str(s28.get('ctx', '')).startswith('ctx_stall'), p.stdout[:200])
+        sends = calls()
+        send_hit = [x for x in sends if x[:2] == ['terminal', 'send'] and '--enter' in x]
+        c.check('S28 空Enter 单发(唯一一次,--text 空)', len(send_hit) == 1
+                and send_hit[0][send_hit[0].index('--text') + 1] == '', str(send_hit))
+        reads = [x for x in sends if x[:2] == ['terminal', 'read']]
+        c.check('S28 重查读终端(≥2 次:基线+增长)', len(reads) >= 2, str(len(reads)))
+        ev28 = sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM events WHERE node_id='T-F1' AND detail LIKE '%stall-rescued%'").fetchone()[0]
+        c.check('S28 stall-rescued 已记事件', ev28 >= 1)
+        # S28b ORCH_STALL_RESCUE=0 关闭:恢复旧行为 die(exit 5)
+        open(env['ORCH_FAKE_STALL'], 'w').write('1')
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_stall',
+                   '--new-run', '关闸对照', '--ref', 'T-F1B', '--project', proj, '--json'],
+                  dict(env, ORCH_STALL_RESCUE='0'), cwd=proj)
+        c.check('S28b 补发关闸=旧行为 exit=5', p.returncode == 5 and 'agent_prompt_stalled' in p.stderr,
+                f'rc={p.returncode} {p.stderr[-160:]}')
+
+        # S29 F1 worker-start(dag-seat)stalled→补发→票 refs 记 stall_rescued
+        resetspy()
+        open(env['ORCH_FAKE_STALL'], 'w').write('1')
+        p = _orch(['dag-task', 'DF1', '--title', 'F1 dag', '--spec', 'spec 一行',
+                   '--orch-sig', 'test-orch@test-session'], env2, cwd=proj)
+        c.check('S29 dag-task 建票 rc=0', p.returncode == 0, p.stderr[-200:])
+        p = _orch(['dag-seat', 'DF1', '--orch-sig', 'test-orch@test-session'], env2, cwd=proj)
+        c.check('S29 stalled worker-start 补发后 rc=0', p.returncode == 0 and 'stall-rescued' in p.stdout,
+                p.stdout[:200] + p.stderr[-200:])
+        ws_sends = [x for x in calls() if x[:2] == ['terminal', 'send'] and '--enter' in x]
+        c.check('S29 空Enter 落 term_stall(dispatch-show 兜底句柄)',
+                len(ws_sends) == 1 and ws_sends[0][ws_sends[0].index('--terminal') + 1] == 'term_stall', str(ws_sends))
+        c.check('S29 ticket refs 含 stall_rescued',
+                'stall_rescued' in str(dag_ticket_refs('DF1') or {}), str(dag_ticket_refs('DF1')))
 
         # S26 全程零 --wait orca 调用(V1 机器断言;阻塞等待已退役,完成信号=回调)
         bad = [x for x in calls() if '--wait' in x]
