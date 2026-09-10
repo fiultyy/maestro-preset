@@ -47,7 +47,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 ```bash
 orch dag-seat-open --project <path> [--base-branch B]        # 编排席终端幂等创建/复用(缓存 handle;--base-branch=worker-start 显式基点双保险)
 orch dag-run "<objective>"                             # 幂等建/续 Run
-orch dag-task <REF> --title <t> --spec <s> --orch-sig <sig> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝(本地未建依赖先行 fail-loud)
+orch dag-task <REF> --title <t> --spec <s> --orch-sig <sig> [--deps R1,R2]   # Orca task + ticket 环原子建;deps 屏障=Orca task_not_startable 硬拒绝(本地未建依赖先行 fail-loud);spec ≤1.5KB(≥2KB 触发引擎 IPC runtime_unavailable,F1 边界发现;三行式天然合规)
 orch dag-seat <REF> [--name <worktree>]                # worker-start(固定 omp × new-top-level)+ ticket/node dispatched 双写
 # 信封口径(HOOK-ENVELOPE,#133 A′): dag-task 落 task 文本首行自动构造 DSHMSG 派票信封
 #   {"from":"<编排席签名>","to":"-","type":"dispatch","ref":"<票REF>","msgid":"<uuid4>","ver":3}
@@ -61,6 +61,9 @@ orch dag-close <REF> <end|rejected|rolled-back|blocked> --outcome "<≤300字>" 
 # END 语义(END-RENAME,2026-09-10 用户裁定): worker=oneshot,一回合即回执;票态/回执 end=「回合结束,待复验」≠全部完成。
 # 编排者收 end 必复验;复验不过两条路:①改单(票改 dag 更新,跑新插票) ②幂等重跑 end 票(票 end→running 合法,node 保持 end 终态、重结算幂等跳过)。真完成=close。
 # 帧事件名 ticket-done 为线协议史料名,语义同 end,不追改;cb-send end 为正名(done 透传仍合法=同义)。
+# 票态硬水化(FRAME-SETTLE,2026-09-10): frame-settle-watch.sh(UserPromptSubmit,编排者侧)帧到达即记账,不靠 agent 约定——
+#   ticket-received→票 running;ticket-done→票/node end(dag-close,dispatched 先补 running;msgid 去重防改单后旧帧回推)。
+#   双路径: prompt 帧(ORCA-CB]/DSHMSG] 前缀锚定)+inbox 游标兜底(桥未投的滞留帧也水化)。编排者醒来账已新,只做复验决策。
 orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca task 并排(只读)
 # 票面卫生(CONTRACT-HYGIENE): 测试票(非真实派发目的的 ledger ticket)即建即拒——dag-close rejected 关账,理由必填(outcome/note);生产 ledger 禁留无主测试票
 # 册面卫生(NOGUESS-ORCH 收口): 编排席使命终局(链收官/会话退役)必须撤 bridge 册(删 ~/.dsh/maestro/bridge/registry.json 里**本席那一行**;册是共享的,只动自己的行)——僵尸行留册=新 agent 无信封猜主错绑源+测试流量误涌(2026-09-10 活体:三席未撤册)
