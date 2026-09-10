@@ -159,6 +159,8 @@ ORCA orchestration worker-release --dispatch <ctx>
 
 **新编排线首动作纪律(IDX-5 事故③锚: 38c3 换址后从未 arm,回调 3 小时无人消费)**——新起的编排线,回合第一个动作 = `bridge_arm`(或 `bridge-rearm` 自注册)武装本席;不 arm = 注册只是死条目,发向本线的回调全部失联,直到你 arm 为止。
 
+**武装别名纪律(ALIAS-UNIQ, 2026-09-10)**——`bridge_arm` **必带显式职能别名**(`bridge_arm { alias: "<职能>-<线名>" }`,如 maestro-gdi/maestro-audit);**禁无参武装**——全局默认 preset=maestro 会令无参注册的别名恒为裸 `maestro`,多席共册全撞名(活体: 新 agent ping 按别名找 maestro 全部涌向最早在册席)。撞名=猜主错绑源。
+
 降级场景速查:
 
 | 我要… | 怎么做 | 传什么 |
