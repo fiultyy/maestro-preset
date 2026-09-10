@@ -48,3 +48,10 @@ CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro
 
 - 没回音: `tail -3 ~/.dsh/maestro/bridge/dead.log` — `unknown-addressee`=目标不在册(把 ack 手写落文件桥: `printf '%s\n' '{"type":"ack","from":"<你>","to":"<签名>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log`);`ambiguous`=撞名,换全签名重发。
 - 直测 HTTP 口: `curl -sS -X POST http://127.0.0.1:$(cat ~/.dsh/maestro/bridge/http.port)/callback -H 'content-type: application/json' -d '{"type":"ping","from":"<你>","to":"<签名>","body":"probe"}'`
+
+## 纪律: 无信封不猜主(NOGUESS-ORCH, 2026-09-10)
+- 编排者地址的唯一合法来源=**你收到的派单信封里的 from 字段**(`DSHMSG]` 首行)。
+- 没有信封上下文时(自主 ping test/自检/探索),**禁止**从 bridge/registry.json 挑一行当编排者——
+  共享册里 alias 含 maestro 的行可能是任意在册编排席,猜主=把测试流量打到别人回合里(活体: 新 agent
+  ping test 全部涌向正跑任务链的编排席)。测试请对显式地址 `--to <alias>@<sessionId>` 发,或只对
+  自己(arm 后 ping 自己)。
