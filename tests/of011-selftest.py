@@ -185,6 +185,23 @@ def v2_ups_inflight_5col(tmp, base):
     print('[ ok ] v2 ticket-received to=信封 FROM(来路即目标),from=SID')
 
 
+@case
+def v2_nondispatch_type_gate(tmp, base):
+    """P3(2026-09-10 本席活体): 非dispatch 型 DSHMSG 行(他席 done/ack/report 汇总帧进入
+    编排席 prompt)→ 静默:零 inflight 零 inbox 零 running——编排席不再被误当 worker。"""
+    e = dict(base)
+    in0 = sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip())
+    run0 = sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip())
+    line = ('DSHMSG]{"from": "worker-x@session-x", "to": "orch-y@session-y", "type": "done", '
+            '"ref": "T9", "body": "done summary", "msgid": "m9", "ts": 1, "ver": 3}')
+    p = run_script(UPS, {'session_id': 'sess-p3', 'prompt': line + '\n汇总帧正文'}, e)
+    assert p.returncode == 0, p.stderr
+    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-p3'))
+    assert sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()) == in0
+    assert sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip()) == run0
+    print('[ ok ] v2 P3 type 门: 非dispatch DSHMSG 行静默(零 inflight/inbox/running)')
+
+
 def inflight_dir(base):
     return base['ORCH_INFLIGHT']
 
