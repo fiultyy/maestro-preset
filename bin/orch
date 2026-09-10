@@ -11,7 +11,7 @@
   orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
   # HOOK-ENVELOPE: dag-task 落 task 文本首行自动构造 DSHMSG 派票信封(from=编排席签名,to="-",type=dispatch,ref=票REF,msgid=uuid4,ver=3;
   #   消费端 ups 钩 NR==1 只认首行 → 落 inflight(5 列含 FROM) → turn_end 配对回 ticket-done(to=信封 FROM 来路即目标);
-  #   签名回落链: --orch-sig 旗标 → env ORCH_SIG → dag-seat --orch-sig 落态 → MAESTRO_ORCH_SIGNATURE → bridge/orch.signature → orch-p0)
+  #   签名必传(SIG-MANDATE,issue#1): --orch-sig 旗标或 env ORCH_SIG,零静默回落(缺席 exit 2 附本席签名获取法))
   orch dag-seat <REF> [--name <worktree>]             # dag 族: worker-start(omp×新顶层worktree)+dispatched 双写
   orch reply    --msg <msg_id> (--body <text> | --body-file <f>) [--run <run_id>] [--json]
   orch status   [--run <run_id>] [--ref <ref>] [--project <key|path>] [--json]
@@ -410,9 +410,9 @@ def orch_sig():
 # 有在册 consumer(非 stale),否则拒绝并给 arm 指引。注册表路径可经
 # ORCH_BRIDGE_REGISTRY 覆盖(自测隔离)。
 
-def bridge_arm_gate():
+def bridge_arm_gate(sig=None):
     reg = os.environ.get('ORCH_BRIDGE_REGISTRY') or os.path.join(MAESTRO_DIR, 'bridge', 'registry.json')
-    sig = orch_sig()
+    sig = ((sig or '').strip() or orch_sig())   # SIG-MANDATE: 调用方显式签名优先——检查的是真 caller 会话,非共享签名文件身份
 
     def refuse(why):
         die('bridge 武装硬门: ' + why + '\n'
@@ -818,7 +818,7 @@ def cmd_dag_run(a):
     print(f'run: {rid}')
 
 def cmd_dag_task(a):
-    bridge_arm_gate()
+    bridge_arm_gate(getattr(a, 'orch_sig', None))   # SIG-MANDATE: 显式签名优先过门(检 caller 真身)
     s = dag_load()
     seat = dag_need_seat(s)
     if not s.get('run'):
@@ -866,12 +866,17 @@ def dag_ensure_project(project):
         run_ledger(['project', project, os.path.basename(str(project).rstrip('/')) or 'proj'])
 
 def dag_orch_sig(flag, state=None):
-    """HOOK-ENVELOPE 信封 from 编排席签名回落链: --orch-sig 旗标 → env ORCH_SIG →
-    dag state.orch_sig(dag-seat --orch-sig 落态)→ orch_sig() 既有链(MAESTRO_ORCH_SIGNATURE
-    → bridge/orch.signature)→ 'orch-p0'(消费端 ups/turn-end 同款末位兜底)。
-    禁硬编码单一席位 = 旗标/env 恒优先,字面值仅全链落空时兜底。"""
-    return ((flag or '').strip() or os.environ.get('ORCH_SIG', '').strip()
-            or ((state or {}).get('orch_sig') or '').strip() or orch_sig() or 'orch-p0')
+    """SIG-MANDATE(issue#1,用户裁决): 席位/信封签名=显式必传(--orch-sig 旗标或 env ORCH_SIG),
+    零静默回落——多席共册下 seat 落态(末写者胜)/bridge 签名文件/orch-p0 字面兜底皆他人签名
+    错绑源(orch-e2e E2E 实证:dag-seat 漏传解析到 orch1 落态)。缺席 die(2) 附本席签名获取法。
+    state 形参保留兼容旧调用,不再参与解析。"""
+    sig = (flag or '').strip() or os.environ.get('ORCH_SIG', '').strip()
+    if not sig:
+        die('--orch-sig 必传(SIG-MANDATE): 签名零静默回落,防多席错绑。'
+            '本席签名获取法: dsh 席=echo $DSH_SESSION_ID;任意面=bridge_arm 后查 '
+            '~/.dsh/maestro/bridge/registry.json 自己的注册行(<别名>@<sessionId>)。'
+            '传法: --orch-sig <签名> 或 export ORCH_SIG=<签名>', 2)
+    return sig
 
 
 def dag_envelope(sig, ref):
@@ -884,7 +889,7 @@ def dag_envelope(sig, ref):
 
 
 def cmd_dag_seat(a):
-    bridge_arm_gate()
+    bridge_arm_gate(getattr(a, 'orch_sig', None))   # SIG-MANDATE: 显式签名优先过门
     s = dag_load()
     seat = dag_need_seat(s)
     if not s.get('project'):
@@ -892,7 +897,7 @@ def cmd_dag_seat(a):
     if a.ref not in s['refs'] or not s['refs'][a.ref].get('orca_task'):
         die(f"ref 未建 task: {a.ref}(先 orch dag-task {a.ref})", 64)
     tid = s['refs'][a.ref]['orca_task']
-    if a.orch_sig:   # HOOK-ENVELOPE: 席位级编排席签名落态(dag-task 信封 from 回落链一环)
+    if a.orch_sig:   # SIG-MANDATE(issue#1): 席位级签名仅簿记展示,不再参与 dag-task 解析(末写者胜错绑源)
         s['orch_sig'] = a.orch_sig.strip()
         dag_save(s)
     name = a.name or a.ref.lower()
@@ -1344,7 +1349,9 @@ def cmd_selftest(a):
         breg = os.path.join(tmp, 'bridge-registry.json')
         with open(breg, 'w') as f:
             json.dump({'version': '4.1.0',
-                       'consumers': {'test-session': {'alias': 'test-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
+                       'consumers': {'test-session': {'alias': 'test-orch', 'pid': os.getpid(), 'armedAt': now()},
+                                     # SIG-MANDATE: S21e 显式 --orch-sig 覆盖案的信封 from 席亦须在册(门检 caller 真身)
+                                     'session-alt': {'alias': 'alt-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
         env['ORCH_BRIDGE_REGISTRY'] = breg
 
         def calls():
@@ -1743,10 +1750,11 @@ def cmd_selftest(a):
         msg2 = str(envy.get('msgid'))
         c.check('S21e msgid 跨票唯一', msg1 != msg2, f'{msg1} vs {msg2}')
 
-        # S21f 回落链槽位(HOOK-ENVELOPE): env 缺席时 seat 落态 → signature 文件 → 单元级末位兜底
+        # S21f SIG-MANDATE(issue#1): 签名=显式必传(旗标/env),seat 落态/签名文件/字面零回落——
+        #   多席共册末写者胜的 state.orch_sig 是错绑源(orch-e2e E2E 实证);缺席 die(2) 附获取法
         fenv = dict(env)
         fenv.pop('ORCH_SIG', None)
-        fenv['MAESTRO_HOME'] = tmp   # orch_sig() 文件链定向到 $MAESTRO_HOME/maestro/bridge/orch.signature
+        fenv['MAESTRO_HOME'] = tmp   # 签名文件链定向(在场也不得绑)
         sigdir = os.path.join(tmp, 'maestro', 'bridge')
         fbin = os.path.join(tmp, 'maestro', 'bin')   # LEDGER_BIN 随 MAESTRO_DIR 重定向 → 符号链接回真身
         os.makedirs(fbin, exist_ok=True)
@@ -1760,31 +1768,34 @@ def cmd_selftest(a):
         with open(freg, 'w') as f:
             json.dump({'version': '4.1.0', 'consumers': {
                 'session-file': {'alias': 'file-orch', 'pid': os.getpid(), 'armedAt': now()},
-                'session-seat': {'alias': 'seat-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
+                'session-seat': {'alias': 'seat-orch', 'pid': os.getpid(), 'armedAt': now()},
+                'session-envs': {'alias': 'env-orch', 'pid': os.getpid(), 'armedAt': now()}}}, f)
         fenv['ORCH_BRIDGE_REGISTRY'] = freg
         fenv['ORCH_DAG_STATE'] = os.path.join(tmp, 'state', 'dag-fenv.json')
-        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {}},
+        json.dump({'seat': 'term_seat', 'run': st['run'], 'project': proj, 'refs': {},
+                   'orch_sig': 'stale-orch@session-stale'},   # 末写者胜脏落态在场
                   open(fenv['ORCH_DAG_STATE'], 'w'))
         p = _orch(['dag-task', 'DR-F1', '--title', 'FLTF', '--spec', 'ff'], fenv, cwd=proj)
-        c.check('S21f env 缺席 → signature 文件链 rc=0', p.returncode == 0, p.stderr[-200:])
+        c.check('S21f 无旗标无 env die(2)(签名文件+脏落态零回落)', p.returncode == 2
+                and 'SIG-MANDATE' in p.stderr and 'DSH_SESSION_ID' in p.stderr, p.stderr[-200:])
+        c.check('S21f 拒绝零落票(ledger 无 DR-F1)', get_ticket('DR-F1') is None, str(get_ticket('DR-F1')))
+        fenv['ORCH_SIG'] = 'env-orch@session-envs'
+        p = _orch(['dag-task', 'DR-F1', '--title', 'FLTF', '--spec', 'ff'], fenv, cwd=proj)
         spf = tc_spec('FLTF') or ''
         try:
             envf = json.loads(spf.split('\n', 1)[0][len('DSHMSG]'):])
         except (json.JSONDecodeError, IndexError):
             envf = {}
-        c.check('S21f 文件链签名即 from', envf.get('from') == 'file-orch@session-file', spf[:120])
+        c.check('S21f env 槽显式即 from(rc=0 建票)', p.returncode == 0
+                and envf.get('from') == 'env-orch@session-envs', spf[:120])
+        fenv.pop('ORCH_SIG', None)
         p = _orch(['dag-seat', 'DR-F1', '--orch-sig', 'seat-orch@session-seat'], fenv, cwd=proj)
-        c.check('S21f dag-seat --orch-sig rc=0', p.returncode == 0, p.stderr[-160:])
+        c.check('S21f dag-seat --orch-sig rc=0(仅簿记)', p.returncode == 0, p.stderr[-160:])
         stf = json.load(open(fenv['ORCH_DAG_STATE']))
-        c.check('S21f 席位级签名落 state.orch_sig', stf.get('orch_sig') == 'seat-orch@session-seat', str(stf))
+        c.check('S21f 席位级签名落 state.orch_sig(簿记)', stf.get('orch_sig') == 'seat-orch@session-seat', str(stf))
         p = _orch(['dag-task', 'DR-F2', '--title', 'FLTS', '--spec', 'f2'], fenv, cwd=proj)
-        spf2 = tc_spec('FLTS') or ''
-        try:
-            envf2 = json.loads(spf2.split('\n', 1)[0][len('DSHMSG]'):])
-        except (json.JSONDecodeError, IndexError):
-            envf2 = {}
-        c.check('S21f seat 落态签名即 from', p.returncode == 0
-                and envf2.get('from') == 'seat-orch@session-seat', spf2[:120])
+        c.check('S21f seat 落态不参与解析:仍 die(2)', p.returncode == 2
+                and 'SIG-MANDATE' in p.stderr, p.stderr[-160:])
         import importlib.util as _ilu
         from importlib.machinery import SourceFileLoader as _sfl
         _loader = _sfl('orch_mod_selftest', os.path.abspath(__file__))   # 无扩展名脚本须显式 loader
@@ -1792,18 +1803,20 @@ def cmd_selftest(a):
         _om = _ilu.module_from_spec(_spec_o)
         _loader.exec_module(_om)
         _saved_sig = os.environ.pop('ORCH_SIG', None)
-        _saved_md = _om.MAESTRO_DIR   # 模块常量已按进程环境绑定;单元检查直接指向无 signature 的隔离路径
-        _om.MAESTRO_DIR = os.path.join(tmp, 'no-sig-home', 'maestro')
+        _code = None
         try:
-            c.check('S21f 全链落空末位兜底 orch-p0(消费端同款)',
-                    _om.dag_orch_sig(None, None) == 'orch-p0', _om.dag_orch_sig(None, None))
+            _om.dag_orch_sig(None, None)
+        except SystemExit as _e:
+            _code = _e.code
+        try:
+            c.check('S21f 单元级全链落空 die(2)(末位兜底废止)',
+                    _code == 2, str(_code))
             c.check('S21f 旗标恒优先(禁硬编码单席)',
                     _om.dag_orch_sig('flag-orch@session-flag', {'orch_sig': 'seat@session-s'}) ==
                     'flag-orch@session-flag', '')
         finally:
             if _saved_sig is not None:
                 os.environ['ORCH_SIG'] = _saved_sig
-            _om.MAESTRO_DIR = _saved_md
 
         # S21b 全新账本(ledger.db 尚未建)dag-task 不崩 + ledger 自举
         #   (ORCH-UNIFY 修: 只读连接 connect 失败与查询失败分离;旧写法 finally 踩未绑定 c)

@@ -3,7 +3,7 @@
 
 覆盖验收 V1-V4 可离线面(envelope.md):
   ① V1 生产端单元面: bin/orch 模块级 dag_envelope/dag_orch_sig — 信封 jq 可析/from=旗标/ref=票REF/
-     msgid 唯一/回落链五槽位(旗标→env ORCH_SIG→seat 落态→MAESTRO_ORCH_SIGNATURE→signature 文件→orch-p0);
+     msgid 唯一/SIG-MANDATE 二槽显式(旗标→env ORCH_SIG;seat/文件/orch-p0 回落全废止,缺席 SystemExit 2);
      CLI 全链由 orch selftest S21e/S21f 断言(此处兼跑其尾行,全绿方过)
   ② V2 消费端: 带信封 prompt → ups 落 inflight 5 列含 FROM + ticket-received(to=信封 FROM
      来路即目标对称化(RECV-ROUTE),from=SID 与 done 帧同族);
@@ -127,8 +127,13 @@ def v1_sig_fallback_chain(tmp, base):
     try:
         for k in saved:
             os.environ.pop(k, None)
+        def _ec(fn):
+            try:
+                fn(); return None
+            except SystemExit as e:
+                return e.code
         assert om.dag_orch_sig('flag@session-f', {'orch_sig': 'seat@session-s'}) == 'flag@session-f'
-        assert om.dag_orch_sig(None, {'orch_sig': 'seat@session-s'}) == 'seat@session-s'
+        assert _ec(lambda: om.dag_orch_sig(None, {'orch_sig': 'seat@session-s'})) == 2   # seat 落态零回落
         os.environ['ORCH_SIG'] = 'env@session-e'
         assert om.dag_orch_sig(None, {'orch_sig': 'seat@session-s'}) == 'env@session-e'
         os.environ.pop('ORCH_SIG', None)
@@ -137,10 +142,10 @@ def v1_sig_fallback_chain(tmp, base):
         with open(os.path.join(sigdir, 'orch.signature'), 'w') as f:
             f.write('file@session-fi')
         om.MAESTRO_DIR = os.path.join(tmp, 'maestro')
-        assert om.dag_orch_sig(None, None) == 'file@session-fi'
+        assert _ec(lambda: om.dag_orch_sig(None, None)) == 2   # 签名文件在场零回落
         om.MAESTRO_DIR = os.path.join(tmp, 'no-such-maestro')
-        assert om.dag_orch_sig(None, None) == 'orch-p0'   # 末位兜底=消费端同款
-        print('[ ok ] v1 回落链五槽位: 旗标→env ORCH_SIG→seat 落态→signature 文件→orch-p0')
+        assert _ec(lambda: om.dag_orch_sig(None, None)) == 2   # 末位兜底废止
+        print('[ ok ] v1 SIG-MANDATE: 旗标→env 显式二槽;seat/文件/orch-p0 回落全废止(缺席 SystemExit 2)')
     finally:
         om.MAESTRO_DIR = saved_md
         for k, v in saved.items():
