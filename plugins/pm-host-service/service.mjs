@@ -1284,9 +1284,12 @@ const UNIT_FILE = `${CONFIG_DIR}/systemd/user/${SERVICE}.service`
 // 2026-09-05: NEW 链 session/list 空 request 实测 0.94-1.6s (成本在 slim 投影,
 // limit:1 不省; detail 仅 slim|full 无更廉形态; workspace.list 已不存在) —
 // 1s 预算在边缘反复 abort → 横幅间歇常驻。slash 放宽 3s, dot 链 (ms 级) 不变。
+// PM-HEALTH-SLOWLIST(2026-09-10 用户报障票板横幅): slash 探针端点 session/list 空 request
+// 在大会话库(当晚 E2E 连 spawn 数百席)下全投影实测 5.6-7.4s,3s 预算连续 abort x29 →
+// 降级常驻(dsh RPC 本体 200 健康)。对齐 PMW2-I join 预算 10s+裕量 → 12s。
 // PMWEB-DATA: 闪断防抖参数集中此处可配 — PM_HEALTH_DSH_TIMEOUT_MS (探针预算,
 // 缺省随 wire 形态) + PM_HEALTH_DSH_FAIL_STREAK (连续失败才 degraded 的阈值, 缺省 2)。
-const HEALTH_DSH_TIMEOUT_MS = Number(process.env.PM_HEALTH_DSH_TIMEOUT_MS) || (DSH_WIRE === 'slash' ? 3_000 : 1_000) // loopback RPC probe budget (health must stay snappy)
+const HEALTH_DSH_TIMEOUT_MS = Number(process.env.PM_HEALTH_DSH_TIMEOUT_MS) || (DSH_WIRE === 'slash' ? 12_000 : 1_000) // loopback RPC probe budget (join 10s 对齐;慢源挂账: session/list 全投影瘦身)
 const HEALTH_DSH_FAIL_STREAK = Math.max(1, Number(process.env.PM_HEALTH_DSH_FAIL_STREAK) || 2) // 连续 ≥N 次探针失败才降级; 单次失败保留上一态 (PMWEB-DATA 防抖)
 const JOIN_DSH_TIMEOUT_MS = Number(process.env.PM_JOIN_TIMEOUT_MS) || 10_000 // PMW2-I: session.list 数百会话全投影实测 ~5s, 8s→10s 放宽; join 失败仅自身降级注记(joined:false+原因), 不连坐 dsh_api liveness。PM_JOIN_TIMEOUT_MS 供沙箱门调参
 const BOOT_CACHE_MS = 5_000 // systemctl is-enabled/is-active cache
