@@ -502,14 +502,11 @@ def ticket_exists(tid):
 # 已 running/end 等一律幂等跳过。游标+现态双保险,同帧/同 task 不重复记账。
 
 def orch_sig():
+    """SIG-MANDATE 补全(2026-09-10,a7e7e503 验证票活体): 砍 bridge/orch.signature 共享文件
+    静默回落——8/30 陈文件(orch-p0@af290650)曾令未设 env 的 seat-open 错绑他人签名过门被拒。
+    仅认显式 env(ORCH_SIG/MAESTRO_ORCH_SIGNATURE);无则 None(帧消费寻址过滤安全跳过)。"""
     sig = os.environ.get('ORCH_SIG') or os.environ.get('MAESTRO_ORCH_SIGNATURE')
-    if sig:
-        return sig.strip()
-    try:
-        with open(os.path.join(MAESTRO_DIR, 'bridge', 'orch.signature'), encoding='utf-8') as f:
-            return f.read().strip()
-    except OSError:
-        return None
+    return sig.strip() if sig else None
 
 # ── bridge 武装硬门(ORCH-WAKE 契约修复②,用户裁决 2026-09-09) ─────────────────
 # 「CB 桥武装应该默认强制的。契约中完全移除阻塞 check(--wait),反而是武装回调是唯一
@@ -525,7 +522,7 @@ def bridge_arm_gate(sig=None):
 
     def refuse(why):
         die('bridge 武装硬门: ' + why + '\n'
-            f'  本席签名: {sig or "(无 — 未设 ORCH_SIG/MAESTRO_ORCH_SIGNATURE,亦无 bridge/orch.signature)"}\n'
+            f'  本席签名: {sig or "(无 — 未设 ORCH_SIG/MAESTRO_ORCH_SIGNATURE)"}\n'
             '  → arm 指引: 本会话内武装回调桥(bridge_arm;或 POST /register {"sessionId":"<本会话id>","alias":"<别名>"}'
             ',端口见 bridge/http.port),取得 <alias>@<sessionId> 回信签名后重试。\n'
             '  依据: --wait 阻塞等待已退役,回调是完成等待唯一手段(ADR-013 唤醒单车道)。',
@@ -887,7 +884,7 @@ def dag_ticket_refs(ref):
     return refs
 
 def cmd_dag_seat_open(a):
-    bridge_arm_gate()   # ORCH-UNIFY V3: 派发链全路径过武装门
+    bridge_arm_gate(dag_orch_sig(a.orch_sig))   # SIG-MANDATE 先行(缺签名 die2 附获取法)→门验 caller 真身
     s = dag_load()
     if a.base_branch:   # dbdeb83 收编: worker-start 显式基点(repo 默认基点变更后的双保险)
         s['worker_base_ref'] = a.base_branch
@@ -940,7 +937,7 @@ def cmd_dag_run(a):
     print(f'run: {rid}')
 
 def cmd_dag_task(a):
-    bridge_arm_gate(getattr(a, 'orch_sig', None))   # SIG-MANDATE: 显式签名优先过门(检 caller 真身)
+    bridge_arm_gate(dag_orch_sig(a.orch_sig))   # SIG-MANDATE 先行 die(2) 教学→门验册(S21f 序:签名缺席先教获取法,非硬门文案)
     s = dag_load()
     seat = dag_need_seat(s)
     if not s.get('run'):
@@ -1011,7 +1008,7 @@ def dag_envelope(sig, ref):
 
 
 def cmd_dag_seat(a):
-    bridge_arm_gate(getattr(a, 'orch_sig', None))   # SIG-MANDATE: 显式签名优先过门
+    bridge_arm_gate(dag_orch_sig(a.orch_sig))   # SIG-MANDATE 先行→门验 caller 真身
     s = dag_load()
     seat = dag_need_seat(s)
     if not s.get('project'):
@@ -1782,6 +1779,17 @@ def cmd_selftest(a):
                    '--project', proj, '--json'], bare)
         c.check('S18a 无签名 dispatch 拒绝 rc=1', p.returncode == 1, (p.stdout + p.stderr)[-200:])
         c.check('S18a 拒绝带 arm 指引与硬门口径', 'bridge 武装硬门' in p.stderr and 'arm 指引' in p.stderr, p.stderr[-200:])
+        # S18a2(SIG-MANDATE 补全): 陈共享签名文件在场也不得被读——8/30 活体曾致 seat-open 错绑他人签名
+        stale_dir = os.path.join(tmp, 'stalesig', 'bridge')
+        os.makedirs(stale_dir, exist_ok=True)
+        with open(os.path.join(stale_dir, 'orch.signature'), 'w') as fh:
+            fh.write('ghost-p0@session-stalefile')
+        bare3 = dict(bare)
+        bare3['MAESTRO_HOME'] = os.path.join(tmp, 'stalesig')
+        p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18a2', '--ref', 'T-018a2',
+                   '--project', proj, '--json'], bare3)
+        c.check('S18a2 陈签名文件不被读(签名不可得拒,无 stalefile 字样)',
+                p.returncode == 1 and '本席签名不可得' in p.stderr and 'stalefile' not in p.stderr, p.stderr[-200:])
         bare2 = dict(env)
         bare2['ORCH_SIG'] = 'ghost-orch@session-ghost'   # 有签名但不在册
         p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--new-run', 'r18b', '--ref', 'T-018b',
@@ -1799,9 +1807,11 @@ def cmd_selftest(a):
         dstate = os.path.join(tmp, 'state', 'orch-dag.json')   # ORCH_STATE_DIR 已隔离,承 orch-dag 旧档路径
 
         # S19 未武装拒派(V3: dag 派发链过 bridge 武装硬门,S18 口径)
+        # SIG-MANDATE 序调整后本义=「有签名未在册」拒 die(1);「完全无签名」die(2) 教学由 S21f 覆
         dag_bare = dict(env)
         for k in ('ORCH_SIG', 'MAESTRO_ORCH_SIGNATURE', 'ORCH_BRIDGE_REGISTRY'):
             dag_bare.pop(k, None)
+        dag_bare['ORCH_SIG'] = 'ghost-orch@session-ghost'   # 有签名但未武装(册空)
         dag_bare['MAESTRO_HOME'] = tmp
         for dargs in (['dag-seat-open', '--project', proj], ['dag-run', 'x'],
                       ['dag-task', 'DX-1', '--title', 't', '--spec', 's'], ['dag-seat', 'DX-1']):
@@ -2213,6 +2223,7 @@ def main():
     p.add_argument('--project', required=True, help='项目路径(须在 Orca 树;缺参 argparse 层 exit 2)')
     p.add_argument('--title', default=DAG_SEAT_TITLE)
     p.add_argument('--base-branch', help='worker-start 显式基点分支(state.worker_base_ref;缺省用 repo 默认)')
+    p.add_argument('--orch-sig', help='编排席签名(SIG-MANDATE;武装门验 caller 真身。缺省回落 env ORCH_SIG,再无则拒)')
     p.set_defaults(f=cmd_dag_seat_open)
     p = sub.add_parser('dag-run', help='dag 族: 幂等建/续 Run')
     p.add_argument('objective')
