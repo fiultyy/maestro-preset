@@ -10,6 +10,9 @@
 #   turn-end-pair.sh 的 ticket-done to 优先取之,空回落 ORCH_SIG(兼容存量 4 列)。
 # 2026-09-09 增(ENVELOPE-SCAN20): 信封识别窗 首行 → 前 20 行(Orca worker-start preamble 占首行,
 #   信封随任务文本后置,原 NR==1 永不命中);优先级 信封行 > preamble sidecar(后者仅无信封时走)。
+# 2026-09-10 增(ENVELOPE-ANCHOR,E2E 断点#1 修): 识别窗 前 20 行 → 全文锚定首中——Orca 实注
+#   前导+CLI 块约 45 行,信封行落 20 行窗外实证(E2E-SKILMIRROR: received/done 帧不生成);
+#   grep -am1 全文首中即停,信封>preamble 优先级与 fail-open 全保持。
 #   仍纯字符标记块匹配(只认 DSHMSG] 前缀行),零软契约,fail-open 全保持。
 # 2026-09-09 增(RECV-ROUTE): ticket-received 来路即目标对称化——to=信封 FROM(原 to=ORCH_SIG env,
 #   双编排席下 worker 属哪派恒投同一席=误投 orch1 派单唤醒 orch-p0 实证),from=SID(与 ticket-done/
@@ -32,10 +35,10 @@ SID="$(printf '%s' "$STDIN" | jq -r '.session_id // empty' 2>/dev/null || :)"
 PROMPT="$(printf '%s' "$STDIN" | jq -r '.prompt // empty' 2>/dev/null || :)"
 [ -n "$SID" ] && [ -n "$PROMPT" ] || exit 0
 
-ENVLINE="$(printf '%s\n' "$PROMPT" | head -20 | grep -am1 '^DSHMSG]' 2>/dev/null || :)"
+ENVLINE="$(printf '%s\n' "$PROMPT" | grep -am1 '^DSHMSG]' 2>/dev/null || :)"   # ENVELOPE-ANCHOR: 全文首中(E2E 断点#1 修)
 if [ -z "$ENVLINE" ]; then
-  # Orca dispatch --inject preamble 分支(running 信号,零契约;ENVELOPE-SCAN20: 仅无信封时走)
-  if printf '%s\n' "$PROMPT" | head -20 | grep -q "You are a dispatched worker\." 2>/dev/null; then
+  # Orca dispatch --inject preamble 分支(running 信号,零契约;ENVELOPE-ANCHOR: 仅无信封时走)
+  if printf '%s\n' "$PROMPT" | grep -aq "You are a dispatched worker\." 2>/dev/null; then
     TASKID="$(printf '%s\n' "$PROMPT" | grep -m1 -o 'Your task ID is: *task_[0-9a-f]*' | grep -o 'task_[0-9a-f]*' | head -1)"
     [ -n "$TASKID" ] || exit 0
     [ -n "$ORCH_DEBUG" ] && echo "branch: DISPATCH-PREAMBLE task=$TASKID sid=$SID" >> "$ORCH_DEBUG" 2>/dev/null || :

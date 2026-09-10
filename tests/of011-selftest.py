@@ -13,8 +13,9 @@
   ④ 回归: running sidecar 分支不回归(preamble prompt → ticket-running 帧,零 inflight 零 inbox);
      turn-idle 分支 to=ORCH_SIG
   ⑤ 部署面 cmp: 仓内 bin/ ↔ ~/.dsh/maestro/bin/ ↔ ~/.dsh/.agent-presets/maestro/bin/ 三面一致
-  ⑥ ENVELOPE-SCAN20(#136): 信封识别窗=前 20 行 + 信封>preamble 优先级 — preamble 占首行信封
-      第 3 行 → 信封命中;第 20/21 行边界钉死;仅 preamble 无信封 sidecar 不变;e2e done 帧原文
+   ⑥ ENVELOPE-ANCHOR(原 SCAN20,#136+E2E 断点#1 修): 信封识别=全文锚定首中(grep -am1) —
+       第 3 行(信封>preamble 优先级)/第 21 行(旧窗外)/第 60 行(Orca 前导+CLI 块实况)/
+       第 300 行(深位)全命中;仅 preamble 无信封 sidecar 不变;e2e done 帧原文
 
 域隔离: ORCH_INBOX/ORCH_INFLIGHT/ORCH_RUNNING 全指 tempfile,零真桥流量,不触真实会话。
 """
@@ -297,25 +298,27 @@ def v1_scan20_env_after_preamble(tmp, base):
 
 
 @case
-def v1_scan20_boundary_20_21(tmp, base):
-    """信封恰在第 20 行 → 命中;第 21 行 → 不命中(无 preamble → 静默)。"""
+def v1_scan_anchor_deep_position(tmp, base):
+    """ENVELOPE-ANCHOR(E2E 断点#1 修): 信封全文任意行首中——第 21 行(旧窗外)/约 60 行
+    (Orca 前导+CLI 块实况)/第 300 行(深位)全命中;无信封无 preamble → 静默不变。"""
     e = dict(base)
-    p20 = '\n'.join(f'填充第{i}行' for i in range(1, 20)) + '\n' \
-        + _envline('orch-b20@session-b20', 'OF11-S20B')
-    p = run_script(UPS, {'session_id': 'sess-b20', 'prompt': p20}, e)
-    assert p.returncode == 0, p.stderr
-    row = open(os.path.join(inflight_dir(base), 'sess-b20'), encoding='utf-8').read().rstrip('\n')
-    assert len(row.split('\t')) == 5 and row.split('\t')[4] == 'orch-b20@session-b20', row
+    for sid, nfill, ref, frm in (('sess-b21', 20, 'OF11-S20B', 'orch-b21@session-b21'),
+                                  ('sess-b60', 59, 'OF11-S20D', 'orch-b60@session-b60'),
+                                  ('sess-b300', 299, 'OF11-S20E', 'orch-b300@session-b300')):
+        prompt = '\n'.join(f'填充第{i}行' for i in range(1, nfill + 1)) + '\n' + _envline(frm, ref)
+        p = run_script(UPS, {'session_id': sid, 'prompt': prompt}, e)
+        assert p.returncode == 0, p.stderr
+        row = open(os.path.join(inflight_dir(base), sid), encoding='utf-8').read().rstrip('\n')
+        cols = row.split('\t')
+        assert len(cols) == 5 and cols[0] == ref and cols[4] == frm, row
     in_before = sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip())
     run_before = sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip())
-    p21 = '\n'.join(f'填充第{i}行' for i in range(1, 21)) + '\n' \
-        + _envline('orch-b21@session-b21', 'OF11-S20C')
-    p = run_script(UPS, {'session_id': 'sess-b21', 'prompt': p21}, e)
+    p = run_script(UPS, {'session_id': 'sess-none', 'prompt': '普通 prompt 无信封无 preamble'}, e)
     assert p.returncode == 0, p.stderr
-    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-b21'))
+    assert not os.path.exists(os.path.join(inflight_dir(base), 'sess-none'))
     assert sum(1 for l in open(base['ORCH_INBOX'], encoding='utf-8') if l.strip()) == in_before
     assert sum(1 for l in open(base['ORCH_RUNNING'], encoding='utf-8') if l.strip()) == run_before
-    print('[ ok ] v1 边界钉死: 信封第 20 行命中 / 第 21 行不命中(静默零落盘)')
+    print('[ ok ] v1 锚定首中: 第 21/60/300 行全命中;无信封无 preamble 静默零落盘')
 
 
 @case
