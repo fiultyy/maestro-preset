@@ -2,9 +2,9 @@
 name: cb-send
 description: >-
   Callback to an orchestrator session from any plane (works for every
-  orchestration plane's workers): send ack/done dispatch handshakes,
+  orchestration plane's workers): send ack/end dispatch handshakes,
   ask/report/ping messages that drive the orchestrator's turn natively. Use
-  when a dispatched task message tells you to "cb-send", reply "ack"/"done"
+  when a dispatched task message tells you to "cb-send", reply "ack"/"end" (done=同义旧名,透传仍合法)
   to an orchestrator, you see a "[ref:...]" callback contract, or you need to
   report to / ask the coordinator from Orca terminals, dais (formerly zap)
   panes, cron, or any local agent process.
@@ -18,7 +18,7 @@ description: >-
 CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro/bin/cb-send
 
 "$CB" ack  <你的ID> <orch签名> <ref> "turn started"      # 回合一开始就必须发
-"$CB" done <你的ID> <orch签名> <ref> "<结果摘要≤300字>"   # 完成时发
+"$CB" end <你的ID> <orch签名> <ref> "<结果摘要≤300字>"   # 完成时发
 ```
 
 ## 目的 → 命令
@@ -26,7 +26,7 @@ CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro
 | 我要… | 调什么 | 传什么 |
 |---|---|---|
 | 报"收到/开干" | `cb-send ack <你的ID> <orch签名> <ref> "turn started"` | 回合第一条动作前发 |
-| 报完成 | `cb-send done <你的ID> <orch签名> <ref> "<摘要≤300字>"` | 只发一次 |
+| 报完成 | `cb-send end <你的ID> <orch签名> <ref> "<摘要≤300字>"` | 只发一次 |
 | 问编排者拍板 | `cb-send ask <你的ID> <orch签名> <ref> "<问题+已试的路>"` | — |
 | 中途通报 | `cb-send report <你的ID> <orch签名> <ref> "<阶段结论>"` | — |
 | 链路自检 | `cb-send ping <你的ID> <orch签名> - "probe"` | — |
@@ -37,7 +37,7 @@ CB=~/.dsh/maestro/bin/cb-send   # 不在时镜像: ~/.dsh/.agent-presets/maestro
 ## 规则
 
 1. **收到派发 → 必须先发 ack 再干活**(编排者按它把节点置 running)。
-2. **完成 → done 只发一次**;发过的 ref 别再投。
+2. **完成 → end 只发一次**;发过的 ref 别再投。
 3. **`to` 必须用编排者全签名**,别用 `*`(广播吵醒所有会话+命中死会话)。
 4. **body 绝不以 `DSH-RE]` 开头**(保留字,会被过滤成回声丢弃)。
 5. 单行 ≤4KB;长内容落文件,body 传路径。

@@ -6,13 +6,13 @@
 #   ledger review <project> <node_id> <pass|fail|rework> <note>      # 审查收口: node→reviewed-* + event
 #   ledger status [project]                                           # 节点+近事件一览
 #   ledger ticket add <ticket_id> <title> [--deps '["OF-001"]'] [--refs '{"worktree":"/wt","run":"/run","session":"s1","verify":"/path/spec"}'] [--outcome X]
-#   ledger ticket state <ticket_id> <new_state> [--force] [--note X]   # 状态机迁移;迁入 running/done 前 deps 须 done(--force 旁路并 journal)
-#   ledger ticket dep <ticket_id> <dep_id> [--rm]                      # 依赖边(自依赖/成环拒绝;dep 可指向未入库票,视为未 done)
+#   ledger ticket state <ticket_id> <new_state> [--force] [--note X]   # 状态机迁移;迁入 running/end 前 deps 须 end(--force 旁路并 journal)
+#   ledger ticket dep <ticket_id> <dep_id> [--rm]                      # 依赖边(自依赖/成环拒绝;dep 可指向未入库票,视为未 end)
 #   ledger ticket lease <ticket_id> [owner] [--release]                # 认领/释放租约
 #   ledger ticket refs-set <ticket_id> --json '{"k":"v"}'              # refs 定点改键(merge,幂等; PMWEB-CWD)
 #   ledger ticket list [--state X] [--since 24h] [--json]              # 回溯查询(since: <N>h|<N>d|<N>=小时)
 #   ledger ticket render [-o <path>]                                   # v4 兼容票板渲染(缺省 <maestro>/tickets.md;手写内容保留于 <!-- hand --> 区;幂等)
-# ticket 状态机: dispatched→running→blocked→done→merged,终态另含 rejected/rolled-back;非法迁移拒绝。
+# ticket 状态机: dispatched→running→blocked→end→merged,终态另含 rejected/rolled-back;非法迁移拒绝。
 # ticket 写路径一律 flock(<db>.lock) 串行,事件追加 ticket_events(append-only);读路径不建 schema 不落锁。
 import argparse, fcntl, json, os, re, sqlite3, sys, tempfile
 from contextlib import contextmanager
@@ -87,23 +87,23 @@ def cmd_status(a):
 # 写路径 flock(<db>.lock) 串行;读路径容忍缺表(不建 schema 不落锁);既有 node/event/review/status/project 行为零变化。
 
 DEFAULT_TICKETS_MD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tickets.md')
-TICKET_STATES = ['dispatched', 'running', 'blocked', 'done', 'merged', 'rejected', 'rolled-back']
+TICKET_STATES = ['dispatched', 'running', 'blocked', 'end', 'merged', 'rejected', 'rolled-back']
 TICKET_TRANSITIONS = {  # 合法迁移表;不在表内即非法,拒绝
     'dispatched':  {'running', 'rejected'},
-    'running':     {'blocked', 'done', 'rejected'},
-    'blocked':     {'running', 'done', 'rejected'},
-    'done':        {'running', 'merged', 'rejected'},
+    'running':     {'blocked', 'end', 'rejected'},
+    'blocked':     {'running', 'end', 'rejected'},
+    'end':        {'running', 'merged', 'rejected'},
     'merged':      {'rolled-back'},
     'rejected':    set(),
     'rolled-back': set(),
 }
 TICKET_SYMBOL = {s: '☐' for s in ('dispatched',)}
 TICKET_SYMBOL.update({s: '◐' for s in ('running', 'blocked')})
-TICKET_SYMBOL.update({s: '☑' for s in ('done', 'merged', 'rejected', 'rolled-back')})
-DEP_SAT = {'done', 'merged'}           # 前置视为就绪(merged 隐含曾过 done)
-DEP_GATED_TARGETS = {'running', 'done'}  # 迁入这些状态须 deps 就绪;reject/rolled-back 永不设门
+TICKET_SYMBOL.update({s: '☑' for s in ('end', 'merged', 'rejected', 'rolled-back')})
+DEP_SAT = {'end', 'merged'}           # 前置视为就绪(merged 隐含曾过 end)
+DEP_GATED_TARGETS = {'running', 'end'}  # 迁入这些状态须 deps 就绪;reject/rolled-back 永不设门
 HAND_OPEN, HAND_CLOSE = '<!-- hand -->', '<!-- /hand -->'
-TICKET_TERMINAL = {'done', 'merged', 'rejected', 'rolled-back'}  # 终态=投影触发面(OF-010)
+TICKET_TERMINAL = {'end', 'merged', 'rejected', 'rolled-back'}  # 终态=投影触发面(OF-010)
 
 # ── OF-010 tickets→longtask 单向投影(通道 b:文件承接件,仿 ledger-carryover Checkpoints 形制) ──
 # 方向钉死:maestro 为源,longtask 为渲染视图;承接件只追加、maestro 永不读回(⑤);
@@ -252,6 +252,11 @@ def ensure_ticket_schema(c):
         detail     TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_key, id DESC);
+
+      -- END-RENAME(2026-09-10 用户裁定): 票/node 态 done→end(oneshot 回合结束语义,防「全部完成」歧义);
+      -- 一次性幂等迁移存量值。事件史料 event_type 不追改——append-only 史。
+      UPDATE tickets SET state='end' WHERE state='done';
+      UPDATE nodes  SET status='end' WHERE status='done';
     """)
 
 @contextmanager
@@ -304,7 +309,7 @@ def unmet_deps(c, deps):
     out = []
     for d in deps:
         r = c.execute("SELECT state FROM tickets WHERE ticket_id=?", (d,)).fetchone()
-        if not r or r['state'] not in DEP_SAT: out.append(d)  # 未入库依赖票视为未 done
+        if not r or r['state'] not in DEP_SAT: out.append(d)  # 未入库依赖票视为未 end
     return out
 
 def parse_json_arg(raw, flag, want):
@@ -334,7 +339,7 @@ def cmd_ticket_state(a):
             die(f"illegal transition: {cur} -> {a.state} (legal: {', '.join(legal) or '无(终态)'})")
         blocked = unmet_deps(c, json.loads(row['deps'])) if a.state in DEP_GATED_TARGETS else []
         if blocked and not a.force:
-            die(f"deps 未就绪: {', '.join(blocked)} 非 done(--force 旁路)")
+            die(f"deps 未就绪: {', '.join(blocked)} 非 end(--force 旁路)")
         c.execute("UPDATE tickets SET state=?,updated_at=? WHERE ticket_id=?", (a.state, now(), a.ticket_id))
         if blocked and a.force:
             ticket_ev(c, a.ticket_id, 'deps-forced', a.source, f"force 放行未就绪 deps: {', '.join(blocked)}")
@@ -447,7 +452,7 @@ def cmd_ticket_render(a):
         hand = m.group(1) if m else old  # 首次渲染:既有全文整体包进 hand 保留区
     L = ['# maestro 票板(v4 渲染视图,autogenerated)', '',
          f'> ⚠ **AUTOGENERATED** by `ledger ticket render` — 区外内容每次渲染覆写;手写内容只保留于文末 `{HAND_OPEN}` 保留区。',
-         '> 状态符号:☐ dispatched · ◐ running/blocked · ☑ done/merged/rejected/rolled-back。'
+         '> 状态符号:☐ dispatched · ◐ running/blocked · ☑ end/merged/rejected/rolled-back。'
          '数据源:`ledger.db` 表 `tickets`(OF-005;渲染幂等,重跑 `ledger ticket render`)。', '',
          f'## 票据(数据面,{len(rows)} 张)', '']
     if not rows: L.append('_(暂无票据)_')

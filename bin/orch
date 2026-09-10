@@ -24,17 +24,17 @@
     worker_done→check --ack+worker-release+记账 | escalation→ack+release |
     question→不动,等编排席 reply);旗标以 orca-ide 动态 guide 为准,链序以本文件为准。
   - ledger 自动建账(编排席规则7/8 硬机制): dispatch → node(dispatched)+event;
-    收果 → node done/blocked + outcome 事件(≤300字);tickets 环(ticket add/lease/state)
+    收果 → node end/blocked + outcome 事件(≤300字);tickets 环(ticket add/lease/state)
     同步勾稽 —— pm-host-service PM-003 票源 = `ledger ticket list --json`(ledger.db
     tickets 表,db 签名是 freshness authority),写 tickets 环 pm-web 票面才自然更新。
   - 状态机在代码里强制(node status 为准): dispatched→{running,blocked};
-    running→{done,failed,blocked};blocked→{running,done,failed};done/failed 终态;
+    running→{end,failed,blocked};blocked→{running,end,failed};end/failed 终态;
     同态重写=幂等 no-op;表外流转一律拒绝(exit 1)。ledger ticket 侧另有内置状态机,
     本工具按其迁移表求最短合法路径逐步迁移,拒绝即 fail-loud。
   - running 帧消费(orch-hooks sidecar,worker 侧 turn-start hook 产出;桥 inbox 不涉及):
     status/settle/dag-status/dag-settle 进门先 tail 增量(字节游标,原子推进)收 type=ticket-running 帧 →
     dispatch 节点(及 ticket 环)dispatched→running;寻址(to==ORCH_SIG)+ref/task 双路
-    解析(ref→node_id;task_*→refs.task;body [task:..] 兜底)+现态幂等(已 running/done 跳过)。
+    解析(ref→node_id;task_*→refs.task;body [task:..] 兜底)+现态幂等(已 running/end 跳过)。
   - 幂等: deliveryId 记账于 <state>/orch-deliveries.json(原子写),重复 settle 收到同一
     delivery 不二次 ack/收尾/记账;同一 ref 重复 dispatch 默认拒(--force 放行并记 duplicate)。
   - 零实弹默认: 所有 orca-ide 调用可经 ORCH_BIN 注入 stub;--dry-run 只打印命令序列,
@@ -46,7 +46,7 @@
     dag-seat-open→dag-run→dag-task[--deps]→dag-seat→(回调)dag-settle→dag-close;
     agent 固定 omp、worktree 固定 new-top-level、tickets 环强制勾稽、零模式旗标;
     deps 屏障三层=本地依赖未建 fail-loud → Orca task_not_startable 硬拒绝透传 →
-    ledger 票面 deps 未就绪拒迁 running/done;派发链四命令(dag-seat-open/run/task/
+    ledger 票面 deps 未就绪拒迁 running/end;派发链四命令(dag-seat-open/run/task/
     seat)同过 bridge 武装硬门(V3: 未武装拒派);--base-branch 收编自 dbdeb83
     (repo 默认基点变更后的双保险: 落 state.worker_base_ref,dag-seat 透传 worker-start);
     状态文件 ORCH_DAG_STATE(缺省 <state>/orch-dag.json,承 orch-dag 旧档)。
@@ -96,19 +96,19 @@ def require_ledger():
 # node 侧(ledger nodes.status,本工具强制;ledger 本体对 node 不设状态机):
 NODE_TRANSITIONS = {
     'dispatched': {'running', 'blocked'},
-    'running':    {'done', 'failed', 'blocked'},
-    'blocked':    {'running', 'done', 'failed'},
-    'done':       set(),
+    'running':    {'end', 'failed', 'blocked'},
+    'blocked':    {'running', 'end', 'failed'},
+    'end':       set(),
     'failed':     set(),
 }
-NODE_TERMINAL = {'done', 'failed'}
+NODE_TERMINAL = {'end', 'failed'}
 # ticket 侧(ledger 内置状态机,~/.dsh/maestro/bin/ledger TICKET_TRANSITIONS 的镜像;
 # 镜像仅用于求最短合法路径,真实校验仍由 ledger 拒绝兜底 —— 漂移即 fail-loud):
 TICKET_TRANSITIONS = {
     'dispatched':  {'running', 'rejected'},
-    'running':     {'blocked', 'done', 'rejected'},
-    'blocked':     {'running', 'done', 'rejected'},
-    'done':        {'running', 'merged', 'rejected'},
+    'running':     {'blocked', 'end', 'rejected'},
+    'blocked':     {'running', 'end', 'rejected'},
+    'end':        {'running', 'merged', 'rejected'},
     'merged':      {'rolled-back'},
     'rejected':    set(),
     'rolled-back': set(),
@@ -390,7 +390,7 @@ def ticket_exists(tid):
 # "ref":<ref,不可得则 task_id>,"msgid","ts","ver":3} 到 <maestro>/orch-hooks/running.log。
 # CLI 消费形态: wait/status 进门先 tail 增量(字节游标,原子推进),寻址校验+双路解析
 # (ref→node_id;task_*→refs.task)→ 仅 dispatched 现态迁 running(node+ticket 环),
-# 已 running/done 等一律幂等跳过。游标+现态双保险,同帧/同 task 不重复记账。
+# 已 running/end 等一律幂等跳过。游标+现态双保险,同帧/同 task 不重复记账。
 
 def orch_sig():
     sig = os.environ.get('ORCH_SIG') or os.environ.get('MAESTRO_ORCH_SIGNATURE')
@@ -464,7 +464,7 @@ def find_dispatch_node(ref=None, task_id=None):
         c.close()
 
 def book_running(node, frame_from, note):
-    """仅 dispatched 现态迁 running(node+ticket 环);已 running/done 等幂等跳过。"""
+    """仅 dispatched 现态迁 running(node+ticket 环);已 running/end 等幂等跳过。"""
     nid, project, refs = node['node_id'], node['project'], node['refs'] or {}
     if node['status'] == 'running':
         return f'running 帧幂等跳过(已 running): {nid}'
@@ -542,7 +542,7 @@ def node_transition(project, node_id, to_status, event_type, detail, source='orc
     """node 状态机迁移: 查现态 → 校验 → ledger node upsert + event。
     auto_path=False(手工/_transition): 严格单边,表外即拒(状态机硬门)。
     auto_path=True(wait 收尾记账): 允许自动补中间态(worker_done 先于 running 观测到达时
-    dispatched→running→done 补齐),每步均合法,事件只记目标一步;同态=幂等 no-op 零写。"""
+    dispatched→running→end 补齐),每步均合法,事件只记目标一步;同态=幂等 no-op 零写。"""
     row = get_node(project, node_id)
     if not row:
         die(f'node 不存在: {node_id} @ {project}(先 orch dispatch 建账)', 1)
@@ -714,7 +714,7 @@ def cmd_dispatch(a):
 # 契约(承 orch-dag,审计 2cfc6b2 定谳语义原样保留): agent 固定 omp、worktree 固定
 # new-top-level、tickets 环随生命周期强制勾稽、零模式旗标、缺参 fail-loud(argparse 层
 # exit 2);deps 屏障三层=本地依赖未建拒绝 → Orca task_not_startable 硬拒绝透传 →
-# ledger 票面 deps 未就绪拒迁 running/done。派发链四命令(dag-seat-open/run/task/seat)
+# ledger 票面 deps 未就绪拒迁 running/end。派发链四命令(dag-seat-open/run/task/seat)
 # 同过 bridge 武装硬门(V3: 未武装拒派)。wait 已退役: 完成等待=回调(ADR-013),
 # 收讫记账 dag-settle(票/node→running「复验待关账」),终态 dag-close(手工)。
 DAG_AGENT = 'omp'                    # 硬编码: 唯一执行席 harness(审计③: 减少选择性,记录即可)
@@ -951,19 +951,21 @@ def cmd_dag_settle(a):
 def cmd_dag_close(a):
     """复验后关账(唯一终态入口,手工): ticket 终态 + node 合法同步 + closed 事件。
     rejected/rolled-back 为票面语义,node 只记事件(node 状态机无此二态)。"""
-    if a.state not in ('done', 'rejected', 'rolled-back', 'blocked'):
-        die('close 仅接受 done|rejected|rolled-back|blocked', 64)
+    if a.state == 'done':
+        a.state = 'end'   # END-RENAME: done=旧别名(存量肌肉记忆),语义同 end
+    if a.state not in ('end', 'rejected', 'rolled-back', 'blocked'):
+        die('close 仅接受 end|rejected|rolled-back|blocked(done 旧别名兼容)', 64)
     t = get_ticket(a.ref)
     if t is None:
         die(f'票不存在: {a.ref}', 1)
-    if t['state'] == a.state:   # P2(模拟E2E 缺口,2026-09-10): 同态重放幂等跳过(仿 S23 settle 先例),done→done 重跑不再非法
+    if t['state'] == a.state:   # P2(模拟E2E 缺口,2026-09-10): 同态重放幂等跳过(仿 S23 settle 先例),end→end 重跑不再非法
         print(f'close: {a.ref} 幂等跳过(已 {a.state})')
         return
     run_ledger(['ticket', 'state', a.ref, a.state, '--source', 'orch-dag',
                 '--note', (a.outcome or '')[:300]], f'ticket close 失败({a.ref})')
     project = dag_load().get('project') or os.getcwd()
     node = get_node(project, a.ref)
-    node_map = {'done': 'done', 'blocked': 'blocked'}
+    node_map = {'end': 'end', 'blocked': 'blocked'}
     if node and a.state in node_map and node['status'] not in NODE_TERMINAL:
         try:
             node_transition(project, a.ref, node_map[a.state], f'closed-{a.state}',
@@ -1036,7 +1038,7 @@ def resolve_settle_target(a):
 def settle_message(msg, run, project, node_id, ref, top_delivery):
     """单条消息收尾。次序硬约定: 先 ledger 记账(失败 exit5,orca 侧未动,可整链重放)
     → 再 ack(fail-loud) → release(WARN) → 记幂等账(deliveryId)。
-    返回 (action, exit_code_contrib)。action ∈ done|escalation|question|status|skip。"""
+    返回 (action, exit_code_contrib)。action ∈ end|escalation|question|status|skip。"""
     mtype = (msg.get('type') or '').strip()
     delivery_id = top_delivery or find_delivery_id(msg) or (str(msg['id']) if msg.get('id') else '')
     payload = msg_payload_dict(msg)
@@ -1049,9 +1051,9 @@ def settle_message(msg, run, project, node_id, ref, top_delivery):
 
     if mtype == 'worker_done':
         if project and node_id:
-            settle_node(project, node_id, 'done', 'worker_done', outcome or f'delivery={delivery_id}')
+            settle_node(project, node_id, 'end', 'worker_done', outcome or f'delivery={delivery_id}')
         if ref:
-            ticket_transition(ref, 'done')
+            ticket_transition(ref, 'end')
             if get_ticket(ref) and get_ticket(ref)['lease_owner']:
                 run_ledger(['ticket', 'lease', ref, '--release', '--source', 'orch'])
         if delivery_id:
@@ -1060,11 +1062,11 @@ def settle_message(msg, run, project, node_id, ref, top_delivery):
         if ctx:
             rc, _, err = run_orca(['orchestration', 'worker-release', '--dispatch', ctx])
             if rc != 0:
-                print(f'orch: WARN worker-release 失败(rc={rc}): {(err or "").strip()[:200]}(账已记 done)', file=sys.stderr)
+                print(f'orch: WARN worker-release 失败(rc={rc}): {(err or "").strip()[:200]}(账已记 end)', file=sys.stderr)
         if delivery_id:
             record_delivery(run, delivery_id, mtype, outcome)
-        print(f"worker_done 收口: node={'done' if node_id else '?'} delivery={delivery_id} outcome={outcome[:80]}")
-        return ('done', 0)
+        print(f"worker_done 收口: node={'end' if node_id else '?'} delivery={delivery_id} outcome={outcome[:80]}")
+        return ('end', 0)
 
     if mtype == 'escalation':
         if project and node_id:
@@ -1413,15 +1415,15 @@ def cmd_selftest(a):
         con.close()
         c.check('S3 duplicate 已记账', dup >= 1)
 
-        # S4 settle worker_done(回调收讫)→ ack+release+node done+ticket done+lease release
+        # S4 settle worker_done(回调收讫)→ ack+release+node end+ticket end+lease release
         resetspy()
         fx = delivery([{'id': 'm1', 'type': 'worker_done',
                         'payload': json.dumps({'taskId': s['task'], 'dispatchId': s['ctx'], 'outcome': '全部落地'})}],
                       'dlv_1')
         p = _orch(['settle', '--run', s['run'], '--payload-file', fx], env)
         c.check('S4 worker_done rc=0', p.returncode == 0, p.stderr + p.stdout)
-        c.check('S4 node done', get_node(proj, 'T-001')['status'] == 'done')
-        c.check('S4 ticket done+lease 释放', get_ticket('T-001') == {'state': 'done', 'lease_owner': None},
+        c.check('S4 node end', get_node(proj, 'T-001')['status'] == 'end')
+        c.check('S4 ticket end+lease 释放', get_ticket('T-001') == {'state': 'end', 'lease_owner': None},
                 str(get_ticket('T-001')))
         c.check('S4 ack 恰一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
         c.check('S4 release 恰一次 ctx', open(env['ORCH_FAKE_RELEASES']).read().split() == [s['ctx']],
@@ -1430,7 +1432,7 @@ def cmd_selftest(a):
         p = _orch(['settle', '--run', s['run'], '--payload-file', fx], env)
         c.check('S5 重放 rc=0 且 skip', p.returncode == 0 and 'already settled' in p.stdout, p.stdout + p.stderr)
         c.check('S5 ack 仍一次', open(env['ORCH_FAKE_ACKS']).read().split().count('dlv_1') == 1)
-        c.check('S5 node 仍 done(未重复迁移)', get_node(proj, 'T-001')['status'] == 'done')
+        c.check('S5 node 仍 end(未重复迁移)', get_node(proj, 'T-001')['status'] == 'end')
 
         # S6 question → 不 ack, node/ticket blocked, 打印 reply 模板
         resetspy()
@@ -1467,13 +1469,13 @@ def cmd_selftest(a):
         p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'm',
                    '--ref', 'T-003', '--project', proj, '--json'], env)
         c.check('S9 前置 dispatch T-003 rc=0', p.returncode == 0, p.stderr)
-        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
-        c.check('S9 dispatched→done 非法拒绝 exit=1', p.returncode == 1 and '非法状态流转' in p.stderr, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'end'], env)
+        c.check('S9 dispatched→end 非法拒绝 exit=1', p.returncode == 1 and '非法状态流转' in p.stderr, p.stderr)
         p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'running'], env)
         c.check('S10 dispatched→running 合法 rc=0', p.returncode == 0, p.stderr)
-        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
-        c.check('S10 running→done 合法 rc=0', p.returncode == 0, p.stderr)
-        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'done'], env)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'end'], env)
+        c.check('S10 running→end 合法 rc=0', p.returncode == 0, p.stderr)
+        p = _orch(['_transition', '--project', proj, '--node', 'T-003', '--to', 'end'], env)
         c.check('S10 同态重写幂等 no-op rc=0', p.returncode == 0 and 'noop' in p.stdout, p.stdout)
 
         # S11 reply → stub 记录 + 提示重挂
@@ -1838,12 +1840,12 @@ def cmd_selftest(a):
         c.check('S21b ledger 自举写票 dispatched', bool(frow) and frow[0] == 'dispatched', str(frow))
         p = _orch(['dag-settle', 'DF-1', '--outcome', 'fresh 收讫'], freshenv, cwd=proj)
         c.check('S21b 空库 settle rc=0', p.returncode == 0, p.stderr[-160:])
-        p = _orch(['dag-close', 'DF-1', 'done', '--outcome', 'fresh-db close'], freshenv, cwd=proj)
+        p = _orch(['dag-close', 'DF-1', 'end', '--outcome', 'fresh-db close'], freshenv, cwd=proj)
         c.check('S21b P1 空库 close rc=0 无 Traceback(编排三表随账本自举)', p.returncode == 0
                 and 'Traceback' not in p.stderr, p.stderr[-200:])
         freshdb = sqlite3.connect(freshenv['MAESTRO_LEDGER'])
         ftabs = {r[0] for r in freshdb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        fev = freshdb.execute("SELECT COUNT(*) FROM events WHERE node_id='DF-1' AND event_type='closed-done'").fetchone()[0]
+        fev = freshdb.execute("SELECT COUNT(*) FROM events WHERE node_id='DF-1' AND event_type='closed-end'").fetchone()[0]
         fprj = freshdb.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         freshdb.close()
         c.check('S21b P1 空库自举含 projects/nodes/events 三表', {'projects','nodes','events'} <= ftabs, str(sorted(ftabs)))
@@ -1858,28 +1860,28 @@ def cmd_selftest(a):
         p = _orch(['dag-settle', 'DR-1'], env, cwd=proj)
         c.check('S23 重复收讫幂等 rc=0', p.returncode == 0 and '幂等跳过' in p.stdout, p.stdout + p.stderr)
         c.check('S23 node 仍 running', (get_node(proj, 'DR-1') or {}).get('status') == 'running')
-        p = _orch(['dag-settle', 'DR-2'], env, cwd=proj)   # DR-2 dep DR-1(未 done)→ ledger deps 门拒
+        p = _orch(['dag-settle', 'DR-2'], env, cwd=proj)   # DR-2 dep DR-1(未 end)→ ledger deps 门拒
         c.check('S23 提前收讫 ledger deps 门 fail-loud rc=5', p.returncode == 5
                 and 'deps 未就绪' in (p.stdout + p.stderr), (p.stdout + p.stderr)[-200:])
         c.check('S23 DR-2 票态未动', (get_ticket('DR-2') or {}).get('state') == 'dispatched')
 
         # S24 dag-close: 复验后关账(唯一终态入口);rejected 只记事件不同步 node
-        p = _orch(['dag-close', 'DR-1', 'done', '--outcome', '复验通过'], env, cwd=proj)
-        c.check('S24 close done rc=0', p.returncode == 0, p.stderr)
-        c.check('S24 票 done', (get_ticket('DR-1') or {}).get('state') == 'done', str(get_ticket('DR-1')))
-        c.check('S24 node done', (get_node(proj, 'DR-1') or {}).get('status') == 'done')
+        p = _orch(['dag-close', 'DR-1', 'end', '--outcome', '复验通过'], env, cwd=proj)
+        c.check('S24 close end rc=0', p.returncode == 0, p.stderr)
+        c.check('S24 票 end', (get_ticket('DR-1') or {}).get('state') == 'end', str(get_ticket('DR-1')))
+        c.check('S24 node end', (get_node(proj, 'DR-1') or {}).get('status') == 'end')
         con = sqlite3.connect(db)
-        ev_done = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-done'").fetchone()[0]
+        ev_done = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-end'").fetchone()[0]
         con.close()
-        c.check('S24 closed-done 事件记账', ev_done >= 1, f'closed-done 事件数={ev_done}')
-        p = _orch(['dag-close', 'DR-1', 'done', '--outcome', '复验通过'], env, cwd=proj)
+        c.check('S24 closed-end 事件记账', ev_done >= 1, f'closed-end 事件数={ev_done}')
+        p = _orch(['dag-close', 'DR-1', 'end', '--outcome', '复验通过'], env, cwd=proj)
         c.check('S24 P2 close 同态重放幂等 rc=0', p.returncode == 0
                 and '幂等跳过' in p.stdout, p.stdout + p.stderr)
         con = sqlite3.connect(db)
-        ev_dup = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-done'").fetchone()[0]
+        ev_dup = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-end'").fetchone()[0]
         con.close()
         c.check('S24 P2 幂等重放零重复事件', ev_dup == ev_done, f'{ev_done} -> {ev_dup}')
-        _orch(['dag-seat', 'DR-2'], env, cwd=proj)   # deps DR-1 已 done,可派发
+        _orch(['dag-seat', 'DR-2'], env, cwd=proj)   # deps DR-1 已 end,可派发
         p = _orch(['dag-close', 'DR-2', 'rejected', '--outcome', '复验不过'], env, cwd=proj)
         c.check('S24 close rejected rc=0', p.returncode == 0, p.stderr)
         c.check('S24 票 rejected', (get_ticket('DR-2') or {}).get('state') == 'rejected')
@@ -1995,7 +1997,8 @@ def main():
     p.set_defaults(f=cmd_dag_settle)
     p = sub.add_parser('dag-close', help='dag 族: 复验后关账(唯一终态入口,手工)')
     p.add_argument('ref')
-    p.add_argument('state', choices=['done', 'rejected', 'rolled-back', 'blocked'])
+    p.add_argument('state', choices=['end', 'done', 'rejected', 'rolled-back', 'blocked'],
+                   help='end=复验通过关账正名(done=旧别名兼容);幂等重跑备路:票 end→running 合法,node 保持 end 终态、重结算幂等跳过')
     p.add_argument('--outcome', required=True, help='≤300字 关账摘要')
     p.set_defaults(f=cmd_dag_close)
     p = sub.add_parser('dag-status', help='dag 族: seat/run/refs+Orca task 并排(只读)')

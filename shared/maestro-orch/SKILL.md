@@ -57,7 +57,10 @@ orch dag-seat <REF> [--name <worktree>]                # worker-start(固定 omp
 #   dsh 席 = echo $DSH_SESSION_ID;任意面 = bridge_arm 后查 ~/.dsh/maestro/bridge/registry.json 自己的注册行。
 # 完成等待 = 回调唯一(见「回调单车道」): worker_done 原生唤醒编排席回合;收讫记账:
 orch dag-settle <REF> [--outcome "<≤300字>"] [--dispatch <ctx>]   # 票/node → running「复验待关账」;重复回调幂等
-orch dag-close <REF> <done|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口,手工)
+orch dag-close <REF> <end|rejected|rolled-back|blocked> --outcome "<≤300字>"   # 复验后关账(唯一终态入口,手工;done=旧别名兼容)
+# END 语义(END-RENAME,2026-09-10 用户裁定): worker=oneshot,一回合即回执;票态/回执 end=「回合结束,待复验」≠全部完成。
+# 编排者收 end 必复验;复验不过两条路:①改单(票改 dag 更新,跑新插票) ②幂等重跑 end 票(票 end→running 合法,node 保持 end 终态、重结算幂等跳过)。真完成=close。
+# 帧事件名 ticket-done 为线协议史料名,语义同 end,不追改;cb-send end 为正名(done 透传仍合法=同义)。
 orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca task 并排(只读)
 # 票面卫生(CONTRACT-HYGIENE): 测试票(非真实派发目的的 ledger ticket)即建即拒——dag-close rejected 关账,理由必填(outcome/note);生产 ledger 禁留无主测试票
 ```
@@ -66,7 +69,7 @@ orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca ta
 
 ## 完成等待 — 回调单车道(ORCH-WAKE 契约,ADR-013)
 
-**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send done`(降级与跨面)。**阻塞式 check 等待(--wait)已从代码与契约双双退役**——阻塞等待循环不出现在任何活代码;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段;收讫结算: dag 票用 `orch dag-settle`,正统链票用 `orch settle`(非阻塞,结算回调唤醒携带的 delivery 文档)。前置硬门: 派发路径(`orch dispatch` 与 dag 族四派发命令,含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
+**完成等待唯一手段 = 回调**: worker_done 原生唤醒编排席回合(orchestration 面)/ `cb-send end`(降级与跨面)。**阻塞式 check 等待(--wait)已从代码与契约双双退役**——阻塞等待循环不出现在任何活代码;`check --peek` 仅作只读诊断(**已废弃, deprecated**),不消费、不作等待手段;收讫结算: dag 票用 `orch dag-settle`,正统链票用 `orch settle`(非阻塞,结算回调唤醒携带的 delivery 文档)。前置硬门: 派发路径(`orch dispatch` 与 dag 族四派发命令,含 `--dry-run`)要求本席在 `bridge/registry.json` 有在册 consumer,未武装即拒并给 arm 指引——无回信地址的派工,其完成信号必然丢失(BRIDGE-WAKE 断腿同源)。
 
 > SLA 告警分态语义注记(#122,SLA-TTL,只增不改): event-watchd 的 sla 面对非终态票分态+依赖感知老化——dispatched/running 维持墙钟计龄到 ttl 告警(不变);blocked 票若存在非终态 deps(∈ dispatched/running/blocked)属设计内依赖屏障,不计龄不告警;deps 全终态(ledger TICKET_TERMINAL 同源)/无 deps/dep 票不可查视为真停摆或账本滞后,照常计龄到 ttl 告警——编排席收到 blocked 票 sla-overdue 即账本态滞后信号,优先核对票 deps 现态。
 
@@ -74,7 +77,7 @@ orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca ta
 
 - **持久 FIFO**: 回调帧落盘 `<maestro>/bridge/` 持久队列,编排席离线不丢,重挂后按序排水。
 - **at-least-once + 去重**: 同一 delivery 可能投递多次;按 deliveryId 记账幂等(`state/orch-deliveries.json` / dag 票现态幂等),重复帧不二次收尾、不二次记账。
-- **乱序无害**: 票完成帧先于开工帧到达亦无碍——账本按现态幂等再水化(done 不回退 running;已 running/done 对重复 running 帧跳过)。
+- **乱序无害**: 票完成帧先于开工帧到达亦无碍——账本按现态幂等再水化(end 不回退 running;已 running/end 对重复 running 帧跳过)。
 - **join 屏障 = 票 deps,不是等待循环**: 多票汇合靠 `orch dag-task <R> --deps R1,R2`(Orca task_not_startable 硬拒绝);绝不手写轮询/睡眠等下游。
 
 ## orch 其余子命令(正统链单票派发 + 收讫/应答/视图)
@@ -83,7 +86,7 @@ orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca ta
 
 ```bash
 orch dispatch --spec <file|-> --to <handle> --new-run "<objective>" --ref <LK-ID> [--json] [--dry-run]   # run→task→dispatch→建账(含 tickets 环;前置武装硬门)
-orch settle [--run r] (--payload-file <f> | --payload -)   # 回调收讫结算(非阻塞): worker_done→ack+release+记账 done;escalation→ack+release exit3;question→不动 exit2
+orch settle [--run r] (--payload-file <f> | --payload -)   # 回调收讫结算(非阻塞): worker_done→ack+release+记账 end;escalation→ack+release exit3;question→不动 exit2
 orch reply  --msg <id> --body <t> [--run <run_id>]   # 应答 question;完成信号仍走回调
 orch status [--run r] [--ref r] [--json]             # run/task/ctx+ledger 节点并排(离线)
 # status/settle 进门兼收 running 帧(worker hook sidecar <maestro>/orch-hooks/running.log):
@@ -140,7 +143,7 @@ ORCA orchestration worker-release --dispatch <ctx>
 1) 回合一开始:
    ~/.dsh/maestro/bin/cb-send ack <你的ID> <MY-SIG> <ref> "turn started"
 2) 完成时:
-   ~/.dsh/maestro/bin/cb-send done <你的ID> <MY-SIG> <ref> "<摘要≤300字>"
+   ~/.dsh/maestro/bin/cb-send end <你的ID> <MY-SIG> <ref> "<摘要≤300字>"
    (cb-send 不在时兜底: printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<MY-SIG>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log)
 3) 契约行丢失: load skill `cb-send`
 ```
@@ -169,7 +172,7 @@ ORCA orchestration worker-release --dispatch <ctx>
 ### 双报禁令(Orca 面)
 
 - 经 `dispatch --inject` 建账的票: **完成信号 = 原生 worker_done,只此一路**。
-- `cb-send done` 仅作编排面 CLI 不可用时的**兜底**;双通道**择一,勿双发**。
+- `cb-send end` 仅作编排面 CLI 不可用时的**兜底**;双通道**择一,勿双发**。
 - worker_done 已自动结算 → **勿再补 task-update**;收尾按需 `worker-start --terminal` 复用终端或 `worker-release` 归还。
 
 ## dais 面 — worker-up 三步链
@@ -180,7 +183,7 @@ dais orchestration start-worker <task_id> --session session_<sid>   # 必须 --s
 dais orchestration inject-prompt <ctx或session> "<全文>"  # 目标须 idle
 ```
 
-prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 done → `dais orchestration transition-worker <ctx_id> succeeded` 收口,然后 close-terminal。**完整命令面(send-message/check-messages/read-worker/scan-wait-blocked/answer/建 run-task)→ load skill `dais-orchestration`**,本技能不重复。
+prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 end → `dais orchestration transition-worker <ctx_id> succeeded` 收口,然后 close-terminal。**完整命令面(send-message/check-messages/read-worker/scan-wait-blocked/answer/建 run-task)→ load skill `dais-orchestration`**,本技能不重复。
 
 ## 内部调用 — ledger(账本)
 
@@ -206,10 +209,10 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
 2. **回调原生唤醒回合,不轮询**;超时才机械校验。
 3. **判定对方产出 → 三闸**: 排除回合前已存在的命中行;关键词用本轮独有词(ref 号/新产物名);命中后再等一次 tui-idle 才收口。
 4. **大文本折叠陷阱**: 派发后 45s 未消费 → 补一个空 `--enter`;**绝不连发两次 Enter**(第二次撤销粘贴,正文被撤回)。单行 ~4KB 上限。
-5. **双报禁令**: Orca 面 dispatch 票 = worker_done 唯一(cb-send done 仅 CLI 不可用兜底,择一勿双发,勿补 task-update);FULL HANDOFF 不嵌契约(已放弃监督);dais 面已有 worker_done,不叠第二套——dais 面用 `worker-up`(见 dais-orchestration skill)。
+5. **双报禁令**: Orca 面 dispatch 票 = worker_done 唯一(cb-send end 仅 CLI 不可用兜底,择一勿双发,勿补 task-update);FULL HANDOFF 不嵌契约(已放弃监督);dais 面已有 worker_done,不叠第二套——dais 面用 `worker-up`(见 dais-orchestration skill)。
 6. 死信 `wake failed … session-not-found` = 目标会话死了,等它 re-arm,别重投。
 7. **每次派发 → 必须记账**(node 置 dispatched + dispatched 事件)。
-8. **每次收果(回调/扫描)→ 必须更新**(状态 done/failed/blocked + ≤300 字 outcome)。账本写失败不阻塞编排: 记一笔继续,下轮 sweep 对账。
+8. **每次收果(回调/扫描)→ 必须更新**(状态 end/failed/blocked + ≤300 字 outcome)。账本写失败不阻塞编排: 记一笔继续,下轮 sweep 对账。
 
 ### 模板速查(一页照抄;2026-09-10 整合自 降级通道/dais 附录/reply.sh)
 
@@ -225,7 +228,7 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
     1) 回合一开始:
        ~/.dsh/maestro/bin/cb-send ack <你的ID> <MY-SIG> <ref> "turn started"
     2) 完成时:
-       ~/.dsh/maestro/bin/cb-send done <你的ID> <MY-SIG> <ref> "<摘要≤300字>"
+       ~/.dsh/maestro/bin/cb-send end <你的ID> <MY-SIG> <ref> "<摘要≤300字>"
        (cb-send 不在时兜底: printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<MY-SIG>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log)
     3) 契约行丢失: load skill cb-send"
 
