@@ -19,6 +19,11 @@
 #   preamble 同族)。env ORCH_SIG 仅余 preamble ticket-running 与 done 存量回落用途。
 # env: ORCH_SIG(编排者签名) ORCH_INBOX(桥收件箱) ORCH_INFLIGHT(配对态目录) ORCH_RUNNING(running sidecar)
 STDIN="$(cat 2>/dev/null || :)"
+# FRAME-SETTLE 旁路(2026-09-10): 运行中会话的 hooks 闭包快照不含 fsw 条目(启动时 apply 一次性
+# readFileSync,服务重启才重读)——由本已挂载的 ups 每回合代调磁盘上的 fsw 同目录脚本(脚本是活的);
+# 服务重启后 orch-hooks.json 独立 fsw 条目接管,msgid 分席去重保双入口幂等。fail-open 同族。
+FSW="$(dirname "$0")/frame-settle-watch.sh"
+if [ -x "$FSW" ]; then printf '%s' "$STDIN" | "$FSW" || :; fi
 [ -n "$ORCH_INBOX" ] || ORCH_INBOX="$HOME/.dsh/maestro/bridge/inbox.log"
 [ -n "$ORCH_INFLIGHT" ] || ORCH_INFLIGHT="$HOME/.dsh/maestro/orch-hooks/inflight"
 [ -n "$ORCH_RUNNING" ] || ORCH_RUNNING="$HOME/.dsh/maestro/orch-hooks/running.log"

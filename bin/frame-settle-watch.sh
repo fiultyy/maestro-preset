@@ -97,8 +97,9 @@ for f in frames:
 if not todo:
     sys.exit(0)
 
-# ── msgid 去重(全局,尾500;防 A/B 双路径同源帧与桥重投重放) ──────────────
-msgids_f = os.path.join(home, 'settled-msgids.log')
+# ── msgid 去重(按席分文件,尾500;防 A/B 双路径同源帧与桥重投重放;分席=不误消化他席
+#   未处理帧——多编排席共面各记各账,读写无竞态) ──────────────────────────
+msgids_f = os.path.join(home, f'settled-msgids-{SID8}.log')
 seen = set()
 try: seen = set(open(msgids_f, encoding='utf-8', errors='replace').read().split()[-500:])
 except OSError: pass
