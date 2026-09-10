@@ -63,6 +63,7 @@ orch dag-close <REF> <end|rejected|rolled-back|blocked> --outcome "<≤300字>" 
 # 帧事件名 ticket-done 为线协议史料名,语义同 end,不追改;cb-send end 为正名(done 透传仍合法=同义)。
 orch dag-status [--ref R] [--json]                     # seat/run/refs + Orca task 并排(只读)
 # 票面卫生(CONTRACT-HYGIENE): 测试票(非真实派发目的的 ledger ticket)即建即拒——dag-close rejected 关账,理由必填(outcome/note);生产 ledger 禁留无主测试票
+# 册面卫生(NOGUESS-ORCH 收口): 编排席使命终局(链收官/会话退役)必须撤 bridge 册(删 ~/.dsh/maestro/bridge/registry.json 里**本席那一行**;册是共享的,只动自己的行)——僵尸行留册=新 agent 无信封猜主错绑源+测试流量误涌(2026-09-10 活体:三席未撤册)
 ```
 
 **与 Orca 自带 `orchestration` skill 的关系**: 官方 stub 只管发现;orch dag 族是编排席固化的唯一工作流封装。旗标细节以 `skills get orchestration` 动态加载为准——但那是排障/核对 dag 族行为用的参考,**不是第二条派发路径**。
