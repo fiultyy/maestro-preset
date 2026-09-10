@@ -63,6 +63,10 @@ REF="$(printf '%s' "$ENV_JSON" | jq -r '.ref // empty' 2>/dev/null || :)"
 OMSGID="$(printf '%s' "$ENV_JSON" | jq -r '.msgid // empty' 2>/dev/null || :)"
 OTYPE="$(printf '%s' "$ENV_JSON" | jq -r '.type // empty' 2>/dev/null || :)"
 [ -n "$FROM" ] || exit 0
+# P3(模拟E2E 后本席活体,2026-09-10): 信封分支仅认 type=dispatch——他席 done/ack/report 帧作为
+#   prompt 进入编排席会话时,曾被误当派单(落 inflight 残行+误发 ticket-received 给原发件人);
+#   非dispatch 的 DSHMSG 行一律静默(不落配对态不回执),fail-open 保持。
+[ "$OTYPE" = "dispatch" ] || exit 0
 case "$REF" in ''|'-') REF="dispatch" ;; esac
 [ -n "$ORCH_DEBUG" ] && echo "branch: ENVELOPE from=$FROM ref=$REF sid=$SID" >> "$ORCH_DEBUG" 2>/dev/null || :
 

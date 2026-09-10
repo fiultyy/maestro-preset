@@ -219,6 +219,39 @@ def ensure_ticket_schema(c):
         ts TEXT NOT NULL,
         payload TEXT NOT NULL
       );
+      -- P1(模拟E2E 缺口,2026-09-10): 编排族三表一并自举——原仅 ticket 族 3 表,
+      -- 空库上 dag-close 的 dag_ensure_project/event 裸 Traceback(projects/nodes/events 无任何运行时建表点)
+      CREATE TABLE IF NOT EXISTS projects(
+        key        TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        path       TEXT NOT NULL,
+        repo_id    TEXT,
+        status     TEXT NOT NULL DEFAULT 'unknown',
+        summary    TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS nodes(
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_key TEXT NOT NULL,
+        node_id    TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        title      TEXT,
+        status     TEXT NOT NULL DEFAULT 'pending',
+        owner      TEXT,
+        refs       TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(project_key, node_id)
+      );
+      CREATE TABLE IF NOT EXISTS events(
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         TEXT NOT NULL,
+        project_key TEXT,
+        node_id    TEXT,
+        event_type TEXT NOT NULL,
+        source     TEXT,
+        detail     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_key, id DESC);
     """)
 
 @contextmanager

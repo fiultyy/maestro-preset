@@ -953,8 +953,12 @@ def cmd_dag_close(a):
     rejected/rolled-back 为票面语义,node 只记事件(node 状态机无此二态)。"""
     if a.state not in ('done', 'rejected', 'rolled-back', 'blocked'):
         die('close 仅接受 done|rejected|rolled-back|blocked', 64)
-    if get_ticket(a.ref) is None:
+    t = get_ticket(a.ref)
+    if t is None:
         die(f'票不存在: {a.ref}', 1)
+    if t['state'] == a.state:   # P2(模拟E2E 缺口,2026-09-10): 同态重放幂等跳过(仿 S23 settle 先例),done→done 重跑不再非法
+        print(f'close: {a.ref} 幂等跳过(已 {a.state})')
+        return
     run_ledger(['ticket', 'state', a.ref, a.state, '--source', 'orch-dag',
                 '--note', (a.outcome or '')[:300]], f'ticket close 失败({a.ref})')
     project = dag_load().get('project') or os.getcwd()
@@ -1832,6 +1836,18 @@ def cmd_selftest(a):
         frow = freshdb.execute("SELECT state FROM tickets WHERE ticket_id='DF-1'").fetchone()
         freshdb.close()
         c.check('S21b ledger 自举写票 dispatched', bool(frow) and frow[0] == 'dispatched', str(frow))
+        p = _orch(['dag-settle', 'DF-1', '--outcome', 'fresh 收讫'], freshenv, cwd=proj)
+        c.check('S21b 空库 settle rc=0', p.returncode == 0, p.stderr[-160:])
+        p = _orch(['dag-close', 'DF-1', 'done', '--outcome', 'fresh-db close'], freshenv, cwd=proj)
+        c.check('S21b P1 空库 close rc=0 无 Traceback(编排三表随账本自举)', p.returncode == 0
+                and 'Traceback' not in p.stderr, p.stderr[-200:])
+        freshdb = sqlite3.connect(freshenv['MAESTRO_LEDGER'])
+        ftabs = {r[0] for r in freshdb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        fev = freshdb.execute("SELECT COUNT(*) FROM events WHERE node_id='DF-1' AND event_type='closed-done'").fetchone()[0]
+        fprj = freshdb.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        freshdb.close()
+        c.check('S21b P1 空库自举含 projects/nodes/events 三表', {'projects','nodes','events'} <= ftabs, str(sorted(ftabs)))
+        c.check('S21b P1 空库 closed 事件+项目注册在账', fev >= 1 and fprj >= 1, f'ev={fev} projects={fprj}')
 
 
         # S23 dag-settle: worker_done 回调收讫→running「复验待关账」+ 幂等 + deps 第三层屏障
@@ -1856,6 +1872,13 @@ def cmd_selftest(a):
         ev_done = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-done'").fetchone()[0]
         con.close()
         c.check('S24 closed-done 事件记账', ev_done >= 1, f'closed-done 事件数={ev_done}')
+        p = _orch(['dag-close', 'DR-1', 'done', '--outcome', '复验通过'], env, cwd=proj)
+        c.check('S24 P2 close 同态重放幂等 rc=0', p.returncode == 0
+                and '幂等跳过' in p.stdout, p.stdout + p.stderr)
+        con = sqlite3.connect(db)
+        ev_dup = con.execute("SELECT COUNT(*) FROM events WHERE node_id='DR-1' AND event_type='closed-done'").fetchone()[0]
+        con.close()
+        c.check('S24 P2 幂等重放零重复事件', ev_dup == ev_done, f'{ev_done} -> {ev_dup}')
         _orch(['dag-seat', 'DR-2'], env, cwd=proj)   # deps DR-1 已 done,可派发
         p = _orch(['dag-close', 'DR-2', 'rejected', '--outcome', '复验不过'], env, cwd=proj)
         c.check('S24 close rejected rc=0', p.returncode == 0, p.stderr)
