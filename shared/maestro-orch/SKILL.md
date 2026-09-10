@@ -208,3 +208,35 @@ prompt 里必须嵌 cb-send 回调契约(命令见 `cb-send` skill)。收到 don
 6. 死信 `wake failed … session-not-found` = 目标会话死了,等它 re-arm,别重投。
 7. **每次派发 → 必须记账**(node 置 dispatched + dispatched 事件)。
 8. **每次收果(回调/扫描)→ 必须更新**(状态 done/failed/blocked + ≤300 字 outcome)。账本写失败不阻塞编排: 记一笔继续,下轮 sweep 对账。
+
+### 模板速查(一页照抄;2026-09-10 整合自 降级通道/dais 附录/reply.sh)
+
+**① DSHMSG 派票信封**(dag-task 自动注入 task 文本首行;手工勿拼——派票一律走 dag 族):
+
+    DSHMSG]{"from":"<alias>@<sessionId>","to":"-","type":"dispatch","ref":"<票REF>","msgid":"<uuid4>","ver":3}
+
+**② 降级派发 = terminal send + cb-send 契约**(一条命令;`--enter`=回车提交;正文尽量 ASCII;`$ORCA`=orca/orca-ide 按车道):
+
+    $ORCA terminal send --terminal <handle> --json --enter --text "[ref:<ref>] <任务正文>
+
+    —— 回调契约(收到本消息后必须执行)——
+    1) 回合一开始:
+       ~/.dsh/maestro/bin/cb-send ack <你的ID> <MY-SIG> <ref> "turn started"
+    2) 完成时:
+       ~/.dsh/maestro/bin/cb-send done <你的ID> <MY-SIG> <ref> "<摘要≤300字>"
+       (cb-send 不在时兜底: printf '%s\n' '{"type":"ack","from":"<你的ID>","to":"<MY-SIG>","body":"[ref:<ref>] turn started"}' >> ~/.dsh/maestro/bridge/inbox.log)
+    3) 契约行丢失: load skill cb-send"
+
+**③ 回执回信**(scripts/reply.sh 同款;`DSH-RE]` 前缀=保留字):
+
+    $ORCA terminal send --terminal <handle> --text "DSH-RE] <msg>" --enter --json
+
+**④ dais 面**:
+
+| 动作 | 模板 |
+|---|---|
+| 起 harness | `dais orchestration inject-prompt session_<sid> <omp-dais\|cc-dais\|pi-dais> --force` |
+| 应答交互提示 | `dais orchestration answer <ctx_id> --text "<答案>" --enter` |
+| 换 pane 里 harness | `answer <sid> --text "/quit" --enter` 再注入新别名 |
+
+**⑤ 回车/键位坑(--enter 族通用)**: terminal send 多字节 UTF-8 会失效→正文尽量 ASCII;turn 提交键因 TUI 而异;大文本派发 45s 未消费→补一个空 `--enter`,**绝不连发两次**(第二次撤销粘贴,正文被撤回);单行 ~4KB 上限。
