@@ -6,7 +6,7 @@
                 [--no-ticket] [--dry-run] [--json]
   orch settle   [--run <run_id>] [--project <key|path>] [--json]
                 (--payload-file <f> | --payload <json> | --payload -)   # 回调收讫结算(非阻塞;阻塞 wait 已退役)
-  orch dag-seat-open --project <path> [--title T] [--base-branch B]   # dag 族: 编排席终端幂等创建/复用
+  orch dag-seat-open --project <path> [--title T] [--base-branch B]   # dag 族: 编排席终端幂等创建/复用(复用时 --project 异参即拒:防踩陈锚)
   orch dag-run "<objective>"                          # dag 族: 幂等建/续 Run
   orch dag-task <REF> --title <t> --spec <s> [--deps R1,R2]   # dag 族: Orca task+ticket 环原子建(deps 硬屏障)
   # HOOK-ENVELOPE: dag-task 落 task 文本首行自动构造 DSHMSG 派票信封(from=编排席签名,to="-",type=dispatch,ref=票REF,msgid=uuid4,ver=3;
@@ -457,7 +457,9 @@ def find_dispatch_node(ref=None, task_id=None):
                               (f'%{task_id}%',)).fetchall()
             for r in cands:
                 hit = _node_hit(r)
-                if hit['refs'].get('task') == task_id:
+                # RUNFRAME-KEYFIX(B3①,2026-09-10): 帧引用恒 task_*,但 dag 族 refs 只写 orca_task
+                # (旧路 dispatch 才写 task)——单键精核致 dag 票运行帧零落账(settle 兜底,观测失真)
+                if task_id in (hit['refs'].get('task'), hit['refs'].get('orca_task')):
                     return hit
         return None
     finally:
@@ -472,7 +474,7 @@ def book_running(node, frame_from, note):
         return f'running 帧跳过(现态 {node["status"]},晚帧不追): {nid}'
     node_transition(project, nid, 'running', 'running',
                     f'worker turn started | from={frame_from} | {note[:200]}')
-    tref = refs.get('ref')
+    tref = refs.get('ref') or nid   # RUNFRAME-KEYFIX: dag 族 refs 无 ref 键,node_id 即票 ref 兜底
     if tref:
         row = get_ticket(tref)
         if row and row['state'] == 'dispatched':
@@ -775,6 +777,11 @@ def cmd_dag_seat_open(a):
     if a.base_branch:   # dbdeb83 收编: worker-start 显式基点(repo 默认基点变更后的双保险)
         s['worker_base_ref'] = a.base_branch
     if s.get('seat'):
+        # SEAT-REANCHOR-GUARD(B3②,2026-09-10): 复用分支原静默丢 --project——错锚贯穿票 cwd/settle;
+        # 真·重锚会撕裂既有票/node 跨项目,故异参 die、同参幂等维持
+        if a.project and s.get('project') and os.path.abspath(a.project) != os.path.abspath(s['project']):
+            die(f"seat 复用但 --project 异参: 锚={s['project']} 新参={a.project}"
+                "(真·重锚撕裂既有票跨项目;确需换项目请隔离 state 或手工迁移)", 64)
         if a.base_branch:
             dag_save(s)
             print(f"seat: 复用 {s['seat']}(worker_base_ref={a.base_branch})")
@@ -1534,6 +1541,22 @@ def cmd_selftest(a):
         n_run_ev = con.execute("SELECT COUNT(*) FROM events WHERE node_id='T-004' AND event_type='running'").fetchone()[0]
         con.close()
         c.check('S15 幂等: 重复帧/已 running 不重记', n_run_ev == 1, f'running 事件数={n_run_ev}')
+
+        # S15b(RUNFRAME-KEYFIX, B3①): dag 形态 node(refs 只 orca_task,无 task/ref 键) 帧须命中+票环 node_id 兜底
+        con = sqlite3.connect(db)
+        con.execute("INSERT OR REPLACE INTO nodes(project_key,node_id,kind,title,status,refs,updated_at) "
+                    "VALUES(?, 'T-DAG1', 'dispatch', 'dagform', 'dispatched', ?, datetime('now'))",
+                    (proj, json.dumps({'orca_task': 'task_dagx'})))
+        con.execute("INSERT OR REPLACE INTO tickets(ticket_id,title,state,deps,refs,updated_at) "
+                    "VALUES('T-DAG1', 'dagform', 'dispatched', '[]', '{}', datetime('now'))")
+        con.commit()
+        con.close()
+        push_frame(type='ticket-running', to='test-orch@test-session', **{'from': 'worker-sess-2'},
+                   body='[task:task_dagx] worker turn started', ref='task_dagx', msgid='rm2', ts='t', ver=3)
+        p = _orch(['status', '--project', proj], env)
+        c.check('S15b dag 形态帧 node→running', get_node(proj, 'T-DAG1')['status'] == 'running', p.stderr)
+        c.check('S15b dag 票 ref 兜底→running', (get_ticket('T-DAG1') or {}).get('state') == 'running',
+                str(get_ticket('T-DAG1')))
 
         p = _orch(['dispatch', '--spec', os.path.join(proj, 'spec.md'), '--to', 'term_a', '--new-run', 'r16a',
                    '--ref', 'T-005', '--project', proj, '--json'], env)

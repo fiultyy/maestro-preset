@@ -11,19 +11,40 @@
   1. ledger nodes.node_id   (MAESTRO_LEDGER,默认 ~/.dsh/maestro/ledger.db)
   2. ledger tickets.ticket_id
   3. flowc flows/<ref>      (MAESTRO_FLOWC_ROOT,默认 ~/.dsh/maestro/flows)
-已知 → exit 0(stdout 注明命中账别);未知 → exit 1(stderr unknown-ref)。
+已知 → exit 0(stdout 注明命中账别);未知 → exit 1(stderr unknown-ref);--nack 回告通道断 → exit 3。
 编排者收到回调先跑本闸: 命中才信,未派发的 ref 一律拒之门外。
 
 环境: MAESTRO_LEDGER / MAESTRO_FLOWC_ROOT / MAESTRO_FLEET(session-send --nack 回告经它)。
 """
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 
-SESSION_SEND = os.environ.get('REF_GUARD_SESSION_SEND', 'session-send')
+
+def resolve_session_send():
+    """REFGUARD-PATH(B2 案1,2026-09-10): 多级回退 env绝对路径 → which(PATH) → 兄弟目录
+    → ~/.dsh/maestro/bin → 裸名。which 必须先于兄弟层(selftest PATH shim 语义保留);
+    兄弟/home 层需 isfile+X_OK 过滤。断链史: 裸名在 env -i/常态失 PATH 搜时 OSError 被吞
+    且 exit=1 与「回告成功」同码,零投递无告警(E2E3-RGNACK 定锚)。"""
+    cand = os.environ.get('REF_GUARD_SESSION_SEND', '')
+    if cand and os.path.isabs(cand):
+        return cand
+    hit = shutil.which('session-send')
+    if hit:
+        return hit
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.expanduser('~/.dsh/maestro/bin')):
+        p = os.path.join(d, 'session-send')
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return 'session-send'
+
+
+SESSION_SEND = resolve_session_send()
 
 
 def parse_cli(argv):
@@ -123,6 +144,7 @@ def main() -> None:
             subprocess.run(cmd, check=False)
         except OSError as exc:
             print(f'ref-guard: nack send failed ({SESSION_SEND}): {exc}', file=sys.stderr)
+            sys.exit(3)   # REFGUARD-PATH 案2: 回告通道断≠ref 未知(1),分码告警
     sys.exit(1)
 
 
@@ -211,6 +233,60 @@ def self_test():
         body = ' '.join(words[4:])
         assert frm == 'session-callersid' and to == 'w9', words
         assert typ == 'nack' and ref == '-' and body == 'unknown-ref rejected', words
+
+    @check('rg:env-override-wins')
+    def _():
+        # 案3: env 钩子绝对路径优先于 which/兄弟层(probe 记录被调 argv0)
+        probe_dir = os.path.join(tmp, 'probe')
+        os.makedirs(probe_dir, exist_ok=True)
+        probe = os.path.join(probe_dir, 'session-send')
+        with open(probe, 'w') as fh:
+            fh.write('#!/bin/sh\nprintf \'env-probe %s\\n\' "$0" >> "$SHIM_LOG"\n')
+        os.chmod(probe, 0o755)
+        env3 = dict(env)
+        env3['REF_GUARD_SESSION_SEND'] = probe
+        if os.path.exists(env['SHIM_LOG']):
+            os.remove(env['SHIM_LOG'])
+        r = subprocess.run([sys.executable, os.path.join(here, 'ref-guard'),
+                            'ZZ-999', '--nack', '--sender', 'w9'],
+                           capture_output=True, text=True, env=env3)
+        assert r.returncode == 1, r.returncode
+        lines = open(env['SHIM_LOG']).read().splitlines()
+        assert len(lines) == 1 and lines[0].startswith('env-probe ') and lines[0].endswith(probe), lines
+
+    @check('rg:sibling-fallback-captures')
+    def _():
+        # 案1: which 层剥除后兄弟目录层接管(拷贝 ref-guard 到 sib/,同目录放兄弟 probe)
+        sib = os.path.join(tmp, 'sib')
+        os.makedirs(sib, exist_ok=True)
+        sib_probe = os.path.join(sib, 'session-send')
+        with open(sib_probe, 'w') as fh:
+            fh.write('#!/bin/sh\nprintf \'sib-probe %s\\n\' "$0" >> "$SHIM_LOG"\n')
+        os.chmod(sib_probe, 0o755)
+        import shutil as _sh
+        _sh.copy(os.path.join(here, 'ref-guard'), os.path.join(sib, 'ref-guard'))
+        env4 = dict(env)
+        env4['PATH'] = os.pathsep.join(p for p in env4.get('PATH', '').split(os.pathsep)
+                                       if p != shim_dir and os.path.exists(p))
+        env4['REF_GUARD_SESSION_SEND'] = ''
+        if os.path.exists(env['SHIM_LOG']):
+            os.remove(env['SHIM_LOG'])
+        r = subprocess.run([sys.executable, os.path.join(sib, 'ref-guard'),
+                            'ZZ-999', '--nack', '--sender', 'w9'],
+                           capture_output=True, text=True, env=env4)
+        assert r.returncode == 1, (r.returncode, r.stderr)
+        lines = open(env['SHIM_LOG']).read().splitlines()
+        assert len(lines) == 1 and lines[0].startswith('sib-probe ') and lines[0].endswith(sib_probe), lines
+
+    @check('rg:nack-send-failed-exit-3')
+    def _():
+        # 案3 触发器: env 钩子指向不存在绝对路径 → OSError → exit 3(原设计窄 PATH 在案1 后变实弹,弃)
+        env5 = dict(env)
+        env5['REF_GUARD_SESSION_SEND'] = os.path.join(tmp, 'no-such-dir', 'session-send')
+        r = subprocess.run([sys.executable, os.path.join(here, 'ref-guard'),
+                            'ZZ-999', '--nack', '--sender', 'w9'],
+                           capture_output=True, text=True, env=env5)
+        assert r.returncode == 3 and 'nack send failed' in r.stderr, (r.returncode, r.stderr)
 
     @check('rg:nack-without-sender-exit-2')
     def _():
