@@ -38,6 +38,8 @@ def dbg(msg):
         except OSError: pass
 
 # ── 会话身份(stdin JSON: session_id/prompt) ──────────────────────────────
+# session_id 可能全形(session-<uuid>)或裸 uuid;统一剥前缀取唯一段(u8)——全形前 8 位恒为
+# 'session-' 对所有会话相同=前缀碰撞,曾令任意席的 fsw 放行所有帧(2026-09-10 活体实证)。
 try:
     payload = json.loads(ENV.get('STDIN') or '{}')
 except json.JSONDecodeError:
@@ -46,7 +48,8 @@ SID = str(payload.get('session_id') or '')
 PROMPT = str(payload.get('prompt') or '')
 if not SID:
     sys.exit(0)
-SID8 = SID[:8]
+SID_RAW = SID[len('session-'):] if SID.startswith('session-') else SID
+U8 = SID_RAW[:8]
 SIG = ENV.get('ORCH_SIG', '')
 
 # ── 帧提取: prompt(路径A) + inbox 增量(路径B) ────────────────────────────
@@ -67,7 +70,14 @@ inbox = ENV.get('ORCH_INBOX', '')
 home = ENV.get('ORCH_SETTLE_HOME') or os.path.join(os.path.expanduser('~'), '.dsh/maestro/orch-hooks')
 try: os.makedirs(home, exist_ok=True)
 except OSError: pass
-cursor_f = os.path.join(home, f'settle-cursor-{SID8}')
+# ── 过滤: 本哨只认 received/done + to 投本席 ────────────────────────────
+def mine(f):
+    to = str(f.get('to') or '')
+    # 寻址权威=帧 to 的 session 段==本会话 session(剥前缀唯一段全匹配或 8 位短匹配);
+# SIG(env)不再参与匹配——部署面 hooks.json 写死单一 ORCH_SIG,异席会话携本席 SIG
+# 匹配=越权消化他席帧(同 SID8 前缀碰撞族缺陷);SIG 仅 debug 记录。
+    return bool(to) and (SID_RAW in to or U8 in to)
+cursor_f = os.path.join(home, f'settle-cursor-{U8}')
 if inbox and os.path.isfile(inbox):
     try: pos = int(open(cursor_f).read().strip() or 0)
     except (OSError, ValueError): pos = 0
@@ -81,15 +91,11 @@ if inbox and os.path.isfile(inbox):
             new_frames = frames_of(fh.read(), raw=True)
             pos = size
             # 只留 to 投本席的(inbox 是全席公共流)
-            frames += [f for f in new_frames if f.get('to') and (SID in str(f['to']) or SID8 in str(f['to']))]
+            frames += [f for f in new_frames if f.get('to') and mine(f)]
             try: open(cursor_f, 'w').write(str(pos))
             except OSError: pass
     except OSError: pass
 
-# ── 过滤: 本哨只认 received/done + to 投本席 ────────────────────────────
-def mine(f):
-    to = str(f.get('to') or '')
-    return bool(to) and (SID in to or SID8 in to or (SIG and SIG in to))
 todo = []
 for f in frames:
     if f.get('type') in ('ticket-received', 'ticket-done') and mine(f):
@@ -99,7 +105,7 @@ if not todo:
 
 # ── msgid 去重(按席分文件,尾500;防 A/B 双路径同源帧与桥重投重放;分席=不误消化他席
 #   未处理帧——多编排席共面各记各账,读写无竞态) ──────────────────────────
-msgids_f = os.path.join(home, f'settled-msgids-{SID8}.log')
+msgids_f = os.path.join(home, f'settled-msgids-{U8}.log')
 seen = set()
 try: seen = set(open(msgids_f, encoding='utf-8', errors='replace').read().split()[-500:])
 except OSError: pass
